@@ -22,6 +22,16 @@ SALES_READ = "sales.read"
 REPORTS_READ = "reports.read"
 USERS_MANAGE = "users.manage"
 AUDIT_READ = "audit.read"
+ACCOUNTING_READ = "accounting.read"
+# Reserved for a future manual-journal-posting endpoint (M4 task Section
+# 27 explicitly asks manual posting endpoints to exist "only if users
+# genuinely need" them — they don't yet: every M4 journal entry is posted
+# automatically, inline, by the operational transaction it represents).
+# Defined now so the permission code is stable when that endpoint is
+# built, rather than invented later and back-seeded.
+ACCOUNTING_POST = "accounting.post"
+ACCOUNTING_REVERSE = "accounting.reverse"
+ACCOUNTING_ADMIN = "accounting.admin"
 
 ALL_PERMISSIONS: dict[str, str] = {
     PRODUCTS_READ: "View products and barcodes",
@@ -36,6 +46,12 @@ ALL_PERMISSIONS: dict[str, str] = {
     REPORTS_READ: "View reports (P&L, stock movement, ...)",
     USERS_MANAGE: "Create users and assign roles",
     AUDIT_READ: "View the audit log",
+    ACCOUNTING_READ: "View the chart of accounts, journal entries, and financial reports",
+    ACCOUNTING_POST: "Manually post a journal entry (reserved; no endpoint uses this yet)",
+    ACCOUNTING_REVERSE: "Reverse a posted journal entry with a compensating entry",
+    ACCOUNTING_ADMIN: (
+        "Manage accounting configuration (reserved for future chart-of-accounts admin)"
+    ),
 }
 
 # --- Roles --------------------------------------------------------------
@@ -69,6 +85,8 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         SALES_READ,
         REPORTS_READ,
         AUDIT_READ,
+        ACCOUNTING_READ,
+        ACCOUNTING_REVERSE,
     ],
     CASHIER: [
         PRODUCTS_READ,
@@ -91,5 +109,6 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         SALES_READ,
         REPORTS_READ,
         AUDIT_READ,
+        ACCOUNTING_READ,
     ],
 }
