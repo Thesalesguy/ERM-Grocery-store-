@@ -14,20 +14,26 @@ concurrency-safe sale-finalization transaction), and
 [`docs/M2_HARDENING_AUDIT.md`](docs/M2_HARDENING_AUDIT.md) records a subsequent adversarial
 pre-M3 audit that found and closed two CRITICAL gaps (no multi-store isolation, no sale
 idempotency) and three HIGH gaps before any purchasing/accounting work was built on top.
-**Read all four before touching a module**; this README only covers running what has been built
+[`docs/M3_PURCHASING_RECEIVING_WAC.md`](docs/M3_PURCHASING_RECEIVING_WAC.md) records the M3
+milestone's decisions (suppliers, purchase orders, transactional goods receiving, Weighted Average
+Cost recalculation, purchase returns, and the concurrency/idempotency guarantees around all of it).
+**Read all five before touching a module**; this README only covers running what has been built
 so far.
 
 ## Status
 
-**Milestone M2 — Authentication, catalog/inventory management, and POS (hardened).** The system is
-now authenticated end-to-end (JWT access tokens + rotating refresh tokens, argon2id password
-hashing, RBAC enforced on every route, per-store data isolation) with a real product-catalog UI,
-inventory-adjustment UI, and a barcode-driven POS whose sale finalization is one atomic, row-locked,
-idempotent database transaction — proven safe against concurrent oversell, cross-store access, and
-duplicate submissions by dedicated tests against real PostgreSQL (see `docs/M2_AUTH_AND_POS.md` §9
-and `docs/M2_HARDENING_AUDIT.md`). No purchasing or accounting UI exists yet (scheduled for later
-milestones). See `docs/M2_AUTH_AND_POS.md` for the full design, `docs/M2_HARDENING_AUDIT.md` for the
-hardening pass, and `docs/M1_DATABASE_DESIGN.md` for the underlying data model it builds on.
+**Milestone M3 — Purchasing, goods receiving, WAC & supplier workflow.** Building on M2's
+authenticated, RBAC-enforced, multi-store-isolated foundation, the system now supports supplier
+management, purchase-order creation/submission/cancellation, and goods receiving (full or partial,
+with over-receipt detection) as one atomic, row-locked, idempotent database transaction that
+recomputes Weighted Average Cost and posts inventory-ledger movements — proven safe against
+concurrent receipts, duplicate submissions, and cross-store access by dedicated tests against real
+PostgreSQL, and confirmed against a live running instance (see
+`docs/M3_PURCHASING_RECEIVING_WAC.md`). Purchase returns are supported with a documented cost-basis
+limitation (no per-lot tracking; returns value at current WAC). No accounting/reporting UI exists
+yet (scheduled for a later milestone). See `docs/M3_PURCHASING_RECEIVING_WAC.md` for the full M3
+design, `docs/M2_AUTH_AND_POS.md` for auth/POS, `docs/M2_HARDENING_AUDIT.md` for the hardening pass,
+and `docs/M1_DATABASE_DESIGN.md` for the underlying data model it all builds on.
 
 ## Architecture
 
@@ -254,7 +260,8 @@ npm run build            # production build verification
 │   ├── TECHNICAL_BLUEPRINT.md    # authoritative design document
 │   ├── M1_DATABASE_DESIGN.md     # M1 decisions: ledger, WAC, COGS, privilege model
 │   ├── M2_AUTH_AND_POS.md        # M2 decisions: auth, RBAC, POS, sale-finalization concurrency
-│   └── M2_HARDENING_AUDIT.md     # pre-M3 adversarial audit: findings, fixes, accepted risks
+│   ├── M2_HARDENING_AUDIT.md     # pre-M3 adversarial audit: findings, fixes, accepted risks
+│   └── M3_PURCHASING_RECEIVING_WAC.md  # M3 decisions: suppliers, PO lifecycle, receiving, WAC
 ├── backend/
 │   ├── app/
 │   │   ├── main.py              # FastAPI app factory + entry point
