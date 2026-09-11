@@ -34,9 +34,12 @@ class Settings(BaseSettings):
     # always set this explicitly to the owner role's connection string.
     MIGRATIONS_DATABASE_URL: str | None = None
 
-    # Used later for JWT signing (see docs/TECHNICAL_BLUEPRINT.md Section H).
+    # JWT signing key (see docs/TECHNICAL_BLUEPRINT.md Section H).
     # Must be overridden with a long random value outside of development.
     SECRET_KEY: str = "dev-only-insecure-secret-key-change-me"
+    JWT_ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 14
 
     # Comma-separated list of allowed browser origins for the frontend SPA.
     CORS_ORIGINS: str = "http://localhost:5173"

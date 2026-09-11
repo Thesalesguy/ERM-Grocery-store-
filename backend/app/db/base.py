@@ -8,6 +8,7 @@ from app.db.base_class import Base  # noqa: F401
 from app.modules.audit.models import AuditLog  # noqa: F401
 from app.modules.auth.models import (  # noqa: F401
     Permission,
+    RefreshToken,
     Role,
     RolePermission,
     Store,

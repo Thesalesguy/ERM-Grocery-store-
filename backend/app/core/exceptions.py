@@ -9,7 +9,9 @@ unhandled exception leaking internals).
 import logging
 
 from fastapi import FastAPI, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +27,16 @@ class AppError(Exception):
         self.message = message
         if error_code is not None:
             self.error_code = error_code
+
+
+class UnauthorizedError(AppError):
+    status_code = status.HTTP_401_UNAUTHORIZED
+    error_code = "UNAUTHORIZED"
+
+
+class ForbiddenError(AppError):
+    status_code = status.HTTP_403_FORBIDDEN
+    error_code = "FORBIDDEN"
 
 
 class NotFoundError(AppError):
@@ -52,6 +64,32 @@ def register_exception_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=exc.status_code,
             content=_error_body(exc.error_code, exc.message),
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def handle_request_validation_error(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        # FastAPI's own automatic Pydantic validation (bad JSON shape, a
+        # field failing its Field(...) constraints) otherwise returns a
+        # differently-shaped {"detail": [...]} body — normalized here so
+        # every 422, ours or FastAPI's, looks the same to a client.
+        first_error = exc.errors()[0] if exc.errors() else {}
+        field = ".".join(str(part) for part in first_error.get("loc", ()) if part != "body")
+        message = first_error.get("msg", "Invalid request")
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content=_error_body("VALIDATION_ERROR", f"{field}: {message}" if field else message),
+        )
+
+    @app.exception_handler(StarletteHTTPException)
+    async def handle_http_exception(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+        # Anything that raises a plain HTTPException (routing 404s, 405s,
+        # FastAPI security dependencies) — same consistent shape.
+        code = {404: "NOT_FOUND", 405: "METHOD_NOT_ALLOWED"}.get(exc.status_code, "HTTP_ERROR")
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=_error_body(code, str(exc.detail)),
         )
 
     @app.exception_handler(Exception)

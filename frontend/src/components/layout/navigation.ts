@@ -1,6 +1,9 @@
 export interface NavItem {
   label: string
   path: string
+  /** Hidden from the nav (and inaccessible) unless the current user has
+   * this permission. Omitted for pages open to any authenticated user. */
+  permission?: string
 }
 
 /**
@@ -9,13 +12,13 @@ export interface NavItem {
  */
 export const NAV_ITEMS: NavItem[] = [
   { label: 'Dashboard', path: '/' },
-  { label: 'POS', path: '/pos' },
-  { label: 'Products', path: '/products' },
-  { label: 'Inventory', path: '/inventory' },
-  { label: 'Purchasing', path: '/purchasing' },
-  { label: 'Suppliers', path: '/suppliers' },
-  { label: 'Sales', path: '/sales' },
-  { label: 'Reports', path: '/reports' },
-  { label: 'Users', path: '/users' },
+  { label: 'POS', path: '/pos', permission: 'pos.use' },
+  { label: 'Products', path: '/products', permission: 'products.read' },
+  { label: 'Inventory', path: '/inventory', permission: 'inventory.read' },
+  { label: 'Purchasing', path: '/purchasing', permission: 'purchasing.read' },
+  { label: 'Suppliers', path: '/suppliers', permission: 'purchasing.read' },
+  { label: 'Sales', path: '/sales', permission: 'sales.read' },
+  { label: 'Reports', path: '/reports', permission: 'reports.read' },
+  { label: 'Users', path: '/users', permission: 'users.manage' },
   { label: 'Settings', path: '/settings' },
 ]

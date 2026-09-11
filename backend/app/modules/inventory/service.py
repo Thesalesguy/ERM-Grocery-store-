@@ -10,11 +10,12 @@ transactional, row-locked vertical slice through the ledger).
 
 from decimal import ROUND_HALF_UP, Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from app.core.exceptions import ConflictError
-from app.modules.inventory.models import InventoryMovement
+from app.core.exceptions import ConflictError, NotFoundError
+from app.modules.audit import service as audit_service
+from app.modules.inventory.models import InventoryMovement, StockAdjustment
 from app.modules.products.models import Product
 
 _WAC_QUANTUM = Decimal("0.000001")  # matches Numeric(14, 6) storage precision
@@ -53,12 +54,17 @@ def compute_new_wac(
 
 
 def list_movements(
-    db: Session, *, product_id: int | None = None, limit: int = 50, offset: int = 0
+    db: Session,
+    *,
+    product_id: int | None = None,
+    movement_type: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
 ) -> list[InventoryMovement]:
-    """Read-only ledger listing — proves the movement ledger is queryable
-    (M1 task Section 20). No write endpoint exists yet; movements are only
-    ever created by app.modules.purchasing.service.receive_goods (and,
-    later, the Sales/Inventory services in M2/M4).
+    """Read-only ledger listing. Movements are created by
+    app.modules.purchasing.service.receive_goods, create_stock_adjustment
+    (above), and app.modules.sales.service.finalize_sale — never directly
+    by a route handler.
     """
     query = (
         select(InventoryMovement)
@@ -68,6 +74,8 @@ def list_movements(
     )
     if product_id is not None:
         query = query.where(InventoryMovement.product_id == product_id)
+    if movement_type is not None:
+        query = query.where(InventoryMovement.movement_type == movement_type)
     return list(db.execute(query).scalars().all())
 
 
@@ -151,3 +159,97 @@ def record_movement(
     db.add(movement)
     db.flush()
     return movement
+
+
+def list_stock_levels(
+    db: Session,
+    *,
+    store_id: int | None = None,
+    search: str | None = None,
+    low_stock_only: bool = False,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[Product]:
+    query = select(Product).order_by(Product.name).limit(limit).offset(offset)
+    if store_id is not None:
+        query = query.where(Product.store_id == store_id)
+    if search:
+        pattern = f"%{search}%"
+        query = query.where(or_(Product.name.ilike(pattern), Product.sku.ilike(pattern)))
+    if low_stock_only:
+        query = query.where(
+            Product.reorder_point.is_not(None),
+            Product.current_qty_on_hand <= Product.reorder_point,
+        )
+    return list(db.execute(query).scalars().all())
+
+
+def get_stock_level(db: Session, product_id: int) -> Product:
+    product = db.get(Product, product_id)
+    if product is None:
+        raise NotFoundError(f"Product {product_id} not found")
+    return product
+
+
+def create_stock_adjustment(
+    db: Session,
+    *,
+    store_id: int,
+    product_id: int,
+    quantity_delta: Decimal,
+    reason_code: str,
+    notes: str | None,
+    created_by: int,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+) -> StockAdjustment:
+    """The full authenticated, transactional, audited stock-adjustment
+    flow (M2 task Section 6): the API can never overwrite
+    current_qty_on_hand directly — every change is this function creating
+    one StockAdjustment (the human-facing record) plus exactly one
+    InventoryMovement (the ledger entry), atomically, with the actor
+    recorded on both and an audit_logs entry to match. Does not commit —
+    the caller (the route handler) does, once this returns successfully.
+    """
+    adjustment = StockAdjustment(
+        store_id=store_id,
+        product_id=product_id,
+        quantity_delta=quantity_delta,
+        reason_code=reason_code,
+        notes=notes,
+        created_by=created_by,
+    )
+    db.add(adjustment)
+    db.flush()
+
+    product = lock_product_for_update(db, product_id)
+    movement_type = "STOCK_ADJUSTMENT_IN" if quantity_delta > 0 else "STOCK_ADJUSTMENT_OUT"
+    record_movement(
+        db,
+        product=product,
+        store_id=store_id,
+        movement_type=movement_type,
+        quantity_delta=quantity_delta,
+        unit_cost_at_movement=product.current_cost,
+        reference_type="stock_adjustment",
+        reference_id=adjustment.id,
+        reason=notes,
+        created_by=created_by,
+    )
+
+    audit_service.log_event(
+        db,
+        user_id=created_by,
+        action="STOCK_ADJUSTMENT_CREATED",
+        entity_type="stock_adjustment",
+        entity_id=adjustment.id,
+        after={
+            "product_id": product_id,
+            "quantity_delta": quantity_delta,
+            "reason_code": reason_code,
+            "resulting_quantity_on_hand": product.current_qty_on_hand,
+        },
+        ip_address=ip_address,
+        user_agent=user_agent,
+    )
+    return adjustment

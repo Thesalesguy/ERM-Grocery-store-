@@ -8,12 +8,16 @@ import uuid
 from datetime import date
 from decimal import Decimal
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.modules.auth.models import Store, User
+from app.core.security import hash_password
+from app.modules.auth.models import Role, Store, User, UserRole
 from app.modules.products.models import Product, ProductCategory
 from app.modules.purchasing.models import PurchaseOrder, Supplier
 from app.modules.tax.models import TaxRate
+
+DEFAULT_TEST_PASSWORD = "Test-Password-123!"
 
 
 def unique_suffix() -> str:
@@ -42,6 +46,23 @@ def make_user(db: Session, store: Store | None = None, **overrides) -> User:
     defaults.update(overrides)
     user = User(**defaults)
     db.add(user)
+    db.flush()
+    return user
+
+
+def make_user_with_role(
+    db: Session,
+    store: Store | None,
+    role_name: str,
+    *,
+    password: str = DEFAULT_TEST_PASSWORD,
+    **overrides,
+) -> User:
+    """A user with a known plaintext password (for exercising the real
+    HTTP login endpoint in API-level tests) and one assigned role."""
+    user = make_user(db, store, password_hash=hash_password(password), **overrides)
+    role = db.execute(select(Role).where(Role.name == role_name)).scalar_one()
+    db.add(UserRole(user_id=user.id, role_id=role.id))
     db.flush()
     return user
 

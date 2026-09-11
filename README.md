@@ -8,17 +8,21 @@ The authoritative technical design lives in [`docs/TECHNICAL_BLUEPRINT.md`](docs
 security, deployment, and the milestone roadmap.
 [`docs/M1_DATABASE_DESIGN.md`](docs/M1_DATABASE_DESIGN.md) records the M1 milestone's decisions in
 detail (inventory ledger, Weighted Average Cost, the two-database-role privilege model, and what
-remains open). **Read both before touching a module**; this README only covers running what has
-been built so far.
+remains open). [`docs/M2_AUTH_AND_POS.md`](docs/M2_AUTH_AND_POS.md) records the M2 milestone's
+decisions (authentication, RBAC, product/inventory APIs, the POS workflow, and the atomic,
+concurrency-safe sale-finalization transaction). **Read all three before touching a module**; this
+README only covers running what has been built so far.
 
 ## Status
 
-**Milestone M1 — Transactional data model.** The full production database schema exists — product
-catalog, the inventory-movement ledger with Weighted Average Cost, purchasing/goods-receiving
-(including one real transactional service), sales/payments/returns, and the tax-rate foundation —
-plus a minimal API proving the model/schema/service/route separation. No POS, purchasing, or
-accounting **UI/full service layer** is implemented yet; authentication is still deferred (see
-`docs/M1_DATABASE_DESIGN.md` §1.A).
+**Milestone M2 — Authentication, catalog/inventory management, and POS.** The system is now
+authenticated end-to-end (JWT access tokens + rotating refresh tokens, argon2id password hashing,
+RBAC enforced on every route) with a real product-catalog UI, inventory-adjustment UI, and a
+barcode-driven POS whose sale finalization is one atomic, row-locked database transaction — proven
+safe against concurrent oversell and orphan records by dedicated tests against real PostgreSQL (see
+`docs/M2_AUTH_AND_POS.md` §9). No purchasing or accounting UI exists yet (scheduled for later
+milestones). See `docs/M2_AUTH_AND_POS.md` for the full design and `docs/M1_DATABASE_DESIGN.md` for
+the underlying data model it builds on.
 
 ## Architecture
 
@@ -36,12 +40,12 @@ backend/app/
   db/         SQLAlchemy engine/session, declarative base
   api/v1/     versioned HTTP routes
   modules/
-    auth/       stores, users, roles, permissions (data model only; no login yet)
-    audit/      append-only audit log (data model only; nothing writes to it yet)
-    products/   catalog: categories, products, barcodes — data model + minimal API
-    inventory/  ledger + Weighted Average Cost — data model + service helpers
+    auth/       stores, users, roles, permissions + JWT login, refresh tokens, RBAC
+    audit/      append-only audit log (login, product, stock, and sale events write to it)
+    products/   catalog: categories, products, barcodes — full CRUD + search + barcode lookup API
+    inventory/  ledger + Weighted Average Cost — stock-level/adjustment API
     purchasing/ suppliers, PO, goods receiving — data model + one real transactional service
-    sales/      sale/payment/return data model (no finalization service yet — that's M4)
+    sales/      atomic, concurrency-safe sale finalization + POS lookup/receipt API
     accounting/ P&L and reporting                                            -- M6
     tax/        tax_rates table now; provider integration                    -- M7
 ```
@@ -84,7 +88,7 @@ cp frontend/.env.example frontend/.env
 | `ENVIRONMENT` | `development` \| `staging` \| `production` — disables `/docs` and `/redoc` in production | `development` |
 | `DATABASE_URL` | Connection string the **running application** uses. Must be the restricted `erp_app` role — see [Database Setup](#database-setup) below | `postgresql+psycopg://erp_app:erp_app_password@localhost:5432/erp_dev` |
 | `MIGRATIONS_DATABASE_URL` | Connection string **Alembic** uses. Must be the schema-owning role (`erp_user`) — falls back to `DATABASE_URL` if unset, which only works if that role owns the schema | `postgresql+psycopg://erp_user:erp_password@localhost:5432/erp_dev` |
-| `SECRET_KEY` | Reserved for future JWT signing (Section H of the blueprint) — replace before any non-local deployment | dev-only placeholder |
+| `SECRET_KEY` | JWT signing key (Section H of the blueprint; see `docs/M2_AUTH_AND_POS.md` §2) — replace before any non-local deployment | dev-only placeholder |
 | `CORS_ORIGINS` | Comma-separated list of allowed frontend origins | `http://localhost:5173` |
 | `LOG_LEVEL` | Python logging level | `INFO` |
 
@@ -135,6 +139,21 @@ alembic revision --autogenerate -m "describe change"   # create a new migration
 ```
 
 Migrations are the only way schema changes reach the database — never edit tables by hand.
+
+## Creating the First Admin User
+
+There is no hardcoded admin account and no self-registration endpoint. After running migrations,
+bootstrap the first Admin interactively:
+
+```bash
+cd backend
+source .venv/bin/activate
+python scripts/create_admin_user.py
+```
+
+It prompts for username, email, full name, an optional store, and a password (hidden input,
+confirmed, 12-character minimum). Every subsequent user is created by an Admin through the
+application. See `docs/M2_AUTH_AND_POS.md` §2.
 
 ## Running Locally (without Docker)
 
@@ -228,27 +247,30 @@ npm run build            # production build verification
 .
 ├── docs/
 │   ├── TECHNICAL_BLUEPRINT.md    # authoritative design document
-│   └── M1_DATABASE_DESIGN.md     # M1 decisions: ledger, WAC, COGS, privilege model
+│   ├── M1_DATABASE_DESIGN.md     # M1 decisions: ledger, WAC, COGS, privilege model
+│   └── M2_AUTH_AND_POS.md        # M2 decisions: auth, RBAC, POS, sale-finalization concurrency
 ├── backend/
 │   ├── app/
 │   │   ├── main.py              # FastAPI app factory + entry point
-│   │   ├── core/                # config, logging, exception handling
+│   │   ├── core/                # config, logging, exception handling, security (JWT/argon2)
 │   │   ├── db/                  # SQLAlchemy session + declarative base
 │   │   ├── api/v1/               # versioned API routes
 │   │   └── modules/              # one package per business module boundary
 │   ├── alembic/                  # migrations
 │   ├── scripts/
-│   │   └── bootstrap_db_roles.sql  # one-time, superuser-run erp_app role setup
+│   │   ├── bootstrap_db_roles.sql  # one-time, superuser-run erp_app role setup
+│   │   └── create_admin_user.py    # one-time, interactive first-Admin bootstrap
 │   ├── tests/
 │   ├── requirements.txt
 │   ├── requirements-dev.txt
 │   └── Dockerfile
 ├── frontend/
 │   ├── src/
-│   │   ├── api/                  # fetch client
+│   │   ├── api/                  # fetch client + per-module API wrappers
+│   │   ├── auth/                  # AuthContext, ProtectedRoute/RequirePermission
 │   │   ├── hooks/                # shared data-fetching hook
 │   │   ├── components/           # layout + shared UI
-│   │   └── pages/                # one placeholder page per module
+│   │   └── pages/                # Login, Products, Inventory, POS
 │   ├── package.json
 │   └── Dockerfile.dev
 └── docker-compose.yml
@@ -280,6 +302,29 @@ negative-stock default, the purchase-return WAC approximation, and others). Summ
 - Table/enum naming was refined from the blueprint's original draft (`purchases` →
   `purchase_orders`, `ADJUSTMENT_IN/OUT` → `STOCK_ADJUSTMENT_IN/OUT`, sale statuses, payment
   methods) — `docs/TECHNICAL_BLUEPRINT.md` has been updated to match throughout.
+
+## Decisions Made During M2
+
+See `docs/M2_AUTH_AND_POS.md` for the full write-up (auth architecture, the permission matrix,
+sale-finalization transaction design, concurrency proof, payment/receipt policy, security review,
+and a list of business decisions still needing sign-off — rate limiting, refresh-token-reuse
+response, and others). Summarized:
+
+- Authentication is resolved: JWT access tokens (15 min) + rotating, hashed-at-rest refresh tokens
+  in an httpOnly cookie, argon2id password hashing, RBAC resolved fresh from the database on every
+  request (never cached in the token) — see `docs/M2_AUTH_AND_POS.md` §2–3.
+- The M1 `products/service.py` bug where any invalid foreign-key reference (category, supplier, tax
+  rate) was misreported as a duplicate-SKU conflict is fixed — see §1.
+- Sale finalization is one atomic transaction using ascending-order row locking to avoid deadlock
+  and a pre-flight stock check to avoid oversell, proven safe under real concurrent load against
+  real PostgreSQL, not just argued — see §7 and §9.
+- A real bug in the RBAC-seed migration's `downgrade()` (deleting `roles` before clearing
+  `user_roles` rows that reference them) was found and fixed while validating the migration
+  up/down/up cycle against a database with a real user present — see §16.
+- The backend lint/format gate (`ruff`, `black`) did not previously exclude Alembic's own
+  autogenerated revision-file boilerplate, which predates this project's style rules; this was a
+  pre-existing gap (present since M0/M1) that made the gate non-functional across the whole
+  `alembic/versions/` directory. Fixed by excluding that directory — see §16.
 
 ## Assumptions Made During M0
 

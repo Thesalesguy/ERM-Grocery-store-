@@ -1,11 +1,14 @@
-"""ORM models for stores, users, roles, and permissions.
+"""ORM models for stores, users, roles, permissions, and refresh tokens.
 
 See docs/TECHNICAL_BLUEPRINT.md Section C.1 for the authoritative design
-(columns, constraints, relationships). No authentication logic lives here
-yet — see the module docstring in __init__.py.
+(columns, constraints, relationships). Authentication logic (hashing,
+JWT, login/refresh/logout) lives in app.core.security and
+app.modules.auth.service — see the module docstring in __init__.py.
 """
 
-from sqlalchemy import Boolean, ForeignKey, String, UniqueConstraint
+from datetime import datetime
+
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base_class import Base, TimestampMixin
@@ -37,6 +40,7 @@ class User(TimestampMixin, Base):
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     full_name: Mapped[str] = mapped_column(String(255), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     store: Mapped[Store | None] = relationship(back_populates="users")
     user_roles: Mapped[list["UserRole"]] = relationship(back_populates="user")
@@ -81,3 +85,21 @@ class UserRole(Base):
 
     user: Mapped[User] = relationship(back_populates="user_roles")
     role: Mapped[Role] = relationship(back_populates="user_roles")
+
+
+class RefreshToken(TimestampMixin, Base):
+    """Server-side half of the auth model (see app.core.security's module
+    docstring for the JWT + refresh-token design decision). Only a SHA-256
+    hash of the token is stored — never the raw value, matching how
+    passwords are stored, so a database dump alone can't be replayed."""
+
+    __tablename__ = "refresh_tokens"
+    __table_args__ = (Index("ix_refresh_tokens_user_id", "user_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    user_agent: Mapped[str | None] = mapped_column(String(255))
+    ip_address: Mapped[str | None] = mapped_column(String(64))

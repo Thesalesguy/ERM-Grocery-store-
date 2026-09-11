@@ -2,9 +2,9 @@
 
 Runs against a dedicated database (not the one other tests use) so a
 migration bug can't corrupt state other tests depend on. Exercises the
-exact sequence the M1 task asks for: upgrade from M0 to M1, back down to
-M0, then up to M1 again — and checks the resulting table count at each
-step, not just that Alembic didn't raise.
+full chain from scratch through every milestone and back down again,
+checking the resulting table count at each step, not just that Alembic
+didn't raise.
 """
 
 import os
@@ -24,6 +24,7 @@ TEST_MIGRATIONS_DATABASE_URL = os.environ.get(
 )
 M0_REVISION = "7b22f673d866"
 M1_HEAD_REVISION = "9163f992ddc1"
+M2_HEAD_REVISION = "e6180fca2ee0"
 
 
 def _alembic_config() -> Config:
@@ -46,6 +47,15 @@ def _table_count(db_url: str) -> int:
         engine.dispose()
 
 
+def _current_revision(db_url: str) -> str:
+    engine = create_engine(db_url)
+    try:
+        with engine.connect() as conn:
+            return conn.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
+    finally:
+        engine.dispose()
+
+
 def test_full_upgrade_downgrade_upgrade_cycle(migrations_db: str) -> None:
     cfg = _alembic_config()
 
@@ -59,20 +69,34 @@ def test_full_upgrade_downgrade_upgrade_cycle(migrations_db: str) -> None:
     # audit_logs + alembic_version.
     assert _table_count(migrations_db) == 8
 
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, M1_HEAD_REVISION)
     # M1 adds 18 tables on top of M0's 7 (+ alembic_version).
     assert _table_count(migrations_db) == 26
+
+    command.upgrade(cfg, "head")
+    # M2 adds one table (refresh_tokens); the RBAC seed migration adds
+    # rows, not tables.
+    assert _table_count(migrations_db) == 27
 
     command.downgrade(cfg, M0_REVISION)
     assert _table_count(migrations_db) == 8
 
     command.upgrade(cfg, "head")
-    assert _table_count(migrations_db) == 26
+    assert _table_count(migrations_db) == 27
+    assert _current_revision(migrations_db) == M2_HEAD_REVISION
+
+
+def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, "head")
 
     engine = create_engine(migrations_db)
     try:
         with engine.connect() as conn:
-            current = conn.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
+            role_count = conn.exec_driver_sql("SELECT count(*) FROM roles").scalar_one()
+            permission_count = conn.exec_driver_sql("SELECT count(*) FROM permissions").scalar_one()
     finally:
         engine.dispose()
-    assert current == M1_HEAD_REVISION
+    assert role_count == 5
+    assert permission_count == 12

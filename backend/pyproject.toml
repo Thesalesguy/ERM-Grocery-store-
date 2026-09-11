@@ -1,10 +1,17 @@
 [tool.black]
 line-length = 100
 target-version = ["py311"]
+extend-exclude = "alembic/versions"
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# Alembic's own revision-file template predates this project's style rules
+# (Union[...] instead of X | Y, embedded DDL strings over the line-length
+# limit) and revision files are boilerplate we don't hand-edit for style,
+# so lint doesn't gate them. Pre-existing gap noticed while validating M2;
+# fixed here rather than reformatting migration history.
+extend-exclude = ["alembic/versions"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

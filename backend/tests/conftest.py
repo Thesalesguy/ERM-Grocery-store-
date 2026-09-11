@@ -11,13 +11,9 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
+from app.api.deps import get_db
 from app.db.session import engine
 from app.main import app
-
-
-@pytest.fixture
-def client() -> TestClient:
-    return TestClient(app)
 
 
 @pytest.fixture
@@ -33,6 +29,9 @@ def db() -> Generator[Session, None, None]:
     giving each test a fully isolated, auto-cleaned-up view of a real
     database. This is what makes tests safely re-runnable: nothing a test
     writes (products, sales, movements, ...) persists past that test.
+
+    Note: tests proving real cross-connection concurrency (test_concurrency.py)
+    deliberately do NOT use this fixture — see that file's module docstring.
     """
     connection = engine.connect()
     transaction = connection.begin()
@@ -43,3 +42,26 @@ def db() -> Generator[Session, None, None]:
         session.close()
         transaction.rollback()
         connection.close()
+
+
+@pytest.fixture
+def client(db: Session) -> Generator[TestClient, None, None]:
+    """A TestClient whose requests run against the SAME session/transaction
+    as the `db` fixture (via a get_db dependency override), so a test can
+    set up fixtures with `db` (factories.py) and then exercise them
+    through real HTTP requests — auth, RBAC, request validation, and all —
+    with everything rolled back together at the end. Without this
+    override, TestClient requests would open their own independent
+    SessionLocal() connection and never see this test's uncommitted setup
+    (the same cross-connection-visibility issue test_concurrency.py's
+    module docstring explains).
+    """
+
+    def _override_get_db() -> Generator[Session, None, None]:
+        yield db
+
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        yield TestClient(app)
+    finally:
+        app.dependency_overrides.pop(get_db, None)
