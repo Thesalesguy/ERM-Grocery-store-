@@ -91,6 +91,18 @@ class SaleItem(TimestampMixin, Base):
             "line_total = round(quantity * unit_price_at_sale - discount_amount + tax_amount, 2)",
             name="ck_sale_items_line_total_consistent",
         ),
+        # M5: how much of this line has been returned so far (docs/
+        # M5_RETURNS_VOIDS_REFUNDS.md) — a maintained cache, incremented
+        # only by app.modules.sales.service.create_sale_return under a
+        # lock on the parent Sale row, mirroring
+        # PurchaseOrderItem.quantity_received's established pattern
+        # (docs/M3_PURCHASING_RECEIVING_WAC.md). Never user-editable
+        # directly; the DB constraint is the backstop against ever
+        # returning more than was sold, not the only protection.
+        CheckConstraint(
+            "quantity_returned >= 0 AND quantity_returned <= quantity",
+            name="ck_sale_items_quantity_returned_bounds",
+        ),
         Index("ix_sale_items_sale_id", "sale_id"),
         Index("ix_sale_items_product_id", "product_id"),
     )
@@ -108,6 +120,7 @@ class SaleItem(TimestampMixin, Base):
     tax_rate_id: Mapped[int | None] = mapped_column(ForeignKey("tax_rates.id"))
     tax_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
     line_total: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    quantity_returned: Mapped[Decimal] = mapped_column(Numeric(14, 3), nullable=False, default=0)
 
     sale: Mapped[Sale] = relationship(back_populates="items")
 
@@ -137,7 +150,18 @@ class Payment(TimestampMixin, Base):
 
 class SaleReturn(TimestampMixin, Base):
     """Customer return/refund against a completed sale. The original sale
-    is never edited (BR-6) — this is a new, separate record."""
+    is never edited (BR-6) — this is a new, separate record.
+
+    A "void" (docs/M5_RETURNS_VOIDS_REFUNDS.md Section 1) is not a
+    separate table or status: every Sale in this system is created
+    already COMPLETED with inventory already moved (finalize_sale is
+    all-or-nothing), so there is no state a void could bypass that a
+    full return wouldn't already have to go through. A void is
+    app.modules.sales.service.void_sale calling create_sale_return with
+    every line's full remaining quantity — same row, same code path,
+    distinguishable only by `reason` and by having returned 100% of the
+    sale in one transaction.
+    """
 
     __tablename__ = "sale_returns"
     __table_args__ = (
@@ -154,6 +178,12 @@ class SaleReturn(TimestampMixin, Base):
     sale_id: Mapped[int] = mapped_column(ForeignKey("sales.id"), nullable=False)
     store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), nullable=False)
     return_number: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    # M5 idempotency key (mirrors Sale.client_transaction_id /
+    # GoodsReceipt.client_transaction_id exactly — same UNIQUE-constraint
+    # enforcement, same early-lookup-then-IntegrityError-recovery pattern
+    # in the service layer). Absent from this table since M1 because no
+    # service ever wrote to it until M5.
+    client_transaction_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
     reason: Mapped[str | None] = mapped_column(Text)
     refund_method: Mapped[str] = mapped_column(String(20), nullable=False)
     refund_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
@@ -162,6 +192,8 @@ class SaleReturn(TimestampMixin, Base):
     # threshold (docs/TECHNICAL_BLUEPRINT.md assumption #5). NULL means
     # not (yet) approved — enforcement of the threshold itself is
     # application logic for a later milestone, not a DB constraint.
+    # Still deferred in M5 (docs/M5_RETURNS_VOIDS_REFUNDS.md "Known
+    # limitations") — every M5 return leaves this NULL.
     approved_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
 
     items: Mapped[list["SaleReturnItem"]] = relationship(back_populates="sale_return")
@@ -172,7 +204,13 @@ class SaleReturnItem(TimestampMixin, Base):
     __table_args__ = (
         CheckConstraint("quantity > 0", name="ck_sale_return_items_quantity_positive"),
         CheckConstraint("unit_price_refunded >= 0", name="ck_sale_return_items_price_non_negative"),
+        CheckConstraint(
+            "discount_refunded >= 0", name="ck_sale_return_items_discount_non_negative"
+        ),
+        CheckConstraint("tax_refunded >= 0", name="ck_sale_return_items_tax_non_negative"),
+        CheckConstraint("unit_cost_refunded >= 0", name="ck_sale_return_items_cost_non_negative"),
         Index("ix_sale_return_items_sale_return_id", "sale_return_id"),
+        Index("ix_sale_return_items_sale_item_id", "sale_item_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -180,8 +218,20 @@ class SaleReturnItem(TimestampMixin, Base):
     sale_item_id: Mapped[int] = mapped_column(ForeignKey("sale_items.id"), nullable=False)
     quantity: Mapped[Decimal] = mapped_column(Numeric(14, 3), nullable=False)
     unit_price_refunded: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    # M5: the proportional share of the original line's discount_amount/
+    # tax_amount this specific return line reverses, and the frozen COGS
+    # basis (copied from SaleItem.unit_cost_at_sale, NEVER current WAC —
+    # docs/M5_RETURNS_VOIDS_REFUNDS.md "COGS reversal") used for its
+    # inventory/accounting effect. Stored (not recomputed on read) so the
+    # return record itself is as immutable/reproducible as the sale it
+    # reverses.
+    discount_refunded: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    tax_refunded: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    unit_cost_refunded: Mapped[Decimal] = mapped_column(Numeric(14, 6), nullable=False)
     # Damaged returns may not go back to sellable stock — only restock=true
-    # returns generate a SALE_RETURN inventory movement.
+    # returns generate a SALE_RETURN inventory movement and a COGS/
+    # Inventory accounting pair (docs/M5_RETURNS_VOIDS_REFUNDS.md
+    # "Inventory behavior").
     restock: Mapped[bool] = mapped_column(nullable=False, default=True)
 
     sale_return: Mapped[SaleReturn] = relationship(back_populates="items")

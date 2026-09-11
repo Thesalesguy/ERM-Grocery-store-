@@ -58,8 +58,25 @@ if TYPE_CHECKING:
     # never executes these imports.
     from app.modules.inventory.models import StockAdjustment
     from app.modules.purchasing.models import GoodsReceipt, PurchaseReturn
-    from app.modules.sales.models import Sale
+    from app.modules.sales.models import Sale, SaleReturn
     from app.modules.sales.service import PaymentInput, _ComputedLine
+
+
+@dataclass(frozen=True)
+class SaleReturnLineEffect:
+    """One return line's accounting-relevant values, computed once by
+    app.modules.sales.service.create_sale_return from the ORIGINAL,
+    frozen SaleItem — never recomputed here from current price/tax/WAC
+    (docs/M5_RETURNS_VOIDS_REFUNDS.md "Return pricing"/"COGS
+    reversal")."""
+
+    refund_price: Decimal
+    discount_refunded: Decimal
+    tax_refunded: Decimal
+    restock: bool
+    quantity: Decimal
+    unit_cost_refunded: Decimal
+
 
 # Same precision/rounding boundary already established for Weighted
 # Average Cost in app/modules/inventory/service.py — reused here rather
@@ -267,6 +284,84 @@ def post_sale_journal(
         source_type="SALE",
         source_id=sale.id,
         memo=f"Sale {sale.sale_number}",
+        created_by=created_by,
+        lines=lines,
+    )
+
+
+def post_sale_return_journal(
+    db: Session,
+    *,
+    sale_return: "SaleReturn",
+    return_date: date,
+    return_lines: "list[SaleReturnLineEffect]",
+    created_by: int | None,
+) -> JournalEntry | None:
+    """docs/M5_RETURNS_VOIDS_REFUNDS.md "Accounting integration" has the
+    full worked derivation and algebraic balance proof — the exact
+    mirror image of post_sale_journal's proof:
+
+    Debits: Sales Revenue (Σ refund_price) + Tax Payable (Σ tax_refunded,
+    if any) + Inventory (Σ restocked quantity × unit_cost_refunded, if
+    any).
+    Credits: Sales Discounts (Σ discount_refunded, if any) + the refund
+    method's clearing/cash account (the actual refund paid out) + COGS
+    (same Inventory amount, if any).
+
+    Every value comes from `return_lines`, which
+    app.modules.sales.service.create_sale_return builds from the
+    ORIGINAL SaleItem's frozen unit_price_at_sale/unit_cost_at_sale and
+    a telescoping proportional share of discount_amount/tax_amount —
+    never from current product price, tax rate, or WAC. Returns None
+    (posts nothing) if every line's effect is zero-value, matching
+    post_goods_receipt_journal's precedent for a real, legitimate
+    zero-value event.
+    """
+    total_refund_price = Decimal("0")
+    total_discount_refunded = Decimal("0")
+    total_tax_refunded = Decimal("0")
+    cogs_total = Decimal("0")
+    for line in return_lines:
+        total_refund_price += line.refund_price
+        total_discount_refunded += line.discount_refunded
+        total_tax_refunded += line.tax_refunded
+        if line.restock:
+            cogs_total += _quantize(line.quantity * line.unit_cost_refunded)
+    total_refund_amount = total_refund_price - total_discount_refunded + total_tax_refunded
+
+    lines: list[_LineSpec] = []
+    if total_refund_price > 0:
+        lines.append(_debit(ACCOUNT_SALES_REVENUE, total_refund_price))
+    if total_tax_refunded > 0:
+        lines.append(_debit(ACCOUNT_TAX_PAYABLE, total_tax_refunded))
+    if total_discount_refunded > 0:
+        lines.append(_credit(ACCOUNT_SALES_DISCOUNTS, total_discount_refunded))
+    if total_refund_amount > 0:
+        lines.append(
+            _credit(
+                PAYMENT_METHOD_ACCOUNT_CODE[sale_return.refund_method],
+                total_refund_amount,
+                description="Refund issued",
+            )
+        )
+    if cogs_total > 0:
+        lines.append(
+            _debit(ACCOUNT_INVENTORY, cogs_total, description=f"Return {sale_return.return_number}")
+        )
+        lines.append(
+            _credit(ACCOUNT_COGS, cogs_total, description=f"Return {sale_return.return_number}")
+        )
+
+    if not lines:
+        return None
+
+    return _post_journal(
+        db,
+        store_id=sale_return.store_id,
+        posting_date=return_date,
+        source_type="SALE_RETURN",
+        source_id=sale_return.id,
+        memo=f"Return {sale_return.return_number}",
         created_by=created_by,
         lines=lines,
     )

@@ -32,6 +32,17 @@ ACCOUNTING_READ = "accounting.read"
 ACCOUNTING_POST = "accounting.post"
 ACCOUNTING_REVERSE = "accounting.reverse"
 ACCOUNTING_ADMIN = "accounting.admin"
+# M5 (docs/M5_RETURNS_VOIDS_REFUNDS.md "RBAC"): a real POS cashier
+# routinely processes simple merchandise returns, so return.read/write
+# are granted to Cashier alongside pos.use/sales.read. Voiding a WHOLE
+# transaction is a heavier action (it's economically a 100%-quantity
+# return of every line, done in one call) and is deliberately held to
+# Manager/Admin only, mirroring how many real POS systems require a
+# manager override to void a completed sale — a documented business
+# rule, not an arbitrary restriction.
+SALES_RETURN_READ = "sales.return.read"
+SALES_RETURN_WRITE = "sales.return.write"
+SALES_VOID = "sales.void"
 
 ALL_PERMISSIONS: dict[str, str] = {
     PRODUCTS_READ: "View products and barcodes",
@@ -52,6 +63,9 @@ ALL_PERMISSIONS: dict[str, str] = {
     ACCOUNTING_ADMIN: (
         "Manage accounting configuration (reserved for future chart-of-accounts admin)"
     ),
+    SALES_RETURN_READ: "View sale returns and return eligibility",
+    SALES_RETURN_WRITE: "Process a merchandise return against a completed sale",
+    SALES_VOID: "Void an entire completed sale (a full return of every line in one action)",
 }
 
 # --- Roles --------------------------------------------------------------
@@ -87,11 +101,16 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         AUDIT_READ,
         ACCOUNTING_READ,
         ACCOUNTING_REVERSE,
+        SALES_RETURN_READ,
+        SALES_RETURN_WRITE,
+        SALES_VOID,
     ],
     CASHIER: [
         PRODUCTS_READ,
         POS_USE,
         SALES_READ,
+        SALES_RETURN_READ,
+        SALES_RETURN_WRITE,
     ],
     INVENTORY_CLERK: [
         PRODUCTS_READ,
@@ -110,5 +129,6 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         REPORTS_READ,
         AUDIT_READ,
         ACCOUNTING_READ,
+        SALES_RETURN_READ,
     ],
 }

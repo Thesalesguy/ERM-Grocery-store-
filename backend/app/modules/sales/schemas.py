@@ -10,7 +10,7 @@ app.modules.sales.service.finalize_sale from the product catalog and tax
 tables, then frozen.
 """
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -66,6 +66,7 @@ class SaleItemRead(BaseModel):
     tax_rate_id: int | None
     tax_amount: Decimal
     line_total: Decimal
+    quantity_returned: Decimal
     # Denormalized for receipt display — resolved at read time from the
     # product catalog. NOT frozen (a renamed product shows its new name
     # on an old receipt) since a product's *name* isn't one of the
@@ -103,3 +104,97 @@ class SaleRead(BaseModel):
     created_at: datetime
     items: list[SaleItemRead]
     payments: list[PaymentRead]
+
+
+# --- Sale returns / voids (M5) -----------------------------------------
+#
+# SaleReturnLineCreate/SaleReturnCreate/VoidSaleCreate deliberately carry
+# NO price/discount/tax/cost/refund_amount fields — a return's dollar
+# values are always derived server-side from the ORIGINAL sale's frozen
+# data (docs/M5_RETURNS_VOIDS_REFUNDS.md "Return pricing"), never
+# accepted from the client. Only identifiers and quantities.
+
+
+class SaleReturnLineCreate(BaseModel):
+    sale_item_id: int
+    quantity: Decimal = Field(gt=0)
+    restock: bool = True
+
+
+class SaleReturnCreate(BaseModel):
+    store_id: int
+    return_date: date
+    client_transaction_id: str = Field(min_length=1, max_length=100)
+    refund_method: str
+    reason: str | None = Field(default=None, max_length=2000)
+    lines: list[SaleReturnLineCreate] = Field(min_length=1, max_length=500)
+
+    @field_validator("refund_method")
+    @classmethod
+    def _valid_refund_method(cls, value: str) -> str:
+        if value not in PAYMENT_METHODS:
+            raise ValueError(f"refund_method must be one of {PAYMENT_METHODS}")
+        return value
+
+
+class VoidSaleCreate(BaseModel):
+    store_id: int
+    return_date: date
+    client_transaction_id: str = Field(min_length=1, max_length=100)
+    refund_method: str
+    reason: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("refund_method")
+    @classmethod
+    def _valid_refund_method(cls, value: str) -> str:
+        if value not in PAYMENT_METHODS:
+            raise ValueError(f"refund_method must be one of {PAYMENT_METHODS}")
+        return value
+
+
+class SaleReturnItemRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    sale_item_id: int
+    quantity: Decimal
+    unit_price_refunded: Decimal
+    discount_refunded: Decimal
+    tax_refunded: Decimal
+    unit_cost_refunded: Decimal
+    restock: bool
+    product_id: int | None = None
+    product_name: str | None = None
+    product_sku: str | None = None
+
+
+class SaleReturnRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    sale_id: int
+    store_id: int
+    return_number: str
+    client_transaction_id: str
+    reason: str | None
+    refund_method: str
+    refund_amount: Decimal
+    processed_by: int | None
+    created_at: datetime
+    items: list[SaleReturnItemRead] = Field(default_factory=list)
+
+
+class SaleItemReturnEligibilityRead(BaseModel):
+    sale_item_id: int
+    product_id: int
+    quantity: Decimal
+    quantity_returned: Decimal
+    quantity_returnable: Decimal
+    product_name: str | None = None
+    product_sku: str | None = None
+
+
+class SaleReturnEligibilityRead(BaseModel):
+    sale_id: int
+    sale_status: str
+    items: list[SaleItemReturnEligibilityRead]

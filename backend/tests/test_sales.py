@@ -241,6 +241,7 @@ def test_sale_return_data_model(db: Session) -> None:
         sale_id=sale.id,
         store_id=store.id,
         return_number=f"RET-{unique_suffix()}",
+        client_transaction_id=f"ret-txn-{unique_suffix()}",
         reason="Customer changed mind",
         refund_method="CASH",
         refund_amount=Decimal("10.00"),
@@ -254,6 +255,7 @@ def test_sale_return_data_model(db: Session) -> None:
             sale_item_id=sale_item.id,
             quantity=Decimal("1"),
             unit_price_refunded=Decimal("10.00"),
+            unit_cost_refunded=Decimal("5.00"),
             restock=True,
         )
     )

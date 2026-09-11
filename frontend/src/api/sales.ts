@@ -69,3 +69,101 @@ export function finalizeSale(input: SaleCreateInput): Promise<Sale> {
 export function getSale(id: number): Promise<Sale> {
   return apiFetch<Sale>(`/api/v1/sales/${id}`)
 }
+
+// --- Sale returns / voids (M5) ------------------------------------------
+//
+// A return's dollar values (refund price, discount/tax refunded, refund
+// amount) are always computed server-side from the ORIGINAL sale's frozen
+// data — this client only ever sends identifiers and quantities, never a
+// price or amount, matching the same "server is the only source of
+// financial truth" rule finalizeSale already follows.
+
+export interface SaleItemReturnEligibility {
+  sale_item_id: number
+  product_id: number
+  quantity: string
+  quantity_returned: string
+  quantity_returnable: string
+  product_name: string | null
+  product_sku: string | null
+}
+
+export interface SaleReturnEligibility {
+  sale_id: number
+  sale_status: string
+  items: SaleItemReturnEligibility[]
+}
+
+export interface SaleReturnLineInput {
+  sale_item_id: number
+  quantity: string
+  restock?: boolean
+}
+
+export interface SaleReturnCreateInput {
+  store_id: number
+  return_date: string
+  /** Idempotency key — same convention as SaleCreateInput.client_transaction_id:
+   * generate once per return attempt, resend the SAME value on any retry. */
+  client_transaction_id: string
+  refund_method: PaymentInput['payment_method']
+  reason?: string
+  lines: SaleReturnLineInput[]
+}
+
+export interface VoidSaleInput {
+  store_id: number
+  return_date: string
+  client_transaction_id: string
+  refund_method: PaymentInput['payment_method']
+  reason?: string
+}
+
+export interface SaleReturnItem {
+  id: number
+  sale_item_id: number
+  quantity: string
+  unit_price_refunded: string
+  discount_refunded: string
+  tax_refunded: string
+  unit_cost_refunded: string
+  restock: boolean
+  product_id: number | null
+  product_name: string | null
+  product_sku: string | null
+}
+
+export interface SaleReturn {
+  id: number
+  sale_id: number
+  store_id: number
+  return_number: string
+  client_transaction_id: string
+  reason: string | null
+  refund_method: string
+  refund_amount: string
+  processed_by: number | null
+  created_at: string
+  items: SaleReturnItem[]
+}
+
+export function getReturnEligibility(saleId: number): Promise<SaleReturnEligibility> {
+  return apiFetch<SaleReturnEligibility>(`/api/v1/sales/${saleId}/return-eligibility`)
+}
+
+export function createSaleReturn(
+  saleId: number,
+  input: SaleReturnCreateInput,
+): Promise<SaleReturn> {
+  return apiFetch<SaleReturn>(`/api/v1/sales/${saleId}/returns`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
+}
+
+export function voidSale(saleId: number, input: VoidSaleInput): Promise<SaleReturn> {
+  return apiFetch<SaleReturn>(`/api/v1/sales/${saleId}/void`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
+}

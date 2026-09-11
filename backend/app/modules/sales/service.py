@@ -34,7 +34,7 @@ INSUFFICIENT_STOCK — never -1 stock, never two successful sales.
 
 import secrets
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 
 from sqlalchemy import select
@@ -43,11 +43,19 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationAppError
 from app.modules.accounting import service as accounting_service
+from app.modules.accounting.service import SaleReturnLineEffect
 from app.modules.audit import service as audit_service
 from app.modules.auth.models import Store
 from app.modules.inventory import service as inventory_service
 from app.modules.products.models import Product
-from app.modules.sales.models import Payment, Sale, SaleItem
+from app.modules.sales.models import (
+    PAYMENT_METHODS,
+    Payment,
+    Sale,
+    SaleItem,
+    SaleReturn,
+    SaleReturnItem,
+)
 from app.modules.tax.models import TaxRate
 
 _MONEY_QUANTUM = Decimal("0.01")
@@ -55,6 +63,19 @@ _MONEY_QUANTUM = Decimal("0.01")
 
 def _round_money(value: Decimal) -> Decimal:
     return value.quantize(_MONEY_QUANTUM, rounding=ROUND_HALF_UP)
+
+
+def _enforce_store_access(caller_store_id: int | None, target_store_id: int, noun: str) -> None:
+    """Mirrors app.modules.purchasing.service._enforce_store_access —
+    duplicated (not imported) so this module keeps no dependency on the
+    auth module and stays testable by calling its functions directly,
+    same rationale as finalize_sale's existing store check."""
+    if caller_store_id is not None and caller_store_id != target_store_id:
+        raise ForbiddenError(
+            f"Your account is scoped to store {caller_store_id} and cannot "
+            f"access {noun} in store {target_store_id}",
+            error_code="STORE_ACCESS_DENIED",
+        )
 
 
 @dataclass(frozen=True)
@@ -422,3 +443,550 @@ def list_sales(
     if store_id is not None:
         query = query.where(Sale.store_id == store_id)
     return list(db.execute(query).scalars().all())
+
+
+# --- Sale returns / voids (M5) ----------------------------------------------
+#
+# docs/M5_RETURNS_VOIDS_REFUNDS.md has the full design. Summary of the
+# load-bearing decisions:
+#
+# - A "void" is not a separate code path: every Sale here is created
+#   already COMPLETED with inventory already moved, so void_sale() is a
+#   thin wrapper that computes "every line's full remaining quantity"
+#   and calls create_sale_return() with it — same locking, same
+#   validation, same accounting, same audit machinery, distinguished
+#   only by which audit action string is logged.
+# - Return pricing NEVER reads current product price/tax/WAC — every
+#   dollar amount is derived from the ORIGINAL SaleItem's frozen
+#   unit_price_at_sale/unit_cost_at_sale and a *proportional, telescoping*
+#   share of discount_amount/tax_amount (see _proportional_share below),
+#   so repeated partial returns of one line can never sum to more than
+#   the original line's discount/tax, regardless of rounding.
+# - SaleItem.quantity_returned is a maintained cache incremented only
+#   here, under a lock on the parent Sale row acquired FIRST — the exact
+#   same "lock the parent to serialize writes to a child aggregate"
+#   pattern app.modules.purchasing.service.receive_goods established for
+#   PurchaseOrder/PurchaseOrderItem.quantity_received.
+# - WAC on a restocked return reuses the existing
+#   inventory_service.compute_new_wac unchanged — a return is treated as
+#   a "receipt" of previously-owned inventory at its own historical cost
+#   (unit_cost_at_sale). If nothing else has changed a product's WAC
+#   since the original sale, this returns the pre-sale WAC exactly
+#   (averaging a cost with itself); if the WAC has since moved, it
+#   correctly blends the returned units' known historical cost into the
+#   current average — no new algorithm, the existing one already
+#   supports this.
+
+
+@dataclass(frozen=True)
+class SaleReturnLineInput:
+    sale_item_id: int
+    quantity: Decimal
+    restock: bool = True
+
+
+def _generate_return_number(store_id: int) -> str:
+    timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+    return f"RET{store_id}-{timestamp}-{secrets.token_hex(3).upper()}"
+
+
+def _proportional_share(
+    *,
+    total: Decimal,
+    original_qty: Decimal,
+    already_returned_qty: Decimal,
+    this_return_qty: Decimal,
+) -> Decimal:
+    """The telescoping-entitlement technique: this return's share of a
+    line-level aggregate (discount_amount or tax_amount) is the
+    difference between the rounded cumulative entitlement AFTER this
+    return and the rounded cumulative entitlement BEFORE it — not
+    `total * this_return_qty / original_qty` computed fresh each time.
+
+    This guarantees the sum of every partial return's share, across any
+    number of separate return transactions against the same line, never
+    exceeds `total` and telescopes to exactly `total` once the full
+    quantity has been returned — regardless of how rounding falls on any
+    individual return. If `original_qty` were ever zero this would
+    divide by zero, but SaleItem.quantity has a CHECK (> 0), so an
+    original line always has a positive quantity to divide by.
+    """
+    if total == 0:
+        return Decimal("0")
+    new_cumulative_qty = already_returned_qty + this_return_qty
+    entitled_after = _round_money(total * new_cumulative_qty / original_qty)
+    entitled_before = _round_money(total * already_returned_qty / original_qty)
+    return entitled_after - entitled_before
+
+
+def _match_or_reject_idempotent_return(
+    db: Session,
+    *,
+    client_transaction_id: str,
+    sale_id: int,
+    refund_method: str,
+    lines: list[SaleReturnLineInput],
+) -> SaleReturn | None:
+    """Looks up an existing SaleReturn by `client_transaction_id` and
+    either returns it (identical payload), raises IDEMPOTENCY_KEY_CONFLICT
+    (a different payload reusing the same key), or returns None (no prior
+    return with this key — the caller may proceed).
+
+    Called twice by create_sale_return: once before any lock (fast path
+    for the common sequential-retry case), and once again immediately
+    after the Sale row lock is acquired. The second call is not redundant
+    — two callers racing with the SAME client_transaction_id can both pass
+    the first, unlocked check before either has committed. Postgres holds
+    the Sale row's FOR UPDATE lock until commit, so by the time the loser
+    acquires that lock the winner's row (if any) is already committed and
+    visible here, closing the race that would otherwise surface as the
+    loser hitting SALE_NOT_RETURNABLE or EXCESSIVE_RETURN_QUANTITY instead
+    of transparently receiving the winner's result.
+    """
+    existing = db.execute(
+        select(SaleReturn).where(SaleReturn.client_transaction_id == client_transaction_id)
+    ).scalar_one_or_none()
+    if existing is None:
+        return None
+    existing_items = (
+        db.execute(select(SaleReturnItem).where(SaleReturnItem.sale_return_id == existing.id))
+        .scalars()
+        .all()
+    )
+    existing_signature = sorted(
+        (item.sale_item_id, item.quantity, item.restock) for item in existing_items
+    )
+    requested_signature = sorted((line.sale_item_id, line.quantity, line.restock) for line in lines)
+    if (
+        existing.sale_id != sale_id
+        or existing.refund_method != refund_method
+        or existing_signature != requested_signature
+    ):
+        raise ConflictError(
+            f"client_transaction_id {client_transaction_id!r} was already used for a "
+            "different return request",
+            error_code="IDEMPOTENCY_KEY_CONFLICT",
+        )
+    return existing
+
+
+def create_sale_return(
+    db: Session,
+    *,
+    sale_id: int,
+    store_id: int,
+    return_date: date,
+    lines: list[SaleReturnLineInput],
+    refund_method: str,
+    client_transaction_id: str,
+    caller_store_id: int | None,
+    reason: str | None = None,
+    created_by: int | None = None,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+    _is_void: bool = False,
+) -> SaleReturn:
+    """Atomically: idempotency fast path -> validate -> lock the Sale row
+    -> validate sale/line state -> lock affected product rows (restocked
+    lines only, sorted, deadlock-safe) -> compute refund per line from
+    frozen sale data -> post one inventory movement + WAC recompute per
+    restocked line -> update quantity_returned -> advance Sale.status ->
+    audit -> post accounting -> return (caller commits).
+
+    `client_transaction_id` idempotency (mirrors finalize_sale/
+    receive_goods exactly) is extended here per M5 task Section 8: a
+    retried request with the SAME key and an equivalent payload returns
+    the original return; the SAME key with a DIFFERENT payload (a
+    conflicting reuse — e.g. a client bug reusing a UUID for a different
+    return) is rejected with IDEMPOTENCY_KEY_CONFLICT rather than
+    silently returning an unrelated result or silently creating a second
+    one.
+    """
+    if refund_method not in PAYMENT_METHODS:
+        raise ValidationAppError(
+            f"Invalid refund method {refund_method!r}", error_code="INVALID_REFUND_METHOD"
+        )
+
+    # --- Idempotency fast path (before any lock/validation work). This
+    # alone is NOT sufficient under concurrency: two callers with the same
+    # client_transaction_id can both pass this check before either has
+    # committed (see the second check after the Sale lock below, which is
+    # what actually closes the race). -------------------------------------
+    existing = _match_or_reject_idempotent_return(
+        db,
+        client_transaction_id=client_transaction_id,
+        sale_id=sale_id,
+        refund_method=refund_method,
+        lines=lines,
+    )
+    if existing is not None:
+        return existing
+
+    if not lines:
+        raise ValidationAppError("A return must have at least one line", error_code="EMPTY_RETURN")
+    for line in lines:
+        if line.quantity <= 0:
+            raise ValidationAppError(
+                "Return quantity must be positive", error_code="INVALID_QUANTITY"
+            )
+
+    # --- Store-scope check against the sale's REAL store, before any
+    # lock is taken (fail fast, no wasted lock contention for a request
+    # that's going to be rejected anyway — receive_goods's pattern). ----
+    if caller_store_id is not None:
+        actual_store_id = db.execute(
+            select(Sale.store_id).where(Sale.id == sale_id)
+        ).scalar_one_or_none()
+        if actual_store_id is not None and actual_store_id != caller_store_id:
+            raise ForbiddenError(
+                f"Your account is scoped to store {caller_store_id} and cannot return "
+                f"against a sale in store {actual_store_id}",
+                error_code="STORE_ACCESS_DENIED",
+            )
+
+    # --- Lock the Sale row: serializes every write to any of its items'
+    # quantity_returned (see module docstring above). --------------------
+    sale = db.execute(select(Sale).where(Sale.id == sale_id).with_for_update()).scalar_one_or_none()
+    if sale is None:
+        raise NotFoundError(f"Sale {sale_id} not found")
+
+    # --- Idempotency re-check, now that the Sale row's lock guarantees
+    # any concurrent identical request either hasn't started or has fully
+    # committed (see _match_or_reject_idempotent_return's docstring). ----
+    existing = _match_or_reject_idempotent_return(
+        db,
+        client_transaction_id=client_transaction_id,
+        sale_id=sale_id,
+        refund_method=refund_method,
+        lines=lines,
+    )
+    if existing is not None:
+        return existing
+
+    if sale.store_id != store_id:
+        raise ConflictError(
+            f"Sale {sale_id} does not belong to store {store_id}", error_code="STORE_MISMATCH"
+        )
+    if sale.status not in ("COMPLETED", "PARTIALLY_REFUNDED"):
+        raise ConflictError(
+            f"Sale {sale_id} is {sale.status} and cannot be returned against "
+            "(must be COMPLETED or PARTIALLY_REFUNDED)",
+            error_code="SALE_NOT_RETURNABLE",
+        )
+
+    # --- Resolve and validate every line's SaleItem, summing duplicate
+    # lines against the same item (finalize_sale's cart-summing pattern).
+    # Batched into one IN(...) query rather than one db.get() per line —
+    # unlike the product-locking loop below (which needs FOR UPDATE in a
+    # fixed per-row order for deadlock safety), this is a plain read with
+    # no ordering requirement, so there is no reason to pay one
+    # round-trip per line for a request that can carry up to 500. --------
+    distinct_sale_item_ids = {line.sale_item_id for line in lines}
+    sale_items_by_id: dict[int, SaleItem] = {
+        item.id: item
+        for item in db.execute(
+            select(SaleItem).where(SaleItem.id.in_(distinct_sale_item_ids))
+        ).scalars()
+    }
+    requested_qty_by_item: dict[int, Decimal] = {}
+    restock_by_item: dict[int, bool] = {}
+    for line in lines:
+        sale_item = sale_items_by_id.get(line.sale_item_id)
+        if sale_item is None or sale_item.sale_id != sale_id:
+            # A tampered/foreign sale_item_id — never reveal whether the
+            # ID exists at all, just that it's not valid on this sale.
+            raise NotFoundError(f"Sale item {line.sale_item_id} not found on sale {sale_id}")
+        requested_qty_by_item[sale_item.id] = (
+            requested_qty_by_item.get(sale_item.id, Decimal("0")) + line.quantity
+        )
+        # If the same item is returned in two lines with conflicting
+        # restock flags in one request, the more conservative (restock)
+        # wins — never silently discards a restock the client asked for.
+        restock_by_item[sale_item.id] = restock_by_item.get(sale_item.id, False) or line.restock
+
+    for sale_item_id, requested_qty in requested_qty_by_item.items():
+        sale_item = sale_items_by_id[sale_item_id]
+        remaining = sale_item.quantity - sale_item.quantity_returned
+        if requested_qty > remaining:
+            raise ConflictError(
+                f"Cannot return {requested_qty} of sale item {sale_item_id}: only "
+                f"{remaining} remains returnable (of {sale_item.quantity} originally sold)",
+                error_code="EXCESSIVE_RETURN_QUANTITY",
+            )
+
+    # --- Lock every distinct product row that will actually be
+    # restocked, ascending id order (deadlock-safe). ---------------------
+    restock_product_ids = sorted(
+        {
+            sale_items_by_id[item_id].product_id
+            for item_id, restock in restock_by_item.items()
+            if restock
+        }
+    )
+    locked_products: dict[int, Product] = {
+        product_id: inventory_service.lock_product_for_update(db, product_id)
+        for product_id in restock_product_ids
+    }
+
+    sale_return = SaleReturn(
+        sale_id=sale_id,
+        store_id=store_id,
+        return_number=_generate_return_number(store_id),
+        client_transaction_id=client_transaction_id,
+        reason=reason,
+        refund_method=refund_method,
+        refund_amount=Decimal("0"),  # filled in below once every line is computed
+        processed_by=created_by,
+    )
+    db.add(sale_return)
+    try:
+        db.flush()
+    except IntegrityError:
+        # Genuinely concurrent duplicate submission — see finalize_sale's
+        # identical recovery block. Rolling back also releases the Sale/
+        # product locks this attempt acquired.
+        db.rollback()
+        winner = db.execute(
+            select(SaleReturn).where(SaleReturn.client_transaction_id == client_transaction_id)
+        ).scalar_one_or_none()
+        if winner is None:
+            raise
+        return winner
+
+    audit_service.log_event(
+        db,
+        user_id=created_by,
+        action="SALE_RETURN_INITIATED",
+        entity_type="sale_return",
+        entity_id=sale_return.id,
+        after={
+            "sale_id": sale_id,
+            "line_count": len(lines),
+            "client_transaction_id": client_transaction_id,
+        },
+        ip_address=ip_address,
+        user_agent=user_agent,
+    )
+
+    return_effects: list[SaleReturnLineEffect] = []
+    total_refund_amount = Decimal("0")
+    for sale_item_id, requested_qty in requested_qty_by_item.items():
+        sale_item = sale_items_by_id[sale_item_id]
+        restock = restock_by_item[sale_item_id]
+        already_returned = sale_item.quantity_returned
+
+        refund_price = _round_money(sale_item.unit_price_at_sale * requested_qty)
+        discount_refunded = _proportional_share(
+            total=sale_item.discount_amount,
+            original_qty=sale_item.quantity,
+            already_returned_qty=already_returned,
+            this_return_qty=requested_qty,
+        )
+        tax_refunded = _proportional_share(
+            total=sale_item.tax_amount,
+            original_qty=sale_item.quantity,
+            already_returned_qty=already_returned,
+            this_return_qty=requested_qty,
+        )
+        line_refund_amount = refund_price - discount_refunded + tax_refunded
+        total_refund_amount += line_refund_amount
+
+        db.add(
+            SaleReturnItem(
+                sale_return_id=sale_return.id,
+                sale_item_id=sale_item.id,
+                quantity=requested_qty,
+                unit_price_refunded=sale_item.unit_price_at_sale,
+                discount_refunded=discount_refunded,
+                tax_refunded=tax_refunded,
+                unit_cost_refunded=sale_item.unit_cost_at_sale,
+                restock=restock,
+            )
+        )
+
+        if restock:
+            product = locked_products[sale_item.product_id]
+            new_wac = inventory_service.compute_new_wac(
+                existing_qty=product.current_qty_on_hand,
+                existing_wac=product.current_cost,
+                received_qty=requested_qty,
+                received_unit_cost=sale_item.unit_cost_at_sale,
+            )
+            inventory_service.record_movement(
+                db,
+                product=product,
+                store_id=store_id,
+                movement_type="SALE_RETURN",
+                quantity_delta=requested_qty,
+                unit_cost_at_movement=sale_item.unit_cost_at_sale,
+                reference_type="sale_return",
+                reference_id=sale_return.id,
+                created_by=created_by,
+                new_product_cost=new_wac,
+            )
+
+        sale_item.quantity_returned = already_returned + requested_qty
+
+        return_effects.append(
+            SaleReturnLineEffect(
+                refund_price=refund_price,
+                discount_refunded=discount_refunded,
+                tax_refunded=tax_refunded,
+                restock=restock,
+                quantity=requested_qty,
+                unit_cost_refunded=sale_item.unit_cost_at_sale,
+            )
+        )
+
+    sale_return.refund_amount = total_refund_amount
+
+    # --- Advance Sale.status (mirrors purchasing's
+    # _advance_purchase_order_status exactly) ----------------------------
+    all_items = list(sale.items)
+    if all_items and all(item.quantity_returned >= item.quantity for item in all_items):
+        sale.status = "REFUNDED"
+    elif any(item.quantity_returned > 0 for item in all_items):
+        sale.status = "PARTIALLY_REFUNDED"
+
+    audit_service.log_event(
+        db,
+        user_id=created_by,
+        action="VOID_COMPLETED" if _is_void else "SALE_RETURN_COMPLETED",
+        entity_type="sale_return",
+        entity_id=sale_return.id,
+        after={
+            "sale_id": sale_id,
+            "return_number": sale_return.return_number,
+            "refund_amount": total_refund_amount,
+            "refund_method": refund_method,
+            "resulting_sale_status": sale.status,
+        },
+        ip_address=ip_address,
+        user_agent=user_agent,
+    )
+
+    accounting_service.post_sale_return_journal(
+        db,
+        sale_return=sale_return,
+        return_date=return_date,
+        return_lines=return_effects,
+        created_by=created_by,
+    )
+
+    db.flush()
+    return sale_return
+
+
+def void_sale(
+    db: Session,
+    *,
+    sale_id: int,
+    store_id: int,
+    return_date: date,
+    refund_method: str,
+    client_transaction_id: str,
+    caller_store_id: int | None,
+    reason: str | None = None,
+    created_by: int | None = None,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+) -> SaleReturn:
+    """A full-sale void = a return of every line's full remaining
+    quantity, restocked, in one call — see the module docstring above
+    for why this is not a separate implementation. Idempotent under the
+    same client_transaction_id as create_sale_return (they share one
+    uniqueness space on sale_returns.client_transaction_id)."""
+    sale = db.execute(select(Sale).where(Sale.id == sale_id).with_for_update()).scalar_one_or_none()
+    if sale is None:
+        raise NotFoundError(f"Sale {sale_id} not found")
+    _enforce_store_access(caller_store_id, sale.store_id, "this sale")
+
+    remaining_lines = [
+        SaleReturnLineInput(
+            sale_item_id=item.id, quantity=item.quantity - item.quantity_returned, restock=True
+        )
+        for item in sale.items
+        if item.quantity > item.quantity_returned
+    ]
+    if not remaining_lines:
+        raise ConflictError(
+            f"Sale {sale_id} has nothing left to void (already fully refunded)",
+            error_code="NOTHING_TO_VOID",
+        )
+
+    return create_sale_return(
+        db,
+        sale_id=sale_id,
+        store_id=store_id,
+        return_date=return_date,
+        lines=remaining_lines,
+        refund_method=refund_method,
+        client_transaction_id=client_transaction_id,
+        caller_store_id=caller_store_id,
+        reason=reason or "Full sale void",
+        created_by=created_by,
+        ip_address=ip_address,
+        user_agent=user_agent,
+        _is_void=True,
+    )
+
+
+def get_sale_return(db: Session, sale_return_id: int) -> SaleReturn:
+    sale_return = db.execute(
+        select(SaleReturn)
+        .options(selectinload(SaleReturn.items))
+        .where(SaleReturn.id == sale_return_id)
+    ).scalar_one_or_none()
+    if sale_return is None:
+        raise NotFoundError(f"Sale return {sale_return_id} not found")
+    return sale_return
+
+
+def list_sale_returns(
+    db: Session,
+    *,
+    sale_id: int | None = None,
+    store_id: int | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[SaleReturn]:
+    query = (
+        select(SaleReturn)
+        .options(selectinload(SaleReturn.items))
+        .order_by(SaleReturn.created_at.desc(), SaleReturn.id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    if sale_id is not None:
+        query = query.where(SaleReturn.sale_id == sale_id)
+    if store_id is not None:
+        query = query.where(SaleReturn.store_id == store_id)
+    return list(db.execute(query).scalars().all())
+
+
+@dataclass(frozen=True)
+class SaleItemReturnEligibility:
+    sale_item_id: int
+    product_id: int
+    quantity: Decimal
+    quantity_returned: Decimal
+    quantity_returnable: Decimal
+
+
+def get_return_eligibility(db: Session, sale_id: int) -> list[SaleItemReturnEligibility]:
+    """Read-only: how much of each line on this sale can still be
+    returned. Used by the eligibility endpoint and the frontend return
+    screen — never authoritative for what a return actually applies
+    (create_sale_return re-validates everything itself, under a lock, at
+    request time)."""
+    sale = get_sale(db, sale_id)
+    return [
+        SaleItemReturnEligibility(
+            sale_item_id=item.id,
+            product_id=item.product_id,
+            quantity=item.quantity,
+            quantity_returned=item.quantity_returned,
+            quantity_returnable=item.quantity - item.quantity_returned,
+        )
+        for item in sale.items
+    ]
