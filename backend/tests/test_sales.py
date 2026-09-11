@@ -59,6 +59,8 @@ def test_sale_item_freezes_cost_independent_of_later_wac_changes(db: Session) ->
     db.commit()
     purchasing_service.receive_goods(
         db,
+        client_transaction_id=f"txn-{unique_suffix()}",
+        caller_store_id=None,
         purchase_order_id=po.id,
         received_date=date(2024, 1, 1),
         lines=[GoodsReceiptLineInput(item.id, Decimal("10"), Decimal("10.00"))],
@@ -92,6 +94,8 @@ def test_sale_item_freezes_cost_independent_of_later_wac_changes(db: Session) ->
     db.commit()
     purchasing_service.receive_goods(
         db,
+        client_transaction_id=f"txn-{unique_suffix()}",
+        caller_store_id=None,
         purchase_order_id=po2.id,
         received_date=date(2024, 2, 1),
         lines=[GoodsReceiptLineInput(item2.id, Decimal("10"), Decimal("50.00"))],

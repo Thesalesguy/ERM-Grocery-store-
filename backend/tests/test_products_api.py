@@ -203,6 +203,8 @@ def test_price_change_does_not_affect_historical_sale(client: TestClient, db: Se
     db.commit()
     purchasing_service.receive_goods(
         db,
+        client_transaction_id=f"txn-{unique_suffix()}",
+        caller_store_id=None,
         purchase_order_id=po.id,
         received_date=date.today(),
         lines=[GoodsReceiptLineInput(item.id, Decimal("10"), Decimal("4.00"))],

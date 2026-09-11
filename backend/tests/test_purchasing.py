@@ -18,7 +18,13 @@ from app.modules.inventory import service as inventory_service
 from app.modules.purchasing import service as purchasing_service
 from app.modules.purchasing.models import PurchaseOrderItem
 from app.modules.purchasing.service import GoodsReceiptLineInput
-from tests.factories import make_product, make_purchase_order, make_store, make_supplier
+from tests.factories import (
+    make_product,
+    make_purchase_order,
+    make_store,
+    make_supplier,
+    unique_suffix,
+)
 
 
 def _make_po_with_item(db: Session, *, quantity_ordered: Decimal, unit_cost: Decimal):
@@ -55,6 +61,8 @@ def test_wac_matches_worked_example_100_at_10_plus_50_at_14(db: Session) -> None
 
     purchasing_service.receive_goods(
         db,
+        client_transaction_id=f"txn-{unique_suffix()}",
+        caller_store_id=None,
         purchase_order_id=po.id,
         received_date=date(2024, 1, 1),
         lines=[GoodsReceiptLineInput(item.id, Decimal("100"), Decimal("10.00"))],
@@ -66,6 +74,8 @@ def test_wac_matches_worked_example_100_at_10_plus_50_at_14(db: Session) -> None
 
     purchasing_service.receive_goods(
         db,
+        client_transaction_id=f"txn-{unique_suffix()}",
+        caller_store_id=None,
         purchase_order_id=po.id,
         received_date=date(2024, 1, 2),
         lines=[GoodsReceiptLineInput(item.id, Decimal("50"), Decimal("14.00"))],
@@ -85,12 +95,16 @@ def test_wac_after_third_purchase_at_a_different_cost(db: Session) -> None:
 
     purchasing_service.receive_goods(
         db,
+        client_transaction_id=f"txn-{unique_suffix()}",
+        caller_store_id=None,
         purchase_order_id=po.id,
         received_date=date(2024, 1, 1),
         lines=[GoodsReceiptLineInput(item.id, Decimal("100"), Decimal("10.00"))],
     )
     purchasing_service.receive_goods(
         db,
+        client_transaction_id=f"txn-{unique_suffix()}",
+        caller_store_id=None,
         purchase_order_id=po.id,
         received_date=date(2024, 1, 2),
         lines=[GoodsReceiptLineInput(item.id, Decimal("50"), Decimal("14.00"))],
@@ -100,6 +114,8 @@ def test_wac_after_third_purchase_at_a_different_cost(db: Session) -> None:
     # Third receipt at yet another cost: (150 * 11.333333 + 50 * 20) / 200
     purchasing_service.receive_goods(
         db,
+        client_transaction_id=f"txn-{unique_suffix()}",
+        caller_store_id=None,
         purchase_order_id=po.id,
         received_date=date(2024, 1, 3),
         lines=[GoodsReceiptLineInput(item.id, Decimal("50"), Decimal("20.00"))],
@@ -124,6 +140,8 @@ def test_partial_goods_receipt_leaves_status_partially_received(db: Session) -> 
 
     purchasing_service.receive_goods(
         db,
+        client_transaction_id=f"txn-{unique_suffix()}",
+        caller_store_id=None,
         purchase_order_id=po.id,
         received_date=date(2024, 1, 1),
         lines=[GoodsReceiptLineInput(item.id, Decimal("40"), Decimal("5.00"))],
@@ -145,6 +163,8 @@ def test_over_receipt_is_allowed(db: Session) -> None:
 
     purchasing_service.receive_goods(
         db,
+        client_transaction_id=f"txn-{unique_suffix()}",
+        caller_store_id=None,
         purchase_order_id=po.id,
         received_date=date(2024, 1, 1),
         lines=[GoodsReceiptLineInput(item.id, Decimal("15"), Decimal("5.00"))],
@@ -167,6 +187,8 @@ def test_cannot_receive_against_a_cancelled_purchase_order(db: Session) -> None:
     with pytest.raises(ConflictError):
         purchasing_service.receive_goods(
             db,
+            client_transaction_id=f"txn-{unique_suffix()}",
+            caller_store_id=None,
             purchase_order_id=po.id,
             received_date=date(2024, 1, 1),
             lines=[GoodsReceiptLineInput(item.id, Decimal("5"), Decimal("5.00"))],
@@ -183,6 +205,8 @@ def test_wac_resets_cleanly_after_stock_reaches_zero_and_reopens(db: Session) ->
     )
     purchasing_service.receive_goods(
         db,
+        client_transaction_id=f"txn-{unique_suffix()}",
+        caller_store_id=None,
         purchase_order_id=po.id,
         received_date=date(2024, 1, 1),
         lines=[GoodsReceiptLineInput(item.id, Decimal("10"), Decimal("10.00"))],
@@ -221,6 +245,8 @@ def test_wac_resets_cleanly_after_stock_reaches_zero_and_reopens(db: Session) ->
 
     purchasing_service.receive_goods(
         db,
+        client_transaction_id=f"txn-{unique_suffix()}",
+        caller_store_id=None,
         purchase_order_id=po2.id,
         received_date=date(2024, 2, 1),
         lines=[GoodsReceiptLineInput(item2.id, Decimal("20"), Decimal("7.50"))],
@@ -263,6 +289,8 @@ def test_purchase_return_data_model(db: Session) -> None:
     )
     purchasing_service.receive_goods(
         db,
+        client_transaction_id=f"txn-{unique_suffix()}",
+        caller_store_id=None,
         purchase_order_id=po.id,
         received_date=date(2024, 1, 1),
         lines=[GoodsReceiptLineInput(item.id, Decimal("10"), Decimal("12.00"))],
@@ -272,6 +300,7 @@ def test_purchase_return_data_model(db: Session) -> None:
     purchase_return = PurchaseReturn(
         purchase_order_id=po.id,
         store_id=store.id,
+        client_transaction_id=f"txn-{unique_suffix()}",
         return_date=date(2024, 1, 5),
         reason="Damaged in transit",
     )

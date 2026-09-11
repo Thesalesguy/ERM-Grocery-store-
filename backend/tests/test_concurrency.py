@@ -142,6 +142,8 @@ def test_two_concurrent_sales_against_one_unit_of_stock_cannot_both_succeed() ->
         setup_session.commit()
         purchasing_service.receive_goods(
             setup_session,
+            client_transaction_id=f"txn-{uuid.uuid4().hex}",
+            caller_store_id=None,
             purchase_order_id=po.id,
             received_date=date.today(),
             lines=[GoodsReceiptLineInput(item.id, Decimal("1"), Decimal("40.00"))],
@@ -248,6 +250,8 @@ def test_five_concurrent_sales_against_one_unit_only_one_succeeds() -> None:
         setup_session.commit()
         purchasing_service.receive_goods(
             setup_session,
+            client_transaction_id=f"txn-{uuid.uuid4().hex}",
+            caller_store_id=None,
             purchase_order_id=po.id,
             received_date=date.today(),
             lines=[GoodsReceiptLineInput(item.id, Decimal("1"), Decimal("20.00"))],
@@ -614,6 +618,8 @@ def test_concurrent_sale_and_goods_receipt_serialize_correctly() -> None:
             barrier.wait(timeout=10)
             purchasing_service.receive_goods(
                 session,
+                client_transaction_id=f"txn-{uuid.uuid4().hex}",
+                caller_store_id=None,
                 purchase_order_id=po_id,
                 received_date=date.today(),
                 lines=[GoodsReceiptLineInput(item_id, Decimal("10"), Decimal("4.00"))],
