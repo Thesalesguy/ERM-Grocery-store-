@@ -26,6 +26,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -33,9 +34,39 @@ from app.db.base_class import Base, TimestampMixin
 
 
 class Supplier(TimestampMixin, Base):
+    """Shared/global reference data (M3 decision, documented rather than
+    silently assumed): a supplier is a business-wide vendor relationship,
+    not one store's data — a chain's multiple stores buy from the same
+    supplier, and the blueprint's "Supplier totals" report already
+    assumes a global join. This matches the existing precedent of
+    `ProductCategory`/`TaxRate` (shared reference data), as opposed to
+    `Product`/`Sale`/`PurchaseOrder` (store-scoped operational data).
+    RBAC for suppliers reuses `purchasing.read`/`purchasing.write` rather
+    than a store filter — see docs/M3_PURCHASING_RECEIVING_WAC.md.
+
+    No `created_by`/`updated_by` columns, matching `ProductCategory`'s
+    precedent (reference/master data doesn't track an acting user as a
+    column here; "who changed this supplier" is answered by the audit
+    log, same as product catalog changes since the M2 hardening fix) —
+    unlike transactional/event tables (PurchaseOrder, GoodsReceipt,
+    StockAdjustment), which do.
+    """
+
     __tablename__ = "suppliers"
+    __table_args__ = (
+        # Optional short reference code, unique when actually set (NULLs
+        # are never compared equal in a plain UNIQUE constraint, so this
+        # partial index is what actually enforces "unique if present").
+        Index(
+            "uq_suppliers_code",
+            "code",
+            unique=True,
+            postgresql_where=text("code IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    code: Mapped[str | None] = mapped_column(String(64))
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     contact_name: Mapped[str | None] = mapped_column(String(255))
     phone: Mapped[str | None] = mapped_column(String(64))
@@ -101,13 +132,29 @@ class PurchaseOrderItem(TimestampMixin, Base):
 
 class GoodsReceipt(TimestampMixin, Base):
     """One physical receiving event against a purchase order. A purchase
-    order can have several (partial deliveries)."""
+    order can have several (partial deliveries).
+
+    `store_id` is redundant with `purchase_order.store_id` (same pattern
+    already used by `PurchaseReturn` below) — kept as its own column so
+    store-scoped queries/authorization checks (M2 hardening audit Section
+    12; M3 extends the same rule to purchasing) don't require a join.
+
+    `client_transaction_id` is the idempotency key (M2 hardening audit
+    Section 7's pattern, extended to M3): a goods receipt changes
+    inventory and cost, so it must be as safe against a retried/duplicated
+    request as a sale is. See app.modules.purchasing.service.receive_goods.
+    """
 
     __tablename__ = "goods_receipts"
-    __table_args__ = (Index("ix_goods_receipts_purchase_order_id", "purchase_order_id"),)
+    __table_args__ = (
+        Index("ix_goods_receipts_purchase_order_id", "purchase_order_id"),
+        Index("ix_goods_receipts_store_id", "store_id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     purchase_order_id: Mapped[int] = mapped_column(ForeignKey("purchase_orders.id"), nullable=False)
+    store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), nullable=False)
+    client_transaction_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
     received_date: Mapped[date] = mapped_column(Date, nullable=False)
     received_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
     notes: Mapped[str | None] = mapped_column(Text)
@@ -141,7 +188,19 @@ class GoodsReceiptItem(TimestampMixin, Base):
 
 
 class PurchaseReturn(TimestampMixin, Base):
-    """Goods sent back to a supplier (damaged/wrong item)."""
+    """Goods sent back to a supplier (damaged/wrong item).
+
+    Cost basis limitation (M3, documented rather than silently assumed):
+    there is no per-receipt-lot tracking in this schema (the same
+    limitation the blueprint already accepts for WAC purchase-returns,
+    Section D edge case 6), so a return's `unit_cost` is the product's
+    *current* Weighted Average Cost at return time, not necessarily the
+    exact cost of the specific lot being physically sent back. This
+    mirrors how record_movement() already treats every other removal
+    (SALE, STOCK_ADJUSTMENT_OUT): removing stock never changes WAC, only
+    receiving does — a return is architecturally identical to those, not
+    a special case.
+    """
 
     __tablename__ = "purchase_returns"
     __table_args__ = (
@@ -152,6 +211,7 @@ class PurchaseReturn(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     purchase_order_id: Mapped[int] = mapped_column(ForeignKey("purchase_orders.id"), nullable=False)
     store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), nullable=False)
+    client_transaction_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
     return_date: Mapped[date] = mapped_column(Date, nullable=False)
     reason: Mapped[str | None] = mapped_column(Text)
     created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
