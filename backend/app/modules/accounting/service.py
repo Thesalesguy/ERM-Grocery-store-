@@ -33,15 +33,20 @@ from sqlalchemy.orm import Session
 
 from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationAppError
 from app.modules.accounting.constants import (
+    ACCOUNT_ACCOUNTS_PAYABLE,
     ACCOUNT_COGS,
     ACCOUNT_INVENTORY,
     ACCOUNT_INVENTORY_ADJUSTMENT_GAIN,
     ACCOUNT_INVENTORY_SHRINKAGE_EXPENSE,
     ACCOUNT_PURCHASE_CLEARING,
+    ACCOUNT_PURCHASE_DISCOUNTS,
+    ACCOUNT_PURCHASE_PRICE_VARIANCE,
+    ACCOUNT_PURCHASE_TAX_EXPENSE,
     ACCOUNT_SALES_DISCOUNTS,
     ACCOUNT_SALES_REVENUE,
     ACCOUNT_TAX_PAYABLE,
     PAYMENT_METHOD_ACCOUNT_CODE,
+    SUPPLIER_PAYMENT_METHOD_ACCOUNT_CODE,
 )
 from app.modules.accounting.models import (
     AUTOMATED_SOURCE_TYPES,
@@ -52,10 +57,11 @@ from app.modules.accounting.models import (
 from app.modules.audit import service as audit_service
 
 if TYPE_CHECKING:
-    # Import cycle avoidance: sales/purchasing/inventory service modules
+    # Import cycle avoidance: sales/purchasing/inventory/ap service modules
     # import THIS module to post accounting entries, so this module must
     # not import them back at runtime — only for type-checking, which
     # never executes these imports.
+    from app.modules.ap.models import PurchaseInvoice, SupplierPayment
     from app.modules.inventory.models import StockAdjustment
     from app.modules.purchasing.models import GoodsReceipt, PurchaseReturn
     from app.modules.sales.models import Sale, SaleReturn
@@ -444,6 +450,187 @@ def post_purchase_return_journal(
         source_type="PURCHASE_RETURN",
         source_id=purchase_return.id,
         memo=f"Purchase return {purchase_return.id}",
+        created_by=created_by,
+        lines=lines,
+    )
+
+
+# --- Accounts Payable (M6) --------------------------------------------------
+#
+# See docs/M6_AP_VENDOR_ACCOUNTING.md "AP accounting" for the full worked
+# arithmetic. The load-bearing identity both functions below depend on:
+# clearing_amount + price_variance_amount == invoice subtotal (Σ quantity ×
+# unit_price across lines) EXACTLY, by construction of how
+# app.modules.ap.service computes price_variance_amount as
+# (invoice_unit_price - receipt_unit_cost) × quantity, summed. This is what
+# makes both the post and the void balance without independently deriving
+# two sides that must agree.
+
+
+def _purchase_invoice_journal_lines(
+    *,
+    clearing_amount: Decimal,
+    price_variance_amount: Decimal,
+    tax_total: Decimal,
+    discount_total: Decimal,
+    grand_total: Decimal,
+    memo: str,
+    reverse: bool,
+) -> list[_LineSpec]:
+    """Builds the invoice-posting line set, or its exact mirror (every
+    debit/credit swapped) when `reverse=True` — used by both
+    post_purchase_invoice_journal and post_purchase_invoice_void_journal
+    so a void is provably the algebraic opposite of its original posting,
+    never a second independent computation that merely happens to match."""
+    debit = _credit if reverse else _debit
+    credit = _debit if reverse else _credit
+    lines: list[_LineSpec] = []
+    if clearing_amount > 0:
+        lines.append(debit(ACCOUNT_PURCHASE_CLEARING, clearing_amount, description=memo))
+    if price_variance_amount > 0:
+        lines.append(
+            debit(ACCOUNT_PURCHASE_PRICE_VARIANCE, price_variance_amount, description=memo)
+        )
+    elif price_variance_amount < 0:
+        lines.append(
+            credit(ACCOUNT_PURCHASE_PRICE_VARIANCE, -price_variance_amount, description=memo)
+        )
+    if tax_total > 0:
+        lines.append(debit(ACCOUNT_PURCHASE_TAX_EXPENSE, tax_total, description=memo))
+    if discount_total > 0:
+        lines.append(credit(ACCOUNT_PURCHASE_DISCOUNTS, discount_total, description=memo))
+    if grand_total > 0:
+        lines.append(credit(ACCOUNT_ACCOUNTS_PAYABLE, grand_total, description=memo))
+    return lines
+
+
+def post_purchase_invoice_journal(
+    db: Session,
+    *,
+    purchase_invoice: "PurchaseInvoice",
+    clearing_amount: Decimal,
+    price_variance_amount: Decimal,
+    created_by: int | None,
+) -> JournalEntry | None:
+    """Dr Purchase Clearing (the receipt-cost value being matched/cleared)
+    [+ Dr/Cr Purchase Price Variance] [+ Dr Purchase Tax Expense]
+    [+ Cr Purchase Discounts] / Cr Accounts Payable (the invoice's own
+    grand_total — what is now genuinely owed to the supplier).
+
+    `clearing_amount` and `price_variance_amount` are computed once by
+    app.modules.ap.service.post_purchase_invoice from the ORIGINAL
+    receipt-cost data (never recomputed here) — see that function's
+    docstring for the exact three-way-match arithmetic. `tax_total`/
+    `discount_total`/`grand_total` are read directly off the (already
+    validated, already stored) invoice header.
+
+    Returns None and posts nothing only if every component is zero (there
+    is no realistic invoice that reaches this function in that state,
+    since PurchaseInvoiceLine.quantity_invoiced > 0 and unit_price >= 0
+    together with the "at least one line" validation in
+    create_purchase_invoice guarantee SOME nonzero component — this
+    mirrors the belt-and-suspenders zero-value convention of every other
+    post_*_journal function above rather than assuming that guarantee
+    holds forever)."""
+    memo = f"Purchase invoice {purchase_invoice.id} ({purchase_invoice.invoice_number})"
+    lines = _purchase_invoice_journal_lines(
+        clearing_amount=clearing_amount,
+        price_variance_amount=price_variance_amount,
+        tax_total=purchase_invoice.tax_total,
+        discount_total=purchase_invoice.discount_total,
+        grand_total=purchase_invoice.grand_total,
+        memo=memo,
+        reverse=False,
+    )
+    if not lines:
+        return None
+    return _post_journal(
+        db,
+        store_id=purchase_invoice.store_id,
+        posting_date=purchase_invoice.invoice_date,
+        source_type="PURCHASE_INVOICE",
+        source_id=purchase_invoice.id,
+        memo=memo,
+        created_by=created_by,
+        lines=lines,
+    )
+
+
+def post_purchase_invoice_void_journal(
+    db: Session,
+    *,
+    purchase_invoice: "PurchaseInvoice",
+    clearing_amount: Decimal,
+    price_variance_amount: Decimal,
+    created_by: int | None,
+) -> JournalEntry | None:
+    """The operational-void counterpart to post_purchase_invoice_journal —
+    called by app.modules.ap.service.void_purchase_invoice, NEVER through
+    reverse_journal_entry's generic mechanism (PURCHASE_INVOICE is an
+    AUTOMATED_SOURCE_TYPES member specifically so that generic path stays
+    blocked for it — docs/M4_HARDENING_AUDIT.md Section 1's CRITICAL
+    finding). Posts a NEW STANDARD entry (source_type=
+    'PURCHASE_INVOICE_VOID') with every line of the original posting
+    exactly mirrored via `_purchase_invoice_journal_lines(..., reverse=True)`
+    — not a fresh computation from current data, so it can never
+    accidentally diverge from what was actually posted.
+
+    `void_purchase_invoice` only ever calls this while
+    `purchase_invoice.amount_paid == 0` (see that function's docstring for
+    why voiding a partially/fully paid invoice is out of scope for M6)."""
+    memo = f"Void of purchase invoice {purchase_invoice.id} ({purchase_invoice.invoice_number})"
+    lines = _purchase_invoice_journal_lines(
+        clearing_amount=clearing_amount,
+        price_variance_amount=price_variance_amount,
+        tax_total=purchase_invoice.tax_total,
+        discount_total=purchase_invoice.discount_total,
+        grand_total=purchase_invoice.grand_total,
+        memo=memo,
+        reverse=True,
+    )
+    if not lines:
+        return None
+    return _post_journal(
+        db,
+        store_id=purchase_invoice.store_id,
+        posting_date=purchase_invoice.invoice_date,
+        source_type="PURCHASE_INVOICE_VOID",
+        source_id=purchase_invoice.id,
+        memo=memo,
+        created_by=created_by,
+        lines=lines,
+    )
+
+
+def post_supplier_payment_journal(
+    db: Session,
+    *,
+    supplier_payment: "SupplierPayment",
+    created_by: int | None,
+) -> JournalEntry | None:
+    """Dr Accounts Payable / Cr <the real asset account the payment method
+    maps to> (SUPPLIER_PAYMENT_METHOD_ACCOUNT_CODE — a DELIBERATELY
+    separate mapping from sales' PAYMENT_METHOD_ACCOUNT_CODE; see that
+    constant's docstring for why). One amount, used for both lines by
+    construction — this can never fail to balance."""
+    if supplier_payment.amount <= 0:
+        return None
+    account_code = SUPPLIER_PAYMENT_METHOD_ACCOUNT_CODE[supplier_payment.payment_method]
+    memo = (
+        f"Supplier payment {supplier_payment.id} against invoice "
+        f"{supplier_payment.purchase_invoice_id}"
+    )
+    lines = [
+        _debit(ACCOUNT_ACCOUNTS_PAYABLE, supplier_payment.amount, description=memo),
+        _credit(account_code, supplier_payment.amount, description=memo),
+    ]
+    return _post_journal(
+        db,
+        store_id=supplier_payment.store_id,
+        posting_date=supplier_payment.payment_date,
+        source_type="SUPPLIER_PAYMENT",
+        source_id=supplier_payment.id,
+        memo=memo,
         created_by=created_by,
         lines=lines,
     )

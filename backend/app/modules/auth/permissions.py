@@ -43,6 +43,18 @@ ACCOUNTING_ADMIN = "accounting.admin"
 SALES_RETURN_READ = "sales.return.read"
 SALES_RETURN_WRITE = "sales.return.write"
 SALES_VOID = "sales.void"
+# M6 (docs/M6_AP_VENDOR_ACCOUNTING.md "RBAC"): four minimal AP permissions,
+# not a reuse of accounting.reverse/accounting.post — mirrors the M5
+# read/write/(heavier action) split. ap.write covers creating a DRAFT
+# invoice and recording matching (no financial commitment yet); ap.post
+# and ap.pay are the two irreversible-in-effect financial actions
+# (establishing AP, moving cash/bank) and are deliberately separate so a
+# role could plausibly have one without the other, though M6's own matrix
+# below always grants them together.
+AP_READ = "ap.read"
+AP_WRITE = "ap.write"
+AP_POST = "ap.post"
+AP_PAY = "ap.pay"
 
 ALL_PERMISSIONS: dict[str, str] = {
     PRODUCTS_READ: "View products and barcodes",
@@ -66,6 +78,13 @@ ALL_PERMISSIONS: dict[str, str] = {
     SALES_RETURN_READ: "View sale returns and return eligibility",
     SALES_RETURN_WRITE: "Process a merchandise return against a completed sale",
     SALES_VOID: "Void an entire completed sale (a full return of every line in one action)",
+    AP_READ: "View supplier invoices, AP balances, aging, and Purchase Clearing reconciliation",
+    AP_WRITE: "Create a draft supplier invoice",
+    AP_POST: (
+        "Post or void a supplier invoice, matching it against receipts and "
+        "establishing/reversing AP"
+    ),
+    AP_PAY: "Record a supplier payment, settling Accounts Payable",
 }
 
 # --- Roles --------------------------------------------------------------
@@ -104,6 +123,10 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         SALES_RETURN_READ,
         SALES_RETURN_WRITE,
         SALES_VOID,
+        AP_READ,
+        AP_WRITE,
+        AP_POST,
+        AP_PAY,
     ],
     CASHIER: [
         PRODUCTS_READ,
@@ -120,6 +143,12 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         PURCHASING_READ,
         PURCHASING_WRITE,
         PURCHASING_RECEIVE,
+        # Can draft/match an invoice against a receipt (purchasing-adjacent
+        # data entry) but not commit it financially — posting and paying
+        # are Manager/Admin-only (M6 task Section 14: heavier than
+        # "record what the paperwork says").
+        AP_READ,
+        AP_WRITE,
     ],
     AUDITOR: [
         PRODUCTS_READ,
@@ -130,5 +159,6 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         AUDIT_READ,
         ACCOUNTING_READ,
         SALES_RETURN_READ,
+        AP_READ,
     ],
 }

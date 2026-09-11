@@ -30,6 +30,7 @@ M3_HEAD_REVISION = "c82162efb3af"  # M3: supplier code, goods receipt/return ide
 M4_ACCOUNTING_CORE_REVISION = "8df037a45976"  # M4: chart of accounts, journal engine, permissions
 M4_HEAD_REVISION = "581d2a07f38c"  # M4 hardening: allow MANUAL journal source type
 M5_HEAD_REVISION = "35d411b947ec"  # M5: sale returns quantity tracking and idempotency
+M6_HEAD_REVISION = "36173e29a9f0"  # M6: accounts payable, purchase invoices, supplier payments
 
 
 def _alembic_config() -> Config:
@@ -94,18 +95,23 @@ def test_full_upgrade_downgrade_upgrade_cycle(migrations_db: str) -> None:
     # M4 adds three tables: accounts, journal_entries, journal_lines.
     assert _table_count(migrations_db) == 30
 
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, M5_HEAD_REVISION)
     # M5 adds columns (sale_items.quantity_returned, sale_returns.
     # client_transaction_id, sale_return_items.discount_refunded/
     # tax_refunded/unit_cost_refunded), not tables.
     assert _table_count(migrations_db) == 30
 
+    command.upgrade(cfg, "head")
+    # M6 adds three tables: purchase_invoices, purchase_invoice_lines,
+    # supplier_payments.
+    assert _table_count(migrations_db) == 33
+
     command.downgrade(cfg, M0_REVISION)
     assert _table_count(migrations_db) == 8
 
     command.upgrade(cfg, "head")
-    assert _table_count(migrations_db) == 30
-    assert _current_revision(migrations_db) == M5_HEAD_REVISION
+    assert _table_count(migrations_db) == 33
+    assert _current_revision(migrations_db) == M6_HEAD_REVISION
 
 
 def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
@@ -121,4 +127,4 @@ def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
     finally:
         engine.dispose()
     assert role_count == 5
-    assert permission_count == 19
+    assert permission_count == 23

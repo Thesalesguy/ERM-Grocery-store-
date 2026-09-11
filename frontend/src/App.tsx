@@ -2,6 +2,7 @@ import { Route, Routes } from 'react-router-dom'
 import { AppShell } from './components/layout/AppShell'
 import { ProtectedRoute, RequirePermission } from './auth/ProtectedRoute'
 import { AccountingPage } from './pages/AccountingPage'
+import { AccountsPayablePage } from './pages/AccountsPayablePage'
 import { DashboardPage } from './pages/DashboardPage'
 import { InventoryPage } from './pages/InventoryPage'
 import { LoginPage } from './pages/LoginPage'
@@ -67,6 +68,14 @@ function App() {
             element={
               <RequirePermission permission="sales.read">
                 <SalesPage />
+              </RequirePermission>
+            }
+          />
+          <Route
+            path="accounts-payable"
+            element={
+              <RequirePermission permission="ap.read">
+                <AccountsPayablePage />
               </RequirePermission>
             }
           />

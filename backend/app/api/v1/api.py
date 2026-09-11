@@ -8,7 +8,7 @@ path.
 
 from fastapi import APIRouter
 
-from app.api.v1.endpoints import accounting, auth, inventory, products, purchasing, sales
+from app.api.v1.endpoints import accounting, ap, auth, inventory, products, purchasing, sales
 
 api_router = APIRouter()
 api_router.include_router(auth.router)
@@ -17,3 +17,4 @@ api_router.include_router(inventory.router)
 api_router.include_router(sales.router)
 api_router.include_router(purchasing.router)
 api_router.include_router(accounting.router)
+api_router.include_router(ap.router)

@@ -60,12 +60,25 @@ NORMAL_BALANCES = ("DEBIT", "CREDIT")
 # source block (service.py `_AUTOMATED_SOURCE_TYPES`) has something to
 # permit, and so the reversal code path stays provably correct rather
 # than untestable dead code.
+# M6 adds three more automated source types (docs/M6_AP_VENDOR_ACCOUNTING.md
+# "AP accounting"): PURCHASE_INVOICE (posted when a supplier invoice is
+# matched/posted — clears Purchase Clearing, establishes Accounts
+# Payable), PURCHASE_INVOICE_VOID (the operational-void counterpart —
+# never reversed through reverse_journal_entry's generic mechanism, same
+# reasoning as every other automated type below), and SUPPLIER_PAYMENT
+# (posted when a supplier payment is recorded — reduces Accounts
+# Payable). Each is produced by its own dedicated app.modules.ap.service
+# function, alongside the real operational state change it accounts for
+# — never posted standalone.
 AUTOMATED_SOURCE_TYPES = (
     "SALE",
     "PURCHASE_RECEIPT",
     "PURCHASE_RETURN",
     "SALE_RETURN",
     "STOCK_ADJUSTMENT",
+    "PURCHASE_INVOICE",
+    "PURCHASE_INVOICE_VOID",
+    "SUPPLIER_PAYMENT",
 )
 SOURCE_TYPES = AUTOMATED_SOURCE_TYPES + ("MANUAL",)
 ENTRY_TYPES = ("STANDARD", "REVERSAL")

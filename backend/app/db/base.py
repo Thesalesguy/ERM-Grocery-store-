@@ -6,6 +6,11 @@ new module's models here as they're introduced.
 
 from app.db.base_class import Base  # noqa: F401
 from app.modules.accounting.models import Account, JournalEntry, JournalLine  # noqa: F401
+from app.modules.ap.models import (  # noqa: F401
+    PurchaseInvoice,
+    PurchaseInvoiceLine,
+    SupplierPayment,
+)
 from app.modules.audit.models import AuditLog  # noqa: F401
 from app.modules.auth.models import (  # noqa: F401
     Permission,

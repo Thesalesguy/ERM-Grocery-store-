@@ -74,6 +74,17 @@ class Supplier(TimestampMixin, Base):
     address: Mapped[str | None] = mapped_column(String(500))
     tax_id: Mapped[str | None] = mapped_column(String(100))
     is_active: Mapped[bool] = mapped_column(nullable=False, default=True)
+    # M6 (docs/M6_AP_VENDOR_ACCOUNTING.md "Supplier master"): the only new
+    # field AP actually needs on Supplier — contact info, tax_id, and
+    # active status already existed and cover the rest of the task's
+    # checklist. NULL means "no standing term" (due immediately/on
+    # receipt); a purchase invoice may still override its own due_date
+    # explicitly. Deliberately NOT adding default currency (this system
+    # has no multi-currency support anywhere — see PurchaseInvoice's own
+    # currency-assumption note) or a payment account/reference (would be
+    # either unused metadata or the exact "banking credentials" the task
+    # says not to store).
+    default_payment_terms_days: Mapped[int | None] = mapped_column()
 
 
 class PurchaseOrder(TimestampMixin, Base):
@@ -111,6 +122,17 @@ class PurchaseOrderItem(TimestampMixin, Base):
         CheckConstraint(
             "quantity_received >= 0", name="ck_purchase_order_items_qty_received_non_negative"
         ),
+        # M6: the three-way-match ceiling is RECEIVED, not ORDERED — you owe
+        # a supplier for what physically arrived, even if that's more than
+        # you ordered (over-receipt is allowed above); you can never owe
+        # for more than arrived (docs/M6_AP_VENDOR_ACCOUNTING.md "Three-way
+        # matching policy"). Enforced here as a same-row DB CHECK, not only
+        # in application code — the exact belt-and-suspenders pattern M5
+        # used for quantity_returned <= quantity.
+        CheckConstraint(
+            "quantity_invoiced >= 0 AND quantity_invoiced <= quantity_received",
+            name="ck_purchase_order_items_qty_invoiced_bounds",
+        ),
         CheckConstraint("unit_cost >= 0", name="ck_purchase_order_items_unit_cost_non_negative"),
         Index("ix_purchase_order_items_purchase_order_id", "purchase_order_id"),
     )
@@ -123,6 +145,13 @@ class PurchaseOrderItem(TimestampMixin, Base):
     # no CHECK tying quantity_received <= quantity_ordered.
     quantity_ordered: Mapped[Decimal] = mapped_column(Numeric(14, 3), nullable=False)
     quantity_received: Mapped[Decimal] = mapped_column(Numeric(14, 3), nullable=False, default=0)
+    # M6: a maintained running-total cache column, exact same pattern as
+    # quantity_received itself (and M5's SaleItem.quantity_returned) —
+    # incremented only by app.modules.ap.service.post_purchase_invoice
+    # under a lock on the parent PurchaseOrder row (the SAME lock
+    # receive_goods already takes), so a receipt and an invoice-posting
+    # racing against the same PO's items always serialize correctly.
+    quantity_invoiced: Mapped[Decimal] = mapped_column(Numeric(14, 3), nullable=False, default=0)
     # The cost expected at order time — frozen (BR-2). The cost actually
     # used for WAC comes from GoodsReceiptItem.unit_cost, which may differ.
     unit_cost: Mapped[Decimal] = mapped_column(Numeric(14, 6), nullable=False)
