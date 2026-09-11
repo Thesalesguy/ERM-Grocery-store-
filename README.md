@@ -17,23 +17,29 @@ idempotency) and three HIGH gaps before any purchasing/accounting work was built
 [`docs/M3_PURCHASING_RECEIVING_WAC.md`](docs/M3_PURCHASING_RECEIVING_WAC.md) records the M3
 milestone's decisions (suppliers, purchase orders, transactional goods receiving, Weighted Average
 Cost recalculation, purchase returns, and the concurrency/idempotency guarantees around all of it).
-**Read all five before touching a module**; this README only covers running what has been built
+[`docs/M4_ACCOUNTING_CORE.md`](docs/M4_ACCOUNTING_CORE.md) records the M4 milestone's decisions (the
+Chart of Accounts, the immutable double-entry journal engine, how sales/purchasing/inventory post
+their accounting effects atomically, reversal, and the inventory/COGS reconciliation proofs).
+**Read all six before touching a module**; this README only covers running what has been built
 so far.
 
 ## Status
 
-**Milestone M3 — Purchasing, goods receiving, WAC & supplier workflow.** Building on M2's
-authenticated, RBAC-enforced, multi-store-isolated foundation, the system now supports supplier
-management, purchase-order creation/submission/cancellation, and goods receiving (full or partial,
-with over-receipt detection) as one atomic, row-locked, idempotent database transaction that
-recomputes Weighted Average Cost and posts inventory-ledger movements — proven safe against
-concurrent receipts, duplicate submissions, and cross-store access by dedicated tests against real
-PostgreSQL, and confirmed against a live running instance (see
-`docs/M3_PURCHASING_RECEIVING_WAC.md`). Purchase returns are supported with a documented cost-basis
-limitation (no per-lot tracking; returns value at current WAC). No accounting/reporting UI exists
-yet (scheduled for a later milestone). See `docs/M3_PURCHASING_RECEIVING_WAC.md` for the full M3
-design, `docs/M2_AUTH_AND_POS.md` for auth/POS, `docs/M2_HARDENING_AUDIT.md` for the hardening pass,
-and `docs/M1_DATABASE_DESIGN.md` for the underlying data model it all builds on.
+**Milestone M4 — Accounting core, double-entry journal engine & financial reporting.** Building on
+M3's purchasing/receiving/WAC foundation, the system now posts a real, immutable, double-entry
+journal entry — atomically, in the same transaction — for every sale, goods receipt, purchase
+return, and stock adjustment, and derives Trial Balance, Profit & Loss, and inventory-value
+reconciliation reports exclusively from posted journal entries (never from sales/purchase tables
+directly). Every posted entry is proven balanced by a real Postgres trigger (not just application
+code), posted-entry immutability is enforced at the database privilege level, and inventory
+GL-vs-operational reconciliation is proven exact — all confirmed by dedicated tests against real
+PostgreSQL (including 5x-repeated concurrency and idempotency proofs) and against a live running
+instance (see `docs/M4_ACCOUNTING_CORE.md`). Sale returns/voids remain unimplemented at the
+operational layer (a pre-existing M1 gap, documented, not built around) and are correspondingly out
+of scope for accounting integration. See `docs/M4_ACCOUNTING_CORE.md` for the full M4 design,
+`docs/M3_PURCHASING_RECEIVING_WAC.md` for purchasing/receiving/WAC, `docs/M2_AUTH_AND_POS.md` for
+auth/POS, `docs/M2_HARDENING_AUDIT.md` for the hardening pass, and `docs/M1_DATABASE_DESIGN.md` for
+the underlying data model it all builds on.
 
 ## Architecture
 
@@ -261,7 +267,8 @@ npm run build            # production build verification
 │   ├── M1_DATABASE_DESIGN.md     # M1 decisions: ledger, WAC, COGS, privilege model
 │   ├── M2_AUTH_AND_POS.md        # M2 decisions: auth, RBAC, POS, sale-finalization concurrency
 │   ├── M2_HARDENING_AUDIT.md     # pre-M3 adversarial audit: findings, fixes, accepted risks
-│   └── M3_PURCHASING_RECEIVING_WAC.md  # M3 decisions: suppliers, PO lifecycle, receiving, WAC
+│   ├── M3_PURCHASING_RECEIVING_WAC.md  # M3 decisions: suppliers, PO lifecycle, receiving, WAC
+│   └── M4_ACCOUNTING_CORE.md     # M4 decisions: chart of accounts, journal engine, reports
 ├── backend/
 │   ├── app/
 │   │   ├── main.py              # FastAPI app factory + entry point
