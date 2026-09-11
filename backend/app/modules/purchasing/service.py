@@ -30,6 +30,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationAppError
+from app.modules.accounting import service as accounting_service
 from app.modules.audit import service as audit_service
 from app.modules.auth.models import Store
 from app.modules.inventory import service as inventory_service
@@ -533,7 +534,9 @@ def receive_goods(
         return winner
 
     over_receipt_lines: list[int] = []
+    received_value_lines: list[tuple[Decimal, Decimal]] = []
     for po_item, quantity_received, unit_cost, condition_notes in line_details:
+        received_value_lines.append((quantity_received, unit_cost))
         product = locked_products[po_item.product_id]
         new_wac = inventory_service.compute_new_wac(
             existing_qty=product.current_qty_on_hand,
@@ -589,6 +592,17 @@ def receive_goods(
             "over_receipt_line_item_ids": over_receipt_lines,
         },
     )
+
+    # Accounting posting shares this same uncommitted transaction — see
+    # app.modules.accounting.service.post_goods_receipt_journal's
+    # docstring (docs/M4_ACCOUNTING_CORE.md Section 19).
+    accounting_service.post_goods_receipt_journal(
+        db,
+        goods_receipt=receipt,
+        received_lines=received_value_lines,
+        created_by=received_by,
+    )
+
     db.flush()
     return receipt
 
@@ -723,9 +737,11 @@ def create_purchase_return(
             raise
         return winner
 
+    returned_value_lines: list[tuple[Decimal, Decimal]] = []
     for line in lines:
         product = locked_products[line.product_id]
         return_unit_cost = product.current_cost
+        returned_value_lines.append((line.quantity, return_unit_cost))
         inventory_service.record_movement(
             db,
             product=product,
@@ -754,6 +770,14 @@ def create_purchase_return(
         entity_id=purchase_return.id,
         after={"purchase_order_id": purchase_order_id, "line_count": len(lines)},
     )
+
+    accounting_service.post_purchase_return_journal(
+        db,
+        purchase_return=purchase_return,
+        returned_lines=returned_value_lines,
+        created_by=created_by,
+    )
+
     db.flush()
     return purchase_return
 

@@ -42,6 +42,7 @@ from sqlalchemy.exc import IntegrityError, NoResultFound
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationAppError
+from app.modules.accounting import service as accounting_service
 from app.modules.audit import service as audit_service
 from app.modules.auth.models import Store
 from app.modules.inventory import service as inventory_service
@@ -378,6 +379,19 @@ def finalize_sale(
         },
         ip_address=ip_address,
         user_agent=user_agent,
+    )
+
+    # Accounting posting happens inline, in the same uncommitted
+    # transaction as everything above (M4 task Section 19: atomicity).
+    # If this raises, the sale/items/payments/movements/audit row already
+    # flushed above are discarded too — nothing commits until the route
+    # handler's single db.commit() after finalize_sale returns.
+    accounting_service.post_sale_journal(
+        db,
+        sale=sale,
+        computed_lines=computed_lines,
+        payments=payments,
+        created_by=cashier_id,
     )
 
     db.flush()

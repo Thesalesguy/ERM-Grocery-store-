@@ -14,6 +14,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import ConflictError, NotFoundError
+from app.modules.accounting import service as accounting_service
 from app.modules.audit import service as audit_service
 from app.modules.inventory.models import InventoryMovement, StockAdjustment
 from app.modules.products.models import Product
@@ -227,13 +228,14 @@ def create_stock_adjustment(
 
     product = lock_product_for_update(db, product_id)
     movement_type = "STOCK_ADJUSTMENT_IN" if quantity_delta > 0 else "STOCK_ADJUSTMENT_OUT"
+    unit_cost_at_movement = product.current_cost
     record_movement(
         db,
         product=product,
         store_id=store_id,
         movement_type=movement_type,
         quantity_delta=quantity_delta,
-        unit_cost_at_movement=product.current_cost,
+        unit_cost_at_movement=unit_cost_at_movement,
         reference_type="stock_adjustment",
         reference_id=adjustment.id,
         reason=notes,
@@ -255,4 +257,15 @@ def create_stock_adjustment(
         ip_address=ip_address,
         user_agent=user_agent,
     )
+
+    # Accounting posting shares this same uncommitted transaction — see
+    # app.modules.accounting.service.post_stock_adjustment_journal's
+    # docstring (docs/M4_ACCOUNTING_CORE.md Section 19).
+    accounting_service.post_stock_adjustment_journal(
+        db,
+        stock_adjustment=adjustment,
+        unit_cost=unit_cost_at_movement,
+        created_by=created_by,
+    )
+    db.flush()
     return adjustment
