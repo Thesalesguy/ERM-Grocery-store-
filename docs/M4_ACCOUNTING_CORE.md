@@ -337,31 +337,67 @@ payment method's account).
 
 ---
 
-## 11. Inventory GL reconciliation — the central invariant, proven exact
+## 11. Inventory GL reconciliation — the central invariant, proven bounded (⚠️ see M4 hardening audit correction)
+
+> **Correction (docs/M4_HARDENING_AUDIT.md Section 10/24)**: this section
+> originally claimed reconciliation is *exact*. The hardening audit's
+> required comprehensive scenario (a product receiving stock at two
+> different costs, driving a WAC recompute whose division does not
+> terminate at 6 decimal places) proved that claim too strong — see the
+> corrected version below and the hardening audit doc for the full
+> analysis. The mechanism described here (never independently computing
+> the Inventory amount twice) still holds and is still why the drift is
+> bounded to a few millionths of a currency unit rather than unbounded;
+> it just isn't literally zero once more than one WAC-changing receipt is
+> involved.
 
 **Claim**: `Inventory` account GL balance (Σ debits − Σ credits, filtered
 by store) always equals `Σ_products(current_qty_on_hand × current_cost)`
-for that store, to the ledger quantum (`0.000001`).
+for that store, **to within a small bound proportional to the number of
+WAC-recomputing receipts that product has had** — not necessarily bit-
+identical.
 
-**Why it's true, not just usually true**: every posting function derives
-its Inventory-account amount from the *identical* `(quantity, unit_cost)`
-pairs already passed to `inventory_service.record_movement()` for that
-same operational event — never a second, independently-computed
-valuation. Since Weighted Average Cost is *defined* such that
-`current_qty_on_hand × current_cost` always equals the cumulative sum of
-every movement's value (added at receipt cost, removed at the WAC in
-effect at removal time — the entire point of a WAC system), and the
-accounting journal's Inventory line is built from those same movement
-values, the two are the same quantity computed two ways. The only
-residual drift is the rounding boundary itself: WAC is stored at 6dp
-(`Decimal("0.000001")`, `inventory/service.py`), and journal amounts use
-the *same* 6dp quantum rather than the app's usual 2dp money precision —
-so there is no second, incompatible rounding rule to drift against.
+**Why it's true, and why it isn't always bit-exact**: every posting
+function derives its Inventory-account amount from the *identical*
+`(quantity, unit_cost)` pairs already passed to
+`inventory_service.record_movement()` for that same operational event —
+never a second, independently-computed valuation, so there is no
+opportunity for the accounting and operational sides to disagree about
+*which* value a given event was worth. But `current_cost` (WAC) is
+itself a *rounded* value (`Decimal("0.000001")`, `inventory/service.py`,
+`ROUND_HALF_UP`) whenever a receipt's division doesn't terminate at 6
+decimal places — e.g. receiving 5 units at cost 20 onto an existing 7
+units at cost 10 gives `(7×10 + 5×20)/12 = 170/12 = 14.1666̄`, stored as
+`14.166667`. At the instant of that rounding, `new_qty × new_WAC`
+(`12 × 14.166667 = 170.000004`) is no longer bit-identical to the true
+pre-rounding total (`170.000000`) — a drift of `0.000004` baked in by the
+rounding itself, independent of anything M4 does afterward. Every
+subsequent movement then uses the *rounded* WAC consistently on both the
+operational and accounting sides (so it doesn't compound *per
+transaction*), but each further WAC-changing receipt can introduce
+another few-millionths-of-a-unit of drift the same way. This is the
+*same* tradeoff `inventory_service.compute_new_wac`'s own docstring
+already accepted for WAC storage itself ("bounds any rounding drift to
+at most ~5e-7 per recompute, which is immaterial at currency scale") —
+M4 doesn't introduce a new rounding rule, it just makes an already-
+accepted M1 tradeoff *visible* in a reconciliation report for the first
+time. Practically: reaching even one cent of cumulative drift on one
+product would require on the order of thousands of divergent-cost
+receipts against it — not a realistic operational scale, but a real,
+non-zero number, and the reconciliation report should be read with a
+small tolerance in mind rather than expecting bit-for-bit zero after a
+long transaction history.
 
-**Proven, not asserted**: `test_inventory_reconciliation_matches_after_receipt_and_sale`
-and the API-level `test_inventory_reconciliation_report_endpoint` build
-stock through a real receipt, sell some of it, and assert `discrepancy
-== Decimal("0.000000")` — exact equality, not a fuzzy tolerance.
+**Proven, with an honest tolerance**: `test_inventory_reconciliation_matches_after_receipt_and_sale`
+and the API-level `test_inventory_reconciliation_report_endpoint`
+(single-receipt scenarios, where the WAC division happens to terminate
+exactly) assert `discrepancy == Decimal("0.000000")`. The hardening
+audit's `test_comprehensive_reconciliation_scenario_store_a`
+(`tests/test_accounting_hardening.py`), which deliberately exercises a
+second receipt at a different, non-evenly-dividing cost, asserts
+`0 < abs(discrepancy) <= Decimal("0.00001")` instead — proving the drift
+is present, small, and bounded, rather than hiding it behind a scenario
+that happens not to trigger it.
 
 **One documented exception, found live**: reversing a *SALE's* journal
 entry (§3) is an **accounting-only** correction — it does not undo the
@@ -559,6 +595,15 @@ survives afterward.
 
 ## 22. Reversal
 
+> **Updated by the M4 hardening audit (docs/M4_HARDENING_AUDIT.md
+> Section 1, CRITICAL finding)**: reversal is now refused for every
+> automatically-posted entry. The original version of this section
+> (reversal freely available against any STANDARD entry) is superseded
+> by the restriction below, added after a live test proved unrestricted
+> reversal lets any `accounting.reverse` holder — including an ordinary
+> Manager, not just Admin — silently diverge the operational and
+> accounting ledgers with a single API call.
+
 Covered in §3/§5. `POST /accounting/journals/{id}/reverse` (gated by
 `accounting.reverse`) creates a new `REVERSAL` entry with every line's
 debit/credit swapped, referencing the original via `reversal_of_id`,
@@ -567,13 +612,41 @@ reversing an already-reversed entry returns the existing reversal.
 Reversing a `REVERSAL` entry itself is rejected
 (`CANNOT_REVERSE_REVERSAL`) — a reversal cannot cascade.
 
-**No automated trigger calls this yet** (§10's gap — nothing voids a
-sale or receipt operationally in M4), so in practice it is a manually-
-triggered correction tool for now. The foundation is real and tested
-end-to-end (service function, endpoint, RBAC, store-scoping,
-concurrency), matching the task's explicit "the architecture must still
-support them cleanly" instruction even with full operational
-reversal/void workflows deferred.
+**Automated-source block**: an entry whose `source_type` is one of the
+five automatically-posted values (`SALE`, `PURCHASE_RECEIPT`,
+`PURCHASE_RETURN`, `SALE_RETURN`, `STOCK_ADJUSTMENT`) cannot be reversed
+through this endpoint at all — refused with `409
+OPERATIONAL_REVERSAL_REQUIRED`, checked *after* store-scoping (so a
+cross-store attempt still gets `403`, never leaking whether the entry
+would otherwise have been reversible). Reversing one of these would
+correct the accounting without undoing the sale/inventory/payment/stock
+it accounts for — proven live before the fix existed (§11's discrepancy
+example) and blocked live after it (a fresh smoke test against a running
+instance got `409 OPERATIONAL_REVERSAL_REQUIRED` attempting to reverse a
+sale's journal).
+
+**A sixth `source_type`, `MANUAL`, was added specifically so this
+restriction doesn't leave the reversal mechanism itself untested or
+effectively dead code**: it is the one value no endpoint currently posts
+(`accounting.post` remains reserved and unused, §15/§17) — added purely
+so `reverse_journal_entry`'s core mechanics have a legal target, proven
+correct by tests that construct a `MANUAL` entry directly via
+`_post_journal` and then reverse it (balance-swap correctness,
+idempotent re-reversal, cannot-reverse-a-reversal, concurrent-reversal
+serialization — all still tested exactly as before, just against a
+`MANUAL` entry instead of an automated one).
+
+**This means reversal is not reachable by any user through any current
+workflow** — the right outcome until an operational void/return workflow
+exists that atomically reverses (operational state + inventory +
+payment/refund + accounting + audit) together, per the hardening audit's
+explicit preferred direction. This is a deliberate, temporary
+restriction, not functionality quietly removed: the endpoint, RBAC gate,
+and full reversal mechanics remain in place and tested, ready to accept
+`MANUAL` entries from a future manual-posting endpoint, or to be extended
+so a future void/return workflow calls the underlying entry-creation
+logic directly (bypassing the automated-source block from inside a
+function that atomically also reverses the operational side).
 
 ---
 
