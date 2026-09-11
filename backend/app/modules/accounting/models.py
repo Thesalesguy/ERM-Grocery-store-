@@ -46,13 +46,28 @@ NORMAL_BALANCES = ("DEBIT", "CREDIT")
 # SaleReturn/SaleReturnItem have existed as ORM models since M1, but no
 # service function or endpoint was ever built in M2 or M3) — so the schema
 # is ready for it, documented as a known gap rather than silently omitted.
-SOURCE_TYPES = (
+#
+# MANUAL (docs/M4_HARDENING_AUDIT.md Section 1): the one source_type NOT
+# produced by an operational service function. It exists solely so the
+# reversal mechanism has a legitimate target — every one of the other
+# five values is posted automatically alongside a real inventory/payment/
+# stock change that reversal does NOT undo, so reversing any of them
+# through this journal-only endpoint would silently diverge the
+# operational and accounting ledgers (a real divergence, proven live
+# against a running instance during the M4 hardening audit). No endpoint
+# currently creates a MANUAL entry (accounting.post is still reserved,
+# unused) — the value exists so `reverse_journal_entry`'s automated-
+# source block (service.py `_AUTOMATED_SOURCE_TYPES`) has something to
+# permit, and so the reversal code path stays provably correct rather
+# than untestable dead code.
+AUTOMATED_SOURCE_TYPES = (
     "SALE",
     "PURCHASE_RECEIPT",
     "PURCHASE_RETURN",
     "SALE_RETURN",
     "STOCK_ADJUSTMENT",
 )
+SOURCE_TYPES = AUTOMATED_SOURCE_TYPES + ("MANUAL",)
 ENTRY_TYPES = ("STANDARD", "REVERSAL")
 
 

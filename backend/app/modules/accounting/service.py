@@ -43,7 +43,12 @@ from app.modules.accounting.constants import (
     ACCOUNT_TAX_PAYABLE,
     PAYMENT_METHOD_ACCOUNT_CODE,
 )
-from app.modules.accounting.models import Account, JournalEntry, JournalLine
+from app.modules.accounting.models import (
+    AUTOMATED_SOURCE_TYPES,
+    Account,
+    JournalEntry,
+    JournalLine,
+)
 from app.modules.audit import service as audit_service
 
 if TYPE_CHECKING:
@@ -435,11 +440,41 @@ def reverse_journal_entry(
 
     Idempotent: reversing an already-reversed entry returns the existing
     reversal rather than creating a second one.
+
+    Automated-source block (docs/M4_HARDENING_AUDIT.md Section 1 —
+    CRITICAL finding, fixed here): an entry whose source_type is one of
+    the five automatically-posted types (SALE, PURCHASE_RECEIPT,
+    PURCHASE_RETURN, SALE_RETURN, STOCK_ADJUSTMENT) is refused with
+    OPERATIONAL_REVERSAL_REQUIRED. Reversing one of these is
+    *accounting-only*: it flips revenue/COGS/cash/inventory-value lines
+    but does not touch the Sale row, inventory quantity, payment record,
+    or WAC that produced them — a live test against a running instance
+    proved this creates a real, permanent inventory-GL-vs-operational
+    discrepancy. Until an operational void/return workflow exists that
+    atomically reverses (operational state + inventory + payment/refund
+    + accounting + audit) together, no automated entry is reversible
+    through this function — only a MANUAL entry (source_type='MANUAL',
+    not currently created by any endpoint — see models.py) can be. This
+    keeps the reversal *mechanism* itself real and tested rather than
+    removing it, per the explicit "do not silently remove functionality"
+    instruction — it is simply not a legal operation against any entry
+    the system currently knows how to produce automatically.
     """
     entry = db.get(JournalEntry, journal_entry_id)
     if entry is None:
         raise NotFoundError(f"Journal entry {journal_entry_id} not found")
     _enforce_store_access(caller_store_id, entry.store_id, "journal entry")
+
+    if entry.source_type in AUTOMATED_SOURCE_TYPES:
+        raise ConflictError(
+            f"Journal entry {entry.id} was posted automatically from a "
+            f"{entry.source_type} — reversing it here would correct the accounting "
+            "without undoing the operational transaction (inventory, payment, stock) "
+            "that produced it, silently diverging the two. An operational void/return "
+            "workflow for this source type does not exist yet; reverse the operational "
+            "transaction through that workflow once it does, not the journal alone.",
+            error_code="OPERATIONAL_REVERSAL_REQUIRED",
+        )
 
     db.execute(select(func.pg_advisory_xact_lock(entry.id)))
 

@@ -151,16 +151,29 @@ function JournalDetail({
       </table>
 
       {error && <p className="mt-2 text-sm text-red-600">{error}</p>}
-      <div className="mt-4 flex gap-2">
-        {canReverse && entry.entry_type === 'STANDARD' && !entry.is_reversed && (
-          <button
-            onClick={handleReverse}
-            disabled={reversing}
-            className="rounded bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50"
-          >
-            {reversing ? 'Reversing…' : 'Reverse entry'}
-          </button>
+      {canReverse &&
+        entry.entry_type === 'STANDARD' &&
+        !entry.is_reversed &&
+        entry.source_type !== 'MANUAL' && (
+          <p className="mt-2 text-xs text-gray-500">
+            This entry was posted automatically from a {entry.source_type.toLowerCase()} and
+            cannot be reversed here — doing so would correct the accounting without undoing the
+            operational transaction (inventory, payment, stock) that produced it.
+          </p>
         )}
+      <div className="mt-4 flex gap-2">
+        {canReverse &&
+          entry.entry_type === 'STANDARD' &&
+          !entry.is_reversed &&
+          entry.source_type === 'MANUAL' && (
+            <button
+              onClick={handleReverse}
+              disabled={reversing}
+              className="rounded bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50"
+            >
+              {reversing ? 'Reversing…' : 'Reverse entry'}
+            </button>
+          )}
         <button
           onClick={onClose}
           className="rounded px-3 py-1.5 text-sm text-gray-600 hover:bg-gray-100"

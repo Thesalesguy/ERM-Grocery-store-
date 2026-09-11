@@ -130,7 +130,12 @@ describe('AccountingPage', () => {
   })
 
   it('opens a journal entry and reverses it', async () => {
-    const reversedEntry = { ...SAMPLE_ENTRY, is_reversed: true }
+    // Reversal is only offered in the UI for MANUAL entries — reversing
+    // an automated source (SALE, etc.) is refused by the backend
+    // (docs/M4_HARDENING_AUDIT.md Section 1), so this scenario uses a
+    // manual entry to exercise the reversal button/flow at all.
+    const manualEntry = { ...SAMPLE_ENTRY, source_type: 'MANUAL', source_id: null }
+    const reversedEntry = { ...manualEntry, is_reversed: true }
     let reverseCalled = false
     vi.stubGlobal(
       'fetch',
@@ -156,18 +161,18 @@ describe('AccountingPage', () => {
           return {
             ok: true,
             status: 200,
-            json: async () => ({ ...SAMPLE_ENTRY, entry_type: 'REVERSAL' }),
+            json: async () => ({ ...manualEntry, entry_type: 'REVERSAL' }),
           } as Response
         }
         if (url.includes('/api/v1/accounting/journals/500') && method === 'GET') {
           return {
             ok: true,
             status: 200,
-            json: async () => (reverseCalled ? reversedEntry : SAMPLE_ENTRY),
+            json: async () => (reverseCalled ? reversedEntry : manualEntry),
           } as Response
         }
         if (url.includes('/api/v1/accounting/journals') && method === 'GET') {
-          return { ok: true, status: 200, json: async () => [SAMPLE_ENTRY] } as Response
+          return { ok: true, status: 200, json: async () => [manualEntry] } as Response
         }
         throw new Error(`no route for ${method} ${url}`)
       }),
@@ -182,5 +187,19 @@ describe('AccountingPage', () => {
     fireEvent.click(screen.getByRole('button', { name: /reverse entry/i }))
 
     await waitFor(() => expect(reverseCalled).toBe(true))
+  })
+
+  it('does not offer reversal for an automatically-posted SALE entry', async () => {
+    mockFetchRoutes([
+      ...AUTH_ROUTES,
+      { path: '/api/v1/accounting/journals/500', json: SAMPLE_ENTRY },
+      { path: '/api/v1/accounting/journals', json: [SAMPLE_ENTRY] },
+    ])
+    await renderAccounting()
+    await waitFor(() => expect(screen.getByText('JE7-TEST')).toBeInTheDocument())
+    fireEvent.click(screen.getByText('JE7-TEST'))
+
+    await waitFor(() => expect(screen.getByText(/posted automatically/i)).toBeInTheDocument())
+    expect(screen.queryByRole('button', { name: /reverse entry/i })).not.toBeInTheDocument()
   })
 })

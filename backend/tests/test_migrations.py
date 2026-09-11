@@ -27,7 +27,8 @@ M1_HEAD_REVISION = "9163f992ddc1"
 M2_RBAC_SEED_REVISION = "e6180fca2ee0"
 M2_HARDENING_REVISION = "89a42dfbfaea"  # M2 hardening: sale idempotency key
 M3_HEAD_REVISION = "c82162efb3af"  # M3: supplier code, goods receipt/return idempotency
-M4_HEAD_REVISION = "8df037a45976"  # M4: chart of accounts, journal engine, accounting permissions
+M4_ACCOUNTING_CORE_REVISION = "8df037a45976"  # M4: chart of accounts, journal engine, permissions
+M4_HEAD_REVISION = "581d2a07f38c"  # M4 hardening: allow MANUAL journal source type
 
 
 def _alembic_config() -> Config:

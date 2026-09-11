@@ -345,33 +345,31 @@ def _attempt_reverse(
 def test_e_two_concurrent_reversals_of_the_same_entry_produce_exactly_one_reversal(
     iteration: int,
 ) -> None:
+    """Uses a MANUAL entry, not a SALE — reversing an automated source is
+    now refused entirely (docs/M4_HARDENING_AUDIT.md Section 1), so the
+    concurrency proof needs a source_type reversal is actually legal
+    against, per the reversal function's own docstring."""
+    from app.modules.accounting.service import _credit, _debit, _post_journal
+
     setup = SessionLocal()
     try:
         store = make_store(setup)
         cashier = make_user(setup, store)
-        product = make_product(
-            setup,
-            store,
-            current_price=Decimal("10.00"),
-            current_cost=Decimal("4.000000"),
-            current_qty_on_hand=Decimal("10"),
-        )
         setup.commit()
-        sale = sales_service.finalize_sale(
+        entry = _post_journal(
             setup,
             store_id=store.id,
-            cashier_id=cashier.id,
-            client_transaction_id=f"txn-{uuid.uuid4().hex}",
-            caller_store_id=None,
-            lines=[SaleLineInput(product_id=product.id, quantity=Decimal("1"))],
-            payments=[PaymentInput(payment_method="CASH", amount=Decimal("10.00"))],
+            posting_date=date(2024, 1, 1),
+            source_type="MANUAL",
+            source_id=None,
+            memo="concurrency test manual entry",
+            created_by=cashier.id,
+            lines=[
+                _debit("1000", Decimal("10.00")),
+                _credit("4000", Decimal("10.00")),
+            ],
         )
         setup.commit()
-        entry = setup.execute(
-            select(JournalEntry).where(
-                JournalEntry.source_type == "SALE", JournalEntry.source_id == sale.id
-            )
-        ).scalar_one()
         entry_id, cashier_id = entry.id, cashier.id
     finally:
         setup.close()

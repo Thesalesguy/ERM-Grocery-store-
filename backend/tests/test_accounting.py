@@ -564,9 +564,38 @@ def test_sale_cogs_journal_amount_is_immutable_after_a_later_wac_change(db: Sess
 
 
 # --- Reversal ------------------------------------------------------------
+#
+# docs/M4_HARDENING_AUDIT.md Section 1 (CRITICAL, fixed): reversing an
+# automatically-posted journal entry (SALE/PURCHASE_RECEIPT/
+# PURCHASE_RETURN/STOCK_ADJUSTMENT/SALE_RETURN) is refused — it would
+# correct the accounting without undoing the operational transaction
+# that produced it (inventory, payment, stock), silently diverging the
+# two. Proven live against a running instance before the fix existed.
+# The reversal *mechanism* itself is still real and tested — against a
+# MANUAL entry (the one source_type no endpoint currently posts, added
+# specifically so this mechanism has a legal, testable target — see
+# accounting/models.py).
 
 
-def test_reverse_journal_entry_creates_an_opposite_balanced_entry(db: Session) -> None:
+def _post_manual_entry(db: Session, *, store_id: int, debit_amount: Decimal) -> JournalEntry:
+    from app.modules.accounting.service import _credit, _debit, _post_journal
+
+    return _post_journal(
+        db,
+        store_id=store_id,
+        posting_date=date(2024, 1, 1),
+        source_type="MANUAL",
+        source_id=None,
+        memo="manual test entry",
+        created_by=None,
+        lines=[
+            _debit(ACCOUNT_CASH_ON_HAND, debit_amount),
+            _credit(ACCOUNT_SALES_REVENUE, debit_amount),
+        ],
+    )
+
+
+def test_reversing_an_automated_sale_journal_is_refused(db: Session) -> None:
     store, cashier, product = _setup_sale_fixture(
         db, price=Decimal("10.00"), cost=Decimal("4.000000")
     )
@@ -585,13 +614,75 @@ def test_reverse_journal_entry_creates_an_opposite_balanced_entry(db: Session) -
             JournalEntry.source_type == "SALE", JournalEntry.source_id == sale.id
         )
     ).scalar_one()
+
+    with pytest.raises(ConflictError) as exc_info:
+        accounting_service.reverse_journal_entry(
+            db,
+            journal_entry_id=entry.id,
+            reason="attempted reversal of an automated entry",
+            reversed_by=cashier.id,
+            caller_store_id=None,
+        )
+    assert exc_info.value.error_code == "OPERATIONAL_REVERSAL_REQUIRED"
+
+    # No reversal was created, and the original entry is untouched.
+    reversal_count = len(
+        list(
+            db.execute(
+                select(JournalEntry).where(JournalEntry.reversal_of_id == entry.id)
+            ).scalars()
+        )
+    )
+    assert reversal_count == 0
+
+
+@pytest.mark.parametrize(
+    "source_type", ["SALE", "PURCHASE_RECEIPT", "PURCHASE_RETURN", "STOCK_ADJUSTMENT"]
+)
+def test_reversing_any_automated_source_type_is_refused(db: Session, source_type: str) -> None:
+    """Direct proof for every automated source_type, not just SALE —
+    constructs the entry via _post_journal directly rather than running
+    the full operational flow for each type, since the point under test
+    is reverse_journal_entry's source_type check, not the posting logic
+    (already covered elsewhere)."""
+    from app.modules.accounting.service import _credit, _debit, _post_journal
+
+    store = make_store(db)
+    db.commit()
+    entry = _post_journal(
+        db,
+        store_id=store.id,
+        posting_date=date(2024, 1, 1),
+        source_type=source_type,
+        source_id=123456,
+        memo="synthetic automated entry",
+        created_by=None,
+        lines=[
+            _debit(ACCOUNT_CASH_ON_HAND, Decimal("5.00")),
+            _credit(ACCOUNT_SALES_REVENUE, Decimal("5.00")),
+        ],
+    )
+    db.commit()
+
+    with pytest.raises(ConflictError) as exc_info:
+        accounting_service.reverse_journal_entry(
+            db, journal_entry_id=entry.id, reason="x", reversed_by=None, caller_store_id=None
+        )
+    assert exc_info.value.error_code == "OPERATIONAL_REVERSAL_REQUIRED"
+
+
+def test_reverse_journal_entry_creates_an_opposite_balanced_entry(db: Session) -> None:
+    store = make_store(db)
+    db.commit()
+    entry = _post_manual_entry(db, store_id=store.id, debit_amount=Decimal("10.00"))
+    db.commit()
     original_lines = {line.account_id: (line.debit, line.credit) for line in _lines_for(db, entry)}
 
     reversal = accounting_service.reverse_journal_entry(
         db,
         journal_entry_id=entry.id,
         reason="test reversal",
-        reversed_by=cashier.id,
+        reversed_by=None,
         caller_store_id=None,
     )
     db.commit()
@@ -610,57 +701,29 @@ def test_reverse_journal_entry_creates_an_opposite_balanced_entry(db: Session) -
 def test_reversing_an_already_reversed_entry_returns_the_same_reversal_idempotently(
     db: Session,
 ) -> None:
-    store, cashier, product = _setup_sale_fixture(
-        db, price=Decimal("10.00"), cost=Decimal("4.000000")
-    )
-    sale = sales_service.finalize_sale(
-        db,
-        store_id=store.id,
-        cashier_id=cashier.id,
-        client_transaction_id=f"txn-{unique_suffix()}",
-        caller_store_id=None,
-        lines=[SaleLineInput(product_id=product.id, quantity=Decimal("1"))],
-        payments=[PaymentInput(payment_method="CASH", amount=Decimal("10.00"))],
-    )
+    store = make_store(db)
     db.commit()
-    entry = db.execute(
-        select(JournalEntry).where(
-            JournalEntry.source_type == "SALE", JournalEntry.source_id == sale.id
-        )
-    ).scalar_one()
+    entry = _post_manual_entry(db, store_id=store.id, debit_amount=Decimal("10.00"))
+    db.commit()
 
     first = accounting_service.reverse_journal_entry(
-        db, journal_entry_id=entry.id, reason="r1", reversed_by=cashier.id, caller_store_id=None
+        db, journal_entry_id=entry.id, reason="r1", reversed_by=None, caller_store_id=None
     )
     db.commit()
     second = accounting_service.reverse_journal_entry(
-        db, journal_entry_id=entry.id, reason="r2", reversed_by=cashier.id, caller_store_id=None
+        db, journal_entry_id=entry.id, reason="r2", reversed_by=None, caller_store_id=None
     )
     db.commit()
     assert first.id == second.id
 
 
 def test_cannot_reverse_a_reversal_entry(db: Session) -> None:
-    store, cashier, product = _setup_sale_fixture(
-        db, price=Decimal("10.00"), cost=Decimal("4.000000")
-    )
-    sale = sales_service.finalize_sale(
-        db,
-        store_id=store.id,
-        cashier_id=cashier.id,
-        client_transaction_id=f"txn-{unique_suffix()}",
-        caller_store_id=None,
-        lines=[SaleLineInput(product_id=product.id, quantity=Decimal("1"))],
-        payments=[PaymentInput(payment_method="CASH", amount=Decimal("10.00"))],
-    )
+    store = make_store(db)
     db.commit()
-    entry = db.execute(
-        select(JournalEntry).where(
-            JournalEntry.source_type == "SALE", JournalEntry.source_id == sale.id
-        )
-    ).scalar_one()
+    entry = _post_manual_entry(db, store_id=store.id, debit_amount=Decimal("10.00"))
+    db.commit()
     reversal = accounting_service.reverse_journal_entry(
-        db, journal_entry_id=entry.id, reason="r1", reversed_by=cashier.id, caller_store_id=None
+        db, journal_entry_id=entry.id, reason="r1", reversed_by=None, caller_store_id=None
     )
     db.commit()
 
@@ -669,7 +732,7 @@ def test_cannot_reverse_a_reversal_entry(db: Session) -> None:
             db,
             journal_entry_id=reversal.id,
             reason="r2",
-            reversed_by=cashier.id,
+            reversed_by=None,
             caller_store_id=None,
         )
     assert exc_info.value.error_code == "CANNOT_REVERSE_REVERSAL"

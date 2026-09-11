@@ -66,7 +66,7 @@ def test_cashier_forbidden_from_accounting_endpoints(client: TestClient, db: Ses
     assert response.status_code == 403
 
 
-def test_manager_can_read_and_reverse(client: TestClient, db: Session) -> None:
+def test_manager_can_read_accounts_and_journals(client: TestClient, db: Session) -> None:
     store = make_store(db)
     username = f"manager_{unique_suffix()}"
     manager = make_user_with_role(db, store, MANAGER, username=username)
@@ -79,17 +79,38 @@ def test_manager_can_read_and_reverse(client: TestClient, db: Session) -> None:
 
     response = client.get(f"/api/v1/accounting/journals?store_id={store.id}", headers=headers)
     assert response.status_code == 200
-    entries = response.json()
-    assert len(entries) == 1
-    journal_id = entries[0]["id"]
+    assert len(response.json()) == 1
+
+
+def test_manager_cannot_reverse_an_automated_sale_journal_via_the_api(
+    client: TestClient, db: Session
+) -> None:
+    """docs/M4_HARDENING_AUDIT.md Section 1 (CRITICAL, fixed): even a
+    permission-holding Manager must not be able to reverse an
+    automatically-posted SALE journal — the API must surface the same
+    409 OPERATIONAL_REVERSAL_REQUIRED the service layer raises, not a
+    200. This is the regression test proving the fix actually reaches
+    the HTTP boundary, not just the service function."""
+    store = make_store(db)
+    username = f"manager_{unique_suffix()}"
+    manager = make_user_with_role(db, store, MANAGER, username=username)
+    _post_a_sale(db, store, manager)
+    headers = auth_headers(client, username, DEFAULT_TEST_PASSWORD)
+
+    response = client.get(f"/api/v1/accounting/journals?store_id={store.id}", headers=headers)
+    journal_id = response.json()[0]["id"]
 
     response = client.post(
         f"/api/v1/accounting/journals/{journal_id}/reverse",
-        json={"reason": "manager test reversal"},
+        json={"reason": "manager attempts to reverse a sale"},
         headers=headers,
     )
-    assert response.status_code == 200
-    assert response.json()["entry_type"] == "REVERSAL"
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "OPERATIONAL_REVERSAL_REQUIRED"
+
+    # No reversal exists and the entry is unchanged.
+    response = client.get(f"/api/v1/accounting/journals/{journal_id}", headers=headers)
+    assert response.json()["is_reversed"] is False
 
 
 def test_auditor_can_read_but_not_reverse(client: TestClient, db: Session) -> None:
@@ -166,6 +187,50 @@ def test_store_scoped_manager_cannot_reverse_another_stores_journal(
     # URL cannot be used to post into another store's ledger either.
     response = client.get(f"/api/v1/accounting/journals?store_id={store_b.id}", headers=headers_b)
     assert response.json() == []
+
+
+def test_store_scoped_manager_cannot_reverse_another_stores_manual_entry(
+    client: TestClient, db: Session
+) -> None:
+    """The cross-store attempt above targets a SALE-sourced entry, which
+    the automated-source block (Section 1) also refuses — masking
+    whether the store-isolation check on its own is doing anything. This
+    test targets a MANUAL entry instead (which the automated-source
+    block does NOT refuse), isolating the store check as the only
+    possible defense — and confirming (via a deliberate, reverted
+    mutation during the M4 hardening audit that temporarily disabled
+    _enforce_store_access) that removing it makes this exact test fail."""
+    from datetime import date
+    from decimal import Decimal
+
+    from app.modules.accounting.service import _credit, _debit, _post_journal
+
+    store_a = make_store(db)
+    store_b = make_store(db)
+    username_a = f"manager_a_{unique_suffix()}"
+    make_user_with_role(db, store_a, MANAGER, username=username_a)
+    username_b = f"manager_b_{unique_suffix()}"
+    make_user_with_role(db, store_b, MANAGER, username=username_b)
+    manual_entry = _post_journal(
+        db,
+        store_id=store_a.id,
+        posting_date=date(2024, 1, 1),
+        source_type="MANUAL",
+        source_id=None,
+        memo="manual entry for store isolation test",
+        created_by=None,
+        lines=[_debit("1000", Decimal("5.00")), _credit("4000", Decimal("5.00"))],
+    )
+    db.commit()
+
+    headers_b = auth_headers(client, username_b, DEFAULT_TEST_PASSWORD)
+    response = client.post(
+        f"/api/v1/accounting/journals/{manual_entry.id}/reverse",
+        json={"reason": "cross-store attempt on a manual entry"},
+        headers=headers_b,
+    )
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "STORE_ACCESS_DENIED"
 
 
 def test_store_scoped_manager_only_sees_own_store_in_list_and_reports(
