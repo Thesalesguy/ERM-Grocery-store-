@@ -500,10 +500,22 @@ audit would go further than one milestone's self-review can.
   credential is hardcoded in application code (§2's bootstrap script).
 - **Error disclosure**: see §13 — no stack trace or SQL text ever reaches
   a client response.
-- **Rate limiting**: **not implemented in M2.** Login and refresh
-  endpoints have no throttling or lockout, which is a genuine gap for a
-  production deployment — noted as a remaining decision (§17), not
-  silently omitted.
+- **Rate limiting**: **implemented in the post-M2 hardening pass** —
+  see `docs/M2_HARDENING_AUDIT.md` MEDIUM-1. A per-process, per-IP
+  fixed-window limiter now covers `/auth/login` and `/auth/refresh`;
+  the in-process (not distributed) nature is a documented, deliberate
+  limitation for the current single-instance deployment.
+- **Multi-store isolation**: **implemented in the post-M2 hardening
+  pass** — see `docs/M2_HARDENING_AUDIT.md` CRITICAL-1. The original M2
+  commit trusted client-submitted `store_id` values with no server-side
+  comparison against the authenticated user's own store assignment; this
+  is now enforced on every read and write across products, inventory,
+  and sales.
+- **Sale idempotency**: **implemented in the post-M2 hardening pass** —
+  see `docs/M2_HARDENING_AUDIT.md` CRITICAL-2. `POST /sales` now
+  requires a client-generated `client_transaction_id`, backed by a
+  UNIQUE database constraint, so a double-click or a network retry
+  cannot create a second sale.
 - **Audit protection**: unchanged from M1 (§12) — the running application
   role has no UPDATE/DELETE grant on `audit_logs`, enforced at the
   PostgreSQL level, not just by omitting the endpoints.
@@ -591,11 +603,14 @@ exact configured origin echoed back (not a wildcard).
 
 ## 17. Remaining business decisions (not resolved by M2, listed rather than silently assumed)
 
-- **Rate limiting / login lockout** is not implemented (§14) — a
-  production deployment needs this before going live.
-- **Refresh-token-reuse detection** revokes the reused token (§2) but
-  does not yet take a stronger action (e.g. revoking every token for
-  that user) — a policy decision for a later milestone.
+**Note**: this section is the original, as-shipped M2 list. A dedicated
+pre-M3 adversarial audit (`docs/M2_HARDENING_AUDIT.md`) subsequently
+closed several of these items — rate limiting, multi-store isolation,
+sale idempotency, and refresh-token-reuse response are now implemented;
+see that document for what changed and what remains genuinely open
+(distributed rate limiting, request body size limits, and others, under
+"Remaining Accepted Risks").
+
 - **`users.manage` and `audit.read` have no endpoints yet** — the
   permission codes and role assignments exist and are seeded (§3) so
   that RBAC checks and tests can reference them now, but user management
