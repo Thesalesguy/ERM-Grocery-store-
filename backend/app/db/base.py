@@ -14,3 +14,22 @@ from app.modules.auth.models import (  # noqa: F401
     User,
     UserRole,
 )
+from app.modules.inventory.models import InventoryMovement, StockAdjustment  # noqa: F401
+from app.modules.products.models import Product, ProductBarcode, ProductCategory  # noqa: F401
+from app.modules.purchasing.models import (  # noqa: F401
+    GoodsReceipt,
+    GoodsReceiptItem,
+    PurchaseOrder,
+    PurchaseOrderItem,
+    PurchaseReturn,
+    PurchaseReturnItem,
+    Supplier,
+)
+from app.modules.sales.models import (  # noqa: F401
+    Payment,
+    Sale,
+    SaleItem,
+    SaleReturn,
+    SaleReturnItem,
+)
+from app.modules.tax.models import TaxRate  # noqa: F401

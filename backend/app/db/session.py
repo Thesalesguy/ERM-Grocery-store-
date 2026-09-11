@@ -10,6 +10,7 @@ from collections.abc import Generator
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+import app.db.base  # noqa: F401  (side effect: registers every ORM model)
 from app.core.config import get_settings
 
 settings = get_settings()

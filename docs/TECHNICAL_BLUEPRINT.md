@@ -158,10 +158,10 @@ Owns `products`, `inventory_movements`, WAC recalculation. Every mutation to on-
 Owns cart → sale finalization. Talks to Inventory Service (deduct stock, get current WAC for COGS) and Accounting/Reporting (post the sale's financial facts) inside one DB transaction.
 
 ### Purchasing Service
-Owns `purchases`, `purchase_items`, goods receiving. On receipt, calls Inventory Service to increase stock and recompute WAC.
+Owns `purchase_orders`, `purchase_order_items`, goods receiving. On receipt, calls Inventory Service to increase stock and recompute WAC.
 
 ### Accounting/Reporting Service
-Read-mostly service that aggregates from `sales`, `sale_items`, `purchases`, `inventory_movements`, `payments`. Never stores editable derived totals as source of truth — only cached/materialized for performance (Section G).
+Read-mostly service that aggregates from `sales`, `sale_items`, `purchase_orders`, `inventory_movements`, `payments`. Never stores editable derived totals as source of truth — only cached/materialized for performance (Section G).
 
 ### Tax Integration Service
 Isolated module behind an interface (`TaxProvider`), so core POS calls `tax_provider.calculate(sale)` and, later, `tax_provider.submit(invoice)` without knowing which authority is behind it (Section J).
@@ -233,7 +233,8 @@ Naming: snake_case, singular concept/plural table names, `id BIGSERIAL PRIMARY K
 
 **`inventory_movements`**
 - Purpose: single source of truth ledger for every stock change. Append-only.
-- Columns: `id`, `store_id FK→stores`, `product_id FK→products`, `movement_type` (enum: `PURCHASE_RECEIPT`, `SALE`, `SALE_RETURN`, `PURCHASE_RETURN`, `ADJUSTMENT_IN`, `ADJUSTMENT_OUT`, `TRANSFER_IN`, `TRANSFER_OUT`), `quantity_delta NUMERIC(14,3)` (signed: + increases stock, - decreases), `unit_cost_at_movement NUMERIC(14,6)` (WAC at time of movement, frozen), `resulting_quantity_on_hand NUMERIC(14,3)` (snapshot after applying, for fast audit/debug), `reference_type` (enum: `sale`, `purchase`, `adjustment`, `transfer`), `reference_id BIGINT` (polymorphic pointer to `sales.id`/`purchases.id`/`stock_adjustments.id`), `reason` TEXT NULL, `created_by FK→users`, `created_at`.
+- Columns: `id`, `store_id FK→stores`, `product_id FK→products`, `movement_type` (enum: `PURCHASE_RECEIPT`, `SALE`, `SALE_RETURN`, `PURCHASE_RETURN`, `STOCK_ADJUSTMENT_IN`, `STOCK_ADJUSTMENT_OUT`), `quantity_delta NUMERIC(14,3)` (signed: + increases stock, - decreases), `unit_cost_at_movement NUMERIC(14,6)` (WAC at time of movement, frozen), `resulting_quantity_on_hand NUMERIC(14,3)` (snapshot after applying, for fast audit/debug), `reference_type` (enum: `purchase_order`, `sale`, `sale_return`, `purchase_return`, `stock_adjustment`), `reference_id BIGINT` (polymorphic pointer to `sales.id`/`purchase_orders.id`/`stock_adjustments.id`/etc., not FK-enforced), `reason` TEXT NULL, `created_by FK→users`, `created_at`.
+- M1 naming update: `ADJUSTMENT_IN`/`ADJUSTMENT_OUT` renamed to `STOCK_ADJUSTMENT_IN`/`STOCK_ADJUSTMENT_OUT` to match the M1 task's movement-type list exactly. `TRANSFER_IN`/`TRANSFER_OUT` are not implemented in M1 — see `docs/M1_DATABASE_DESIGN.md` §3 (no multi-store product sharing exists yet to transfer between). CHECK constraints enforce that `movement_type` and the sign of `quantity_delta` agree — see `docs/M1_DATABASE_DESIGN.md` §2.5.
 - Indexes: `(product_id, created_at)`, `(reference_type, reference_id)`.
 - Never updated or deleted (BR-6); corrections are new offsetting rows.
 
@@ -243,27 +244,35 @@ Naming: snake_case, singular concept/plural table names, `id BIGSERIAL PRIMARY K
 
 ### C.3 Purchasing
 
-**`purchases`**
+> **Naming update (M1)**: this section originally named these tables
+> `purchases`/`purchase_items`. The M1 implementation task asked for
+> `purchase_orders`/`purchase_order_items` instead, to make the
+> order/receipt distinction unambiguous directly in the schema. The
+> tables below reflect the names actually implemented — see
+> `docs/M1_DATABASE_DESIGN.md` §2.2.
+
+**`purchase_orders`**
 - Purpose: purchase order + its receiving lifecycle in one header (status-driven).
 - Columns: `id`, `store_id FK→stores`, `supplier_id FK→suppliers`, `purchase_number` (unique, human-readable), `status` (enum: `DRAFT`, `ORDERED`, `PARTIALLY_RECEIVED`, `RECEIVED`, `CANCELLED`), `order_date`, `expected_date NULL`, `notes`, `created_by FK→users`, `created_at`, `updated_at`.
 - Unique: `purchase_number`.
 
-**`purchase_items`**
-- Columns: `id`, `purchase_id FK→purchases`, `product_id FK→products`, `quantity_ordered NUMERIC(14,3)`, `quantity_received NUMERIC(14,3) DEFAULT 0`, `unit_cost NUMERIC(14,6)` (cost at time of order — frozen, BR-2), `line_total NUMERIC(14,2)` (generated: `quantity_ordered * unit_cost`, informational).
-- Index: `purchase_id`.
+**`purchase_order_items`**
+- Columns: `id`, `purchase_order_id FK→purchase_orders`, `product_id FK→products`, `quantity_ordered NUMERIC(14,3)`, `quantity_received NUMERIC(14,3) DEFAULT 0`, `unit_cost NUMERIC(14,6)` (cost at time of order — frozen, BR-2).
+- Index: `purchase_order_id`.
+- No CHECK ties `quantity_received <= quantity_ordered`: over-receipt is allowed (see below), so this would contradict the stated business rule.
 
 **`goods_receipts`**
-- Purpose: one row per physical receiving event against a purchase (supports partial deliveries, BR from spec item F).
-- Columns: `id`, `purchase_id FK→purchases`, `received_date`, `received_by FK→users`, `notes`, `created_at`.
+- Purpose: one row per physical receiving event against a purchase order (supports partial deliveries, BR from spec item F).
+- Columns: `id`, `purchase_order_id FK→purchase_orders`, `received_date`, `received_by FK→users`, `notes`, `created_at`.
 
 **`goods_receipt_items`**
-- Columns: `id`, `goods_receipt_id FK→goods_receipts`, `purchase_item_id FK→purchase_items`, `quantity_received NUMERIC(14,3)`, `unit_cost NUMERIC(14,6)` (actual invoiced cost for this receipt — may differ from PO cost; this is the value WAC recalculation uses), `condition_notes` (e.g., damaged, short-shipped).
-- Index: `goods_receipt_id`, `purchase_item_id`.
-- Each row here triggers one `inventory_movements` row (`PURCHASE_RECEIPT`) and a WAC recompute (Section D).
+- Columns: `id`, `goods_receipt_id FK→goods_receipts`, `purchase_order_item_id FK→purchase_order_items`, `quantity_received NUMERIC(14,3)`, `unit_cost NUMERIC(14,6)` (actual invoiced cost for this receipt — may differ from PO cost; this is the value WAC recalculation uses), `condition_notes` (e.g., damaged, short-shipped).
+- Index: `goods_receipt_id`, `purchase_order_item_id`.
+- Each row here triggers one `inventory_movements` row (`PURCHASE_RECEIPT`) and a WAC recompute (Section D). Implemented in M1 as `app.modules.purchasing.service.receive_goods`.
 
 **`purchase_returns`** / **`purchase_return_items`**
 - Purpose: returning goods to a supplier (damaged/wrong item).
-- `purchase_returns`: `id`, `purchase_id FK→purchases`, `store_id`, `return_date`, `reason`, `created_by`, `created_at`.
+- `purchase_returns`: `id`, `purchase_order_id FK→purchase_orders`, `store_id`, `return_date`, `reason`, `created_by`, `created_at`.
 - `purchase_return_items`: `id`, `purchase_return_id FK→purchase_returns`, `product_id FK→products`, `quantity NUMERIC(14,3)`, `unit_cost NUMERIC(14,6)` (cost at which it was received, for correct WAC reversal).
 - Generates `inventory_movements` (`PURCHASE_RETURN`, negative delta).
 
@@ -271,7 +280,8 @@ Naming: snake_case, singular concept/plural table names, `id BIGSERIAL PRIMARY K
 
 **`sales`**
 - Purpose: sale (receipt) header. Immutable once `status = COMPLETED` except for status transitions to `VOIDED`/`RETURNED`.
-- Columns: `id`, `store_id FK→stores`, `sale_number` (unique, human-readable/receipt number), `cashier_id FK→users`, `status` (enum: `OPEN`, `COMPLETED`, `VOIDED`, `PARTIALLY_RETURNED`, `RETURNED`), `subtotal NUMERIC(12,2)`, `discount_total NUMERIC(12,2) DEFAULT 0`, `tax_total NUMERIC(12,2) DEFAULT 0`, `grand_total NUMERIC(12,2)`, `amount_tendered NUMERIC(12,2) NULL`, `change_due NUMERIC(12,2) NULL`, `voided_by FK→users NULL`, `voided_reason TEXT NULL`, `completed_at TIMESTAMPTZ NULL`, `created_at`.
+- Columns: `id`, `store_id FK→stores`, `sale_number` (unique, human-readable/receipt number), `cashier_id FK→users`, `status` (enum: `OPEN`, `COMPLETED`, `VOIDED`, `REFUNDED`, `PARTIALLY_REFUNDED` — M1 naming update, see below), `subtotal NUMERIC(12,2)`, `discount_total NUMERIC(12,2) DEFAULT 0`, `tax_total NUMERIC(12,2) DEFAULT 0`, `grand_total NUMERIC(12,2)`, `amount_tendered NUMERIC(12,2) NULL`, `change_due NUMERIC(12,2) NULL`, `voided_by FK→users NULL`, `voided_reason TEXT NULL`, `completed_at TIMESTAMPTZ NULL`, `created_at`.
+- M1 naming update: `PARTIALLY_RETURNED`/`RETURNED` renamed to `PARTIALLY_REFUNDED`/`REFUNDED` to match the M1 task's status list exactly (same meaning). `CHECK (grand_total = subtotal - discount_total + tax_total)` enforces the stored total's internal consistency at the database level.
 - Unique: `sale_number`.
 - Indexes: `(store_id, created_at)`, `cashier_id`.
 - `grand_total` is a stored, computed-once value (BR-1/BR-5) — recomputed server-side and validated against the sum of `sale_items` + tax − discount before commit, never trusted from the client.
@@ -283,7 +293,7 @@ Naming: snake_case, singular concept/plural table names, `id BIGSERIAL PRIMARY K
 
 **`payments`**
 - Purpose: supports split tender (assumption #7).
-- Columns: `id`, `sale_id FK→sales`, `payment_method` (enum: `CASH`, `CARD`, `MOBILE_MONEY`, `OTHER`), `amount NUMERIC(12,2)`, `reference` (e.g., card auth code/mobile money txn id), `created_at`.
+- Columns: `id`, `sale_id FK→sales`, `payment_method` (enum: `CASH`, `CARD`, `MOBILE_MONEY`, `BANK_TRANSFER`, `OTHER` — `BANK_TRANSFER` added in M1 per the task's payment-method list), `amount NUMERIC(12,2)`, `reference` (e.g., card auth code/mobile money txn id), `created_at`.
 - Index: `sale_id`.
 
 **`sale_returns`**
@@ -320,12 +330,12 @@ Naming: snake_case, singular concept/plural table names, `id BIGSERIAL PRIMARY K
 
 ### C.8 Relationship Summary
 ```
-stores 1─* users, products, sales, purchases
+stores 1─* users, products, sales, purchase_orders
 users *─* roles (via user_roles) ; roles *─* permissions (via role_permissions)
 product_categories 1─* products (self-referencing tree)
-suppliers 1─* purchases
-products 1─* product_barcodes, inventory_movements, sale_items, purchase_items
-purchases 1─* purchase_items, goods_receipts
+suppliers 1─* purchase_orders
+products 1─* product_barcodes, inventory_movements, sale_items, purchase_order_items
+purchase_orders 1─* purchase_order_items, goods_receipts
 goods_receipts 1─* goods_receipt_items
 sales 1─* sale_items, payments; sales 1─* sale_returns
 sale_returns 1─* sale_return_items
@@ -358,8 +368,8 @@ Applied **only on receipt of goods** (purchases, positive adjustments, restocked
 **Sales return (restocked):** Customer returns 5 units from that sale. Inventory movement `SALE_RETURN +5` **does not re-average** — the cost of the returned stock is the cost it left at (10.6667), since it's the same physical goods coming back, not a new purchase. On-hand: 135, WAC stays 10.6667.
 
 **Stock adjustment (found extra stock / shrinkage):**
-- Shrinkage (write-off, `ADJUSTMENT_OUT` -3): on-hand 132, WAC unchanged (removing units at existing WAC doesn't change the average of what remains).
-- Found stock with no cost basis (`ADJUSTMENT_IN` +2, cost = current WAC by convention, since no purchase cost exists): on-hand 134, WAC unchanged (adding at the existing average doesn't move it).
+- Shrinkage (write-off, `STOCK_ADJUSTMENT_OUT` -3): on-hand 132, WAC unchanged (removing units at existing WAC doesn't change the average of what remains).
+- Found stock with no cost basis (`STOCK_ADJUSTMENT_IN` +2, cost = current WAC by convention, since no purchase cost exists): on-hand 134, WAC unchanged (adding at the existing average doesn't move it).
 
 **Purchase return (goods sent back to supplier):** Return 10 units that were received at 12.00 (the specific receipt lot). `PURCHASE_RETURN -10` at unit_cost 12.00. New WAC recomputed as a *reversal*:
 ```
@@ -378,8 +388,8 @@ This requires knowing which cost lot is being reversed — see Edge Cases below 
 1. **Selling at zero stock**: blocked by default (BR-7). API returns `409 Conflict` with `INSUFFICIENT_STOCK`. If a store enables the "allow negative" override, the sale proceeds, `unit_cost_at_sale` uses the last known WAC, and the resulting movement drives quantity negative — flagged in a daily exception report.
 2. **Negative inventory**: allowed only per the override in #1; always visible in a "negative stock" report; WAC math still works (average of a negative and a positive quantity is mathematically valid but must be treated with a warning banner, since a WAC computed against negative stock does not represent a physical inventory reality).
 3. **Multiple purchases at different costs**: handled natively by the weighted-average formula (see examples above) — this is WAC's whole purpose, unlike FIFO/LIFO which would need cost-lot tracking.
-4. **Partial receiving**: each `goods_receipt` is its own event; `purchase_items.quantity_received` accumulates; `purchases.status` moves `ORDERED → PARTIALLY_RECEIVED → RECEIVED` when `quantity_received == quantity_ordered` for all lines (or is manually closed short).
-5. **Cancelled purchases**: a `purchase` can move to `CANCELLED` only while `status IN (DRAFT, ORDERED)` and no `goods_receipts` exist against it — no inventory impact, no reversal needed since nothing was posted yet. Once any receipt exists, the PO cannot be cancelled; use a purchase return instead.
+4. **Partial receiving**: each `goods_receipt` is its own event; `purchase_order_items.quantity_received` accumulates; `purchase_orders.status` moves `ORDERED → PARTIALLY_RECEIVED → RECEIVED` when `quantity_received == quantity_ordered` for all lines (or is manually closed short).
+5. **Cancelled purchases**: a `purchase_order` can move to `CANCELLED` only while `status IN (DRAFT, ORDERED)` and no `goods_receipts` exist against it — no inventory impact, no reversal needed since nothing was posted yet. Once any receipt exists, the PO cannot be cancelled; use a purchase return instead.
 6. **Returned goods (purchase return) needing a specific cost lot**: pure WAC has no lot memory, so the return uses the unit cost **recorded on the goods_receipt_item being reversed** (not the current WAC) to correctly back out that value, per the reversal formula above. This is the standard, defensible approach for a WAC system (documented limitation vs. FIFO — acceptable per spec's "Weighted Average Cost" requirement).
 7. **Concurrent sales on the same product**: prevented from corrupting quantity via a DB-level row lock. The Inventory Service acquires `SELECT ... FOR UPDATE` on the product's inventory row (or uses an atomic `UPDATE products SET qty = qty - :n WHERE id=:id AND qty >= :n RETURNING qty` pattern) inside the sale transaction; a failed conditional update surfaces as `INSUFFICIENT_STOCK` and the whole sale transaction rolls back (never partial). Postgres's transaction isolation (READ COMMITTED + row locking, or SERIALIZABLE for the hot path if contention proves an issue) guarantees no lost updates.
 
@@ -407,7 +417,7 @@ This requires knowing which cost lot is being reversed — see Edge Cases below 
 ## F. Purchasing Workflow
 
 ```
-Supplier ─▶ Purchase (DRAFT) ─▶ Purchase (ORDERED)
+Supplier ─▶ Purchase Order (DRAFT) ─▶ Purchase Order (ORDERED)
                                      │
                                      ▼
                           Goods Receipt #1 (partial)
@@ -415,15 +425,15 @@ Supplier ─▶ Purchase (DRAFT) ─▶ Purchase (ORDERED)
                                      │  → inventory_movements (PURCHASE_RECEIPT)
                                      │  → WAC recompute per product
                                      ▼
-                     purchase_items.quantity_received updated
+                purchase_order_items.quantity_received updated
                                      │
                          (if quantity_received < ordered)
                                      ▼
-                     purchases.status = PARTIALLY_RECEIVED
+                  purchase_orders.status = PARTIALLY_RECEIVED
                                      │
                           Goods Receipt #2 ... N
                                      ▼
-                     purchases.status = RECEIVED (fully matched)
+                  purchase_orders.status = RECEIVED (fully matched)
                                      │
                                      ▼
                         Accounting impact: inventory value ↑,
@@ -454,7 +464,7 @@ All figures below are **computed from transaction history at query time (or mate
 | Inventory Value | `Σ products.current_qty_on_hand * products.current_cost` (WAC) at a point in time | products |
 | Stock Movement | Filtered listing/summary of `inventory_movements` by type/date/product | inventory_movements |
 | Daily Sales | Gross/Net/Tax/Discount grouped by `date_trunc('day', sales.completed_at)` | sales, sale_items |
-| Supplier totals | `Σ goods_receipt_items` joined to `purchases.supplier_id` | goods_receipt_items, purchases |
+| Supplier totals | `Σ goods_receipt_items` joined to `purchase_orders.supplier_id` | goods_receipt_items, purchase_orders |
 
 Reports that need to be **fast** at scale (daily P&L dashboard) can use a materialized view or a nightly rollup table (`daily_sales_summary`) populated by the background worker — but the rollup is always reproducible by re-running the aggregation query, never hand-editable, preserving auditability.
 
@@ -472,7 +482,7 @@ Reports that need to be **fast** at scale (daily P&L dashboard) can use a materi
 - **SQL injection prevention**: ORM/parameterized queries only (SQLAlchemy or equivalent) — no string-built SQL.
 - **CSRF**: SPA using Bearer JWT in an `Authorization` header is not CSRF-vulnerable for state-changing calls; if refresh tokens use cookies, mark them `SameSite=Strict`/`Lax` + httpOnly + `Secure`, and don't rely on cookies for the access token itself.
 - **Rate limiting**: Nginx or app-level limiter on `/auth/login` and `/auth/refresh` (e.g., 5/min/IP) to blunt credential stuffing.
-- **Audit logs**: append-only, no update/delete permission granted to any application role at the DB level (revoke UPDATE/DELETE on `audit_logs` from the app's DB user, or enforce via a `BEFORE UPDATE/DELETE` trigger that raises an exception).
+- **Audit logs & inventory ledger**: append-only, no update/delete permission granted to the application's runtime DB role. **Implemented in M1**: the app connects as a restricted role (`erp_app`) distinct from the schema-owning/migration role (`erp_user`), since a table's *owner* always bypasses `GRANT`/`REVOKE` in PostgreSQL — restricting the owner would be a no-op. `erp_app` has broad `SELECT/INSERT/UPDATE/DELETE` on ordinary tables but `UPDATE`/`DELETE` are explicitly revoked on `audit_logs` and `inventory_movements`. See `docs/M1_DATABASE_DESIGN.md` §1.C and the `9163f992ddc1` migration.
 - **Secrets management**: `.env` file outside git (`.gitignore`'d), injected via Docker Compose env vars or a secrets manager; DB credentials, JWT signing key, and future tax-API keys never committed.
 - **HTTPS**: Let's Encrypt via Certbot, auto-renewal, Nginx redirects all HTTP→HTTPS.
 - **Backup security**: backups encrypted at rest (e.g., `gpg` or bucket-side encryption), access-restricted credentials, tested restore.
@@ -505,11 +515,11 @@ Base path `/api/v1`. All endpoints except `/auth/login` require `Authorization: 
 | GET | `/sale-items` | `sales.read` | Query line items across sales (for reporting) | — |
 | GET | `/suppliers` | `suppliers.read` | List suppliers | — |
 | POST | `/suppliers` | `suppliers.write` | Create supplier | 400 |
-| POST | `/purchases` | `purchases.write` | Create PO (draft/ordered) | 400 |
-| GET | `/purchases/{id}` | `purchases.read` | PO detail incl. items, receipts | 404 |
-| POST | `/purchases/{id}/receive` | `purchases.receive` | Record a goods receipt (partial or full) | 400 over-receipt policy; 409 PO cancelled |
-| POST | `/purchases/{id}/cancel` | `purchases.write` | Cancel a PO | 409 already has receipts |
-| POST | `/purchases/{id}/returns` | `purchases.write` | Create a purchase return | 400 exceeds received qty |
+| POST | `/purchase-orders` | `purchases.write` | Create PO (draft/ordered) | 400 |
+| GET | `/purchase-orders/{id}` | `purchases.read` | PO detail incl. items, receipts | 404 |
+| POST | `/purchase-orders/{id}/receive` | `purchases.receive` | Record a goods receipt (partial or full) — implemented in M1 as `app.modules.purchasing.service.receive_goods`, not yet wired to an endpoint | 400 over-receipt policy; 409 PO cancelled |
+| POST | `/purchase-orders/{id}/cancel` | `purchases.write` | Cancel a PO | 409 already has receipts |
+| POST | `/purchase-orders/{id}/returns` | `purchases.write` | Create a purchase return | 400 exceeds received qty |
 | GET | `/reports/pnl` | `reports.read` | P&L for a date range | 400 invalid range |
 | GET | `/reports/daily-sales` | `reports.read` | Daily sales summary | — |
 | GET | `/reports/stock-movement` | `reports.read` | Movement report | — |
@@ -592,6 +602,23 @@ TaxProvider (interface)
 ## M. Development Roadmap
 
 Each milestone is independently testable and shippable in sequence.
+
+> **Actual vs. planned scope (recorded after M0 and M1 shipped)**: the
+> milestones below are the original target shape. In practice:
+> - **M0** deferred authentication entirely (no login/JWT/RBAC
+>   middleware) — only the identity/RBAC *data model* was built. See
+>   `docs/M1_DATABASE_DESIGN.md` §1.A for why, and when that's revisited.
+> - **M1**, as actually scoped by its implementation task, pulled forward
+>   the *data model* (not the UI/full service layer) for everything
+>   through roughly M2–M4 and part of M6/M7: product catalog, the full
+>   inventory ledger + WAC, purchasing/goods-receiving (including one
+>   real transactional service slice), sales/payments/returns schema,
+>   and the tax-rate foundation. `docs/M1_DATABASE_DESIGN.md` is the
+>   authoritative record of what was actually built and why. The
+>   milestone descriptions below still describe the right *eventual*
+>   backend/frontend/UI work for each area — M2 onward should read as
+>   "the service layer and UI for tables M1 already created," not
+>   "create these tables."
 
 **M0 — Foundation**
 - DB: initial migration framework (Alembic), `stores`, `users`, `roles`, `permissions`, `role_permissions`, `user_roles`.

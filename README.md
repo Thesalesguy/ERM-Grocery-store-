@@ -5,15 +5,20 @@ with Weighted Average Cost, purchasing/goods receiving, and Profit & Loss report
 
 The authoritative technical design lives in [`docs/TECHNICAL_BLUEPRINT.md`](docs/TECHNICAL_BLUEPRINT.md)
 — requirements, architecture, full database design, accounting formulas, workflows, API design,
-security, deployment, and the milestone roadmap. **Read that document first**; this README only
-covers running what has been built so far (Milestone M0: project foundation).
+security, deployment, and the milestone roadmap.
+[`docs/M1_DATABASE_DESIGN.md`](docs/M1_DATABASE_DESIGN.md) records the M1 milestone's decisions in
+detail (inventory ledger, Weighted Average Cost, the two-database-role privilege model, and what
+remains open). **Read both before touching a module**; this README only covers running what has
+been built so far.
 
 ## Status
 
-**Milestone M0 — Foundation.** No business features (POS, purchasing, accounting, tax) are
-implemented yet. What exists: the modular-monolith project skeleton, database connectivity and
-migrations for the identity/access + audit schema, a health-checked FastAPI backend, and a React
-frontend shell with placeholder pages for every planned module.
+**Milestone M1 — Transactional data model.** The full production database schema exists — product
+catalog, the inventory-movement ledger with Weighted Average Cost, purchasing/goods-receiving
+(including one real transactional service), sales/payments/returns, and the tax-rate foundation —
+plus a minimal API proving the model/schema/service/route separation. No POS, purchasing, or
+accounting **UI/full service layer** is implemented yet; authentication is still deferred (see
+`docs/M1_DATABASE_DESIGN.md` §1.A).
 
 ## Architecture
 
@@ -31,14 +36,14 @@ backend/app/
   db/         SQLAlchemy engine/session, declarative base
   api/v1/     versioned HTTP routes
   modules/
-    auth/       stores, users, roles, permissions (data model only in M0)
-    audit/      append-only audit log (data model only in M0)
-    products/   catalog                       -- M1
-    inventory/  stock + Weighted Average Cost  -- M2
-    purchasing/ suppliers, PO, goods receiving -- M3
-    sales/      POS / checkout                -- M4
-    accounting/ P&L and reporting              -- M6
-    tax/        tax-authority integration      -- M7
+    auth/       stores, users, roles, permissions (data model only; no login yet)
+    audit/      append-only audit log (data model only; nothing writes to it yet)
+    products/   catalog: categories, products, barcodes — data model + minimal API
+    inventory/  ledger + Weighted Average Cost — data model + service helpers
+    purchasing/ suppliers, PO, goods receiving — data model + one real transactional service
+    sales/      sale/payment/return data model (no finalization service yet — that's M4)
+    accounting/ P&L and reporting                                            -- M6
+    tax/        tax_rates table now; provider integration                    -- M7
 ```
 
 A full production topology (Nginx reverse proxy, TLS, Docker Compose production stack) is planned
@@ -77,7 +82,8 @@ cp frontend/.env.example frontend/.env
 |---|---|---|
 | `PROJECT_NAME` | Display name used in API docs | `Grocery ERP/POS` |
 | `ENVIRONMENT` | `development` \| `staging` \| `production` — disables `/docs` and `/redoc` in production | `development` |
-| `DATABASE_URL` | SQLAlchemy/psycopg3 Postgres connection string | `postgresql+psycopg://erp_user:erp_password@localhost:5432/erp_dev` |
+| `DATABASE_URL` | Connection string the **running application** uses. Must be the restricted `erp_app` role — see [Database Setup](#database-setup) below | `postgresql+psycopg://erp_app:erp_app_password@localhost:5432/erp_dev` |
+| `MIGRATIONS_DATABASE_URL` | Connection string **Alembic** uses. Must be the schema-owning role (`erp_user`) — falls back to `DATABASE_URL` if unset, which only works if that role owns the schema | `postgresql+psycopg://erp_user:erp_password@localhost:5432/erp_dev` |
 | `SECRET_KEY` | Reserved for future JWT signing (Section H of the blueprint) — replace before any non-local deployment | dev-only placeholder |
 | `CORS_ORIGINS` | Comma-separated list of allowed frontend origins | `http://localhost:5173` |
 | `LOG_LEVEL` | Python logging level | `INFO` |
@@ -90,17 +96,32 @@ cp frontend/.env.example frontend/.env
 
 ## Database Setup
 
-Create a local Postgres user/database (adjust names to match your `.env`):
+The application connects as a **restricted runtime role** (`erp_app`), separate from the
+**schema-owning role** migrations run as (`erp_user`). This is what makes the audit-log/inventory-
+ledger write protection real — see `docs/M1_DATABASE_DESIGN.md` §1.C for why a table's owner can
+never be restricted by `GRANT`/`REVOKE` alone.
+
+**Local (non-Docker) setup:**
 
 ```bash
+# 1. Create the schema-owning role and database (as before).
 sudo -u postgres psql -c "CREATE USER erp_user WITH PASSWORD 'erp_password';"
 sudo -u postgres psql -c "CREATE DATABASE erp_dev OWNER erp_user;"
+
+# 2. Bootstrap the restricted runtime role (idempotent — safe to re-run).
+sudo -u postgres psql -d erp_dev -f backend/scripts/bootstrap_db_roles.sql
+
+# 3. Set its password to match your .env (rotate this for anything beyond local dev).
+sudo -u postgres psql -d erp_dev -c "ALTER ROLE erp_app WITH PASSWORD 'erp_app_password';"
 ```
 
-Or start Postgres via Docker instead of installing it locally:
+**Docker**: step 2 runs automatically the first time the `db` volume is created (mounted into
+`/docker-entrypoint-initdb.d/`) — no manual step needed for a fresh `docker compose up`. For an
+*existing* volume that predates this, run it manually:
 
 ```bash
 docker compose up -d db
+docker compose exec db psql -U erp_user -d erp_dev -f /docker-entrypoint-initdb.d/01_bootstrap_db_roles.sql
 ```
 
 ## Migrations
@@ -206,7 +227,8 @@ npm run build            # production build verification
 ```
 .
 ├── docs/
-│   └── TECHNICAL_BLUEPRINT.md   # authoritative design document
+│   ├── TECHNICAL_BLUEPRINT.md    # authoritative design document
+│   └── M1_DATABASE_DESIGN.md     # M1 decisions: ledger, WAC, COGS, privilege model
 ├── backend/
 │   ├── app/
 │   │   ├── main.py              # FastAPI app factory + entry point
@@ -215,6 +237,8 @@ npm run build            # production build verification
 │   │   ├── api/v1/               # versioned API routes
 │   │   └── modules/              # one package per business module boundary
 │   ├── alembic/                  # migrations
+│   ├── scripts/
+│   │   └── bootstrap_db_roles.sql  # one-time, superuser-run erp_app role setup
 │   ├── tests/
 │   ├── requirements.txt
 │   ├── requirements-dev.txt
@@ -240,6 +264,23 @@ npm run build            # production build verification
 5. Run backend and frontend quality checks (lint, format, type-check, tests) before committing.
 6. Commit to the designated feature branch; do not open pull requests unless explicitly asked.
 
+## Decisions Made During M1
+
+See `docs/M1_DATABASE_DESIGN.md` §1 and §11 for the full write-up (authentication timing, Nginx/TLS,
+the `erp_app`/`erp_user` privilege split, and a list of business decisions still needing sign-off —
+negative-stock default, the purchase-return WAC approximation, and others). Summarized:
+
+- Authentication remains deferred (unchanged from M0's decision) — M1 added no user-facing
+  endpoints that need it yet.
+- Nginx/TLS remains deferred to M8 (unchanged from M0's decision).
+- The audit-log write-protection gap flagged in M0 is now resolved: the application runs as a
+  restricted role (`erp_app`) distinct from the migration-owning role (`erp_user`), with
+  `UPDATE`/`DELETE` revoked on `audit_logs` and `inventory_movements` — proved live in
+  `tests/test_constraints.py`, not just asserted.
+- Table/enum naming was refined from the blueprint's original draft (`purchases` →
+  `purchase_orders`, `ADJUSTMENT_IN/OUT` → `STOCK_ADJUSTMENT_IN/OUT`, sale statuses, payment
+  methods) — `docs/TECHNICAL_BLUEPRINT.md` has been updated to match throughout.
+
 ## Assumptions Made During M0
 
 - **Authentication scope**: the blueprint's original M0 definition included full login/JWT/RBAC
@@ -252,12 +293,9 @@ npm run build            # production build verification
   stage." Since local development works without it (CORS handles cross-origin calls between the
   Vite dev server and FastAPI), the Nginx reverse proxy + TLS termination designed in the
   blueprint's Section L is deferred to Milestone M8 (deployment hardening) rather than built twice.
-- **Audit log write-protection**: the blueprint calls for revoking `UPDATE`/`DELETE` on
-  `audit_logs` from the application's database role. In PostgreSQL, `REVOKE` has no effect on a
-  table's *owner* (the owner always retains full privileges), so this requires a second,
-  lower-privileged runtime database role distinct from the migration-owning role — not yet
-  introduced, since M0 has no code writing to `audit_logs` yet. This is flagged as a decision to
-  make before Milestone M5 (returns, voids & audit logging), when real audit writes begin.
+- **Audit log write-protection**: flagged in M0 as needing a second, lower-privileged runtime
+  database role distinct from the migration-owning role (PostgreSQL `REVOKE` has no effect on a
+  table's *owner*). **Resolved in M1** — see "Decisions Made During M1" below.
 - **Local dev database**: examples in this README assume a local Postgres install for running
   tests directly on the host; the same `DATABASE_URL` pattern works identically against the
   Dockerized `db` service.

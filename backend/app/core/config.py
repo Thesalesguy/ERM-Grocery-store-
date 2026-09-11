@@ -18,9 +18,21 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"  # development | staging | production
     API_V1_PREFIX: str = "/api/v1"
 
-    # Postgres connection string, e.g.:
-    # postgresql+psycopg://erp_user:erp_password@localhost:5432/erp_dev
-    DATABASE_URL: str = "postgresql+psycopg://erp_user:erp_password@localhost:5432/erp_dev"
+    # Postgres connection string the running application uses at request
+    # time. This should be the restricted "erp_app" runtime role, NOT the
+    # schema-owning role migrations run as — see
+    # docs/M1_DATABASE_DESIGN.md "Audit-log & ledger write protection" and
+    # backend/scripts/bootstrap_db_roles.sql.
+    DATABASE_URL: str = "postgresql+psycopg://erp_app:erp_app_password@localhost:5432/erp_dev"
+
+    # Connection string Alembic uses to run migrations (DDL, plus the
+    # privilege-grant DCL in the M1 runtime-role migration). This must be
+    # the schema-owning role (e.g. erp_user), which needs CREATE/ALTER
+    # TABLE rights the restricted erp_app role deliberately lacks. Falls
+    # back to DATABASE_URL when unset, for throwaway/local setups that
+    # haven't split the two roles yet — but real environments should
+    # always set this explicitly to the owner role's connection string.
+    MIGRATIONS_DATABASE_URL: str | None = None
 
     # Used later for JWT signing (see docs/TECHNICAL_BLUEPRINT.md Section H).
     # Must be overridden with a long random value outside of development.
@@ -38,6 +50,10 @@ class Settings(BaseSettings):
         if value not in allowed:
             raise ValueError(f"ENVIRONMENT must be one of {allowed}, got {value!r}")
         return value
+
+    @property
+    def migrations_database_url(self) -> str:
+        return self.MIGRATIONS_DATABASE_URL or self.DATABASE_URL
 
     @property
     def cors_origins_list(self) -> list[str]:

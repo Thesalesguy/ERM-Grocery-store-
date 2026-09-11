@@ -10,6 +10,12 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # Runs once, automatically, the first time this volume is
+      # initialized: creates the restricted "erp_app" runtime role (see
+      # docs/M1_DATABASE_DESIGN.md "Audit-log & ledger write protection").
+      # Has no effect against an existing volume — see the README for how
+      # to bootstrap an already-running database.
+      - ./backend/scripts/bootstrap_db_roles.sql:/docker-entrypoint-initdb.d/01_bootstrap_db_roles.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-erp_user} -d ${POSTGRES_DB:-erp_dev}"]
       interval: 5s
@@ -25,7 +31,15 @@ services:
     environment:
       # Overrides .env so the backend reaches the `db` service by name
       # instead of localhost when running under Compose.
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-erp_user}:${POSTGRES_PASSWORD:-erp_password}@db:5432/${POSTGRES_DB:-erp_dev}
+      #
+      # DATABASE_URL (app runtime) uses the restricted "erp_app" role
+      # bootstrapped by db's init script above — NOT the same role as
+      # MIGRATIONS_DATABASE_URL. The placeholder password here matches the
+      # bootstrap script's placeholder exactly; both MUST be rotated
+      # together (see backend/scripts/bootstrap_db_roles.sql) before any
+      # non-local deployment.
+      DATABASE_URL: postgresql+psycopg://erp_app:CHANGE_ME_IN_PRODUCTION@db:5432/${POSTGRES_DB:-erp_dev}
+      MIGRATIONS_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-erp_user}:${POSTGRES_PASSWORD:-erp_password}@db:5432/${POSTGRES_DB:-erp_dev}
       CORS_ORIGINS: http://localhost:5173
     ports:
       - "8000:8000"
