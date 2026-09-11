@@ -27,6 +27,7 @@ def test_sale_item_keeps_its_historical_tax_rate_after_the_rate_changes(db: Sess
     sale = Sale(
         store_id=store.id,
         sale_number=f"SALE-{unique_suffix()}",
+        client_transaction_id=f"txn-{unique_suffix()}",
         cashier_id=cashier.id,
         status="COMPLETED",
         subtotal=Decimal("10.00"),

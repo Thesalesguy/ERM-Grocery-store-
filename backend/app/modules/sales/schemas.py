@@ -39,8 +39,19 @@ class PaymentCreate(BaseModel):
 
 class SaleCreate(BaseModel):
     store_id: int
-    lines: list[SaleLineCreate] = Field(min_length=1)
-    payments: list[PaymentCreate] = Field(min_length=1)
+    # Idempotency key (M2 hardening audit Section 7): the POS generates
+    # one UUID per checkout attempt (crypto.randomUUID() client-side) and
+    # resends the SAME value on any retry of that same attempt. Required,
+    # not optional — "disable the button after one click" alone does not
+    # protect against a network-level retry, so the server enforces this
+    # via a UNIQUE database constraint, not just goodwill from the client.
+    client_transaction_id: str = Field(min_length=1, max_length=100)
+    # Upper bounds (M2 hardening audit Section 13): generous enough for
+    # any real POS cart or split-tender payment, but bounded so a
+    # malicious or malformed request can't force the server to lock and
+    # process an unbounded number of rows in one request.
+    lines: list[SaleLineCreate] = Field(min_length=1, max_length=500)
+    payments: list[PaymentCreate] = Field(min_length=1, max_length=50)
 
 
 class SaleItemRead(BaseModel):
@@ -79,6 +90,7 @@ class SaleRead(BaseModel):
     id: int
     store_id: int
     sale_number: str
+    client_transaction_id: str
     cashier_id: int
     status: str
     subtotal: Decimal

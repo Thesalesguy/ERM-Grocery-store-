@@ -35,6 +35,15 @@ function cartSubtotal(cart: CartLine[]): number {
 export function PosPage() {
   const { user } = useAuth()
   const scannerInputRef = useRef<HTMLInputElement>(null)
+  // Idempotency key for the checkout currently being built (M2 hardening
+  // audit Section 7): generated once when the cart first gets a line, and
+  // reused as-is on every retry of "Complete sale" for that same cart —
+  // a double-click or a retry after a dropped network response resends
+  // the SAME key, so the server can recognize it as the same attempt
+  // instead of creating a second sale. Cleared once the sale succeeds (a
+  // new cart gets a new key). A ref, not state: it must never trigger a
+  // re-render and must survive across renders without being reset.
+  const checkoutKeyRef = useRef<string | null>(null)
   const [scanValue, setScanValue] = useState('')
   const [cart, setCart] = useState<CartLine[]>([])
   const [payments, setPayments] = useState<PaymentLine[]>([{ method: 'CASH', amount: '' }])
@@ -126,11 +135,17 @@ export function PosPage() {
       setCheckoutError('Your account has no assigned store.')
       return
     }
+    // Reused on every retry of this same attempt (see the ref's own
+    // comment) — only a successful sale or an explicit new cart clears it.
+    if (checkoutKeyRef.current === null) {
+      checkoutKeyRef.current = crypto.randomUUID()
+    }
     setCheckoutError(null)
     setIsCheckingOut(true)
     try {
       const sale = await salesApi.finalizeSale({
         store_id: user.store_id,
+        client_transaction_id: checkoutKeyRef.current,
         lines: cart.map((line) => ({
           product_id: line.product.id,
           quantity: line.quantity,
@@ -140,6 +155,7 @@ export function PosPage() {
           .filter((p) => p.amount.trim() !== '')
           .map((p) => ({ payment_method: p.method, amount: p.amount })),
       })
+      checkoutKeyRef.current = null
       setCompletedSale(sale)
       setCart([])
       setPayments([{ method: 'CASH', amount: '' }])
@@ -152,6 +168,7 @@ export function PosPage() {
   }
 
   function startNewSale() {
+    checkoutKeyRef.current = null
     setCompletedSale(null)
     scannerInputRef.current?.focus()
   }

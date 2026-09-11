@@ -58,6 +58,7 @@ def list_movements(
     *,
     product_id: int | None = None,
     movement_type: str | None = None,
+    store_id: int | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> list[InventoryMovement]:
@@ -76,6 +77,8 @@ def list_movements(
         query = query.where(InventoryMovement.product_id == product_id)
     if movement_type is not None:
         query = query.where(InventoryMovement.movement_type == movement_type)
+    if store_id is not None:
+        query = query.where(InventoryMovement.store_id == store_id)
     return list(db.execute(query).scalars().all())
 
 

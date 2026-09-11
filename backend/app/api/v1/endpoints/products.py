@@ -10,8 +10,14 @@ from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
+from app.core.exceptions import NotFoundError
 from app.modules.auth.permissions import PRODUCTS_READ, PRODUCTS_WRITE
-from app.modules.auth.service import require_permission
+from app.modules.auth.service import (
+    CurrentUser,
+    enforce_store_access,
+    require_permission,
+    scoped_store_filter,
+)
 from app.modules.products import service
 from app.modules.products.schemas import (
     ProductBarcodeCreate,
@@ -23,19 +29,26 @@ from app.modules.products.schemas import (
 
 router = APIRouter(prefix="/products", tags=["products"])
 
-_read = Depends(require_permission(PRODUCTS_READ))
-_write = Depends(require_permission(PRODUCTS_WRITE))
+_read_permission = require_permission(PRODUCTS_READ)
+_write_permission = require_permission(PRODUCTS_WRITE)
 
 
-@router.post(
-    "", response_model=ProductRead, status_code=status.HTTP_201_CREATED, dependencies=[_write]
-)
-def create_product(payload: ProductCreate, db: Session = Depends(get_db)) -> ProductRead:
-    product = service.create_product(db, payload)
+@router.post("", response_model=ProductRead, status_code=status.HTTP_201_CREATED)
+def create_product(
+    payload: ProductCreate,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(_write_permission),
+) -> ProductRead:
+    # A store-scoped user (e.g. an Inventory Clerk assigned to one store)
+    # can only create products for their own store — otherwise the
+    # store_id field in the request body would let them populate another
+    # store's catalog (M2 hardening audit Section 12).
+    enforce_store_access(current_user, payload.store_id)
+    product = service.create_product(db, payload, actor_id=current_user.id)
     return ProductRead.model_validate(product)
 
 
-@router.get("", response_model=list[ProductRead], dependencies=[_read])
+@router.get("", response_model=list[ProductRead])
 def list_products(
     store_id: int | None = None,
     category_id: int | None = None,
@@ -44,10 +57,12 @@ def list_products(
     limit: int = 50,
     offset: int = 0,
     db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(_read_permission),
 ) -> list[ProductRead]:
+    effective_store_id = scoped_store_filter(current_user, store_id)
     products = service.list_products(
         db,
-        store_id=store_id,
+        store_id=effective_store_id,
         category_id=category_id,
         is_active=is_active,
         search=search,
@@ -57,37 +72,72 @@ def list_products(
     return [ProductRead.model_validate(p) for p in products]
 
 
-@router.get("/barcode/{barcode}", response_model=ProductRead, dependencies=[_read])
-def get_product_by_barcode(barcode: str, db: Session = Depends(get_db)) -> ProductRead:
+def _check_product_store_access(current_user: CurrentUser, product_store_id: int) -> None:
+    # 404, not 403: a store-scoped user shouldn't be able to tell "this
+    # product exists in another store" from "this product doesn't exist
+    # at all" just by trying an ID/barcode (M2 hardening audit Section 12).
+    if current_user.store_id is not None and current_user.store_id != product_store_id:
+        raise NotFoundError("Product not found")
+
+
+@router.get("/barcode/{barcode}", response_model=ProductRead)
+def get_product_by_barcode(
+    barcode: str,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(_read_permission),
+) -> ProductRead:
     """The POS scan-to-lookup endpoint. Backed by product_barcodes'
     UNIQUE(barcode) index — a single indexed equality lookup, no scan."""
     product = service.get_product_by_barcode(db, barcode)
+    _check_product_store_access(current_user, product.store_id)
     return ProductRead.model_validate(product)
 
 
-@router.get("/{product_id}", response_model=ProductRead, dependencies=[_read])
-def get_product(product_id: int, db: Session = Depends(get_db)) -> ProductRead:
-    product = service.get_product(db, product_id)
-    return ProductRead.model_validate(product)
-
-
-@router.put("/{product_id}", response_model=ProductRead, dependencies=[_write])
-def update_product(
-    product_id: int, payload: ProductUpdate, db: Session = Depends(get_db)
+@router.get("/{product_id}", response_model=ProductRead)
+def get_product(
+    product_id: int,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(_read_permission),
 ) -> ProductRead:
-    product = service.update_product(db, product_id, payload)
+    product = service.get_product(db, product_id)
+    _check_product_store_access(current_user, product.store_id)
     return ProductRead.model_validate(product)
 
 
-@router.post("/{product_id}/activate", response_model=ProductRead, dependencies=[_write])
-def activate_product(product_id: int, db: Session = Depends(get_db)) -> ProductRead:
-    product = service.set_product_active(db, product_id, True)
+@router.put("/{product_id}", response_model=ProductRead)
+def update_product(
+    product_id: int,
+    payload: ProductUpdate,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(_write_permission),
+) -> ProductRead:
+    existing = service.get_product(db, product_id)
+    _check_product_store_access(current_user, existing.store_id)
+    product = service.update_product(db, product_id, payload, actor_id=current_user.id)
     return ProductRead.model_validate(product)
 
 
-@router.post("/{product_id}/deactivate", response_model=ProductRead, dependencies=[_write])
-def deactivate_product(product_id: int, db: Session = Depends(get_db)) -> ProductRead:
-    product = service.set_product_active(db, product_id, False)
+@router.post("/{product_id}/activate", response_model=ProductRead)
+def activate_product(
+    product_id: int,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(_write_permission),
+) -> ProductRead:
+    existing = service.get_product(db, product_id)
+    _check_product_store_access(current_user, existing.store_id)
+    product = service.set_product_active(db, product_id, True, actor_id=current_user.id)
+    return ProductRead.model_validate(product)
+
+
+@router.post("/{product_id}/deactivate", response_model=ProductRead)
+def deactivate_product(
+    product_id: int,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(_write_permission),
+) -> ProductRead:
+    existing = service.get_product(db, product_id)
+    _check_product_store_access(current_user, existing.store_id)
+    product = service.set_product_active(db, product_id, False, actor_id=current_user.id)
     return ProductRead.model_validate(product)
 
 
@@ -95,10 +145,14 @@ def deactivate_product(product_id: int, db: Session = Depends(get_db)) -> Produc
     "/{product_id}/barcodes",
     response_model=ProductBarcodeRead,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[_write],
 )
 def add_barcode(
-    product_id: int, payload: ProductBarcodeCreate, db: Session = Depends(get_db)
+    product_id: int,
+    payload: ProductBarcodeCreate,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(_write_permission),
 ) -> ProductBarcodeRead:
+    existing = service.get_product(db, product_id)
+    _check_product_store_access(current_user, existing.store_id)
     barcode = service.add_barcode(db, product_id, payload)
     return ProductBarcodeRead.model_validate(barcode)

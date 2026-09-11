@@ -121,6 +121,17 @@ def login(
     return user, access_token, raw_refresh
 
 
+def _revoke_all_refresh_tokens_for_user(db: Session, user_id: int) -> None:
+    now = datetime.now(UTC)
+    active_tokens = db.execute(
+        select(RefreshToken).where(
+            RefreshToken.user_id == user_id, RefreshToken.revoked_at.is_(None)
+        )
+    ).scalars()
+    for token in active_tokens:
+        token.revoked_at = now
+
+
 def refresh_access_token(
     db: Session,
     *,
@@ -130,13 +141,45 @@ def refresh_access_token(
 ) -> tuple[User, str, str]:
     """Validates and rotates a refresh token: the old one is revoked and a
     new one issued in the same call, so a stolen-and-replayed old token
-    stops working the moment the legitimate client refreshes."""
+    stops working the moment the legitimate client refreshes.
+
+    Reuse-detection response (M2 hardening audit Section 9 — previously an
+    accepted gap, closed here): presenting a token that is specifically
+    ALREADY REVOKED (as opposed to merely unknown or expired) means either
+    two different parties possess what was supposed to be one single-use
+    token — the legitimate client already rotated past it, and this is a
+    replay of the stale value, which is exactly what a stolen-and-copied
+    refresh token being used after the real client refreshed looks like —
+    or, more mundanely, a logged-out session retrying. Either way, the
+    safe response is the same: treat it as a compromise signal and revoke
+    every OTHER still-active token for that user, forcing every session
+    to re-authenticate, and record the event in the audit log. A merely
+    unknown or expired token (never issued, or aged out) gets the same
+    generic 401 as before — nothing here changes what an attacker
+    observes in the response, only what the server does about it.
+    """
     token_hash = hash_refresh_token(raw_refresh_token)
     row = db.execute(
         select(RefreshToken).where(RefreshToken.token_hash == token_hash)
     ).scalar_one_or_none()
     now = datetime.now(UTC)
-    if row is None or row.revoked_at is not None or row.expires_at < now:
+
+    if row is not None and row.revoked_at is not None:
+        _revoke_all_refresh_tokens_for_user(db, row.user_id)
+        audit_service.log_event(
+            db,
+            user_id=row.user_id,
+            action="REFRESH_TOKEN_REUSE_DETECTED",
+            entity_type="user",
+            entity_id=row.user_id,
+            after={"revoked_all_sessions": True},
+            ip_address=ip_address,
+            user_agent=user_agent,
+        )
+        db.commit()
+        raise UnauthorizedError("Invalid or expired refresh token")
+
+    if row is None or row.expires_at < now:
         raise UnauthorizedError("Invalid or expired refresh token")
 
     user = db.get(User, row.user_id)
@@ -208,6 +251,48 @@ def get_current_user(
         store_id=user.store_id,
         permissions=permissions,
     )
+
+
+def enforce_store_access(current_user: CurrentUser, target_store_id: int) -> None:
+    """Raises ForbiddenError if `current_user` is scoped to a specific
+    store (`store_id` is not None) and `target_store_id` is a different
+    store (M2 hardening audit Section 12: multi-store safety). A user with
+    `store_id is None` (Admin/Manager not tied to one store) may act on
+    any store — that is a deliberate cross-store role, not a gap.
+
+    This must be called with a server-trusted `target_store_id` (the
+    store a specific already-loaded product/sale/adjustment actually
+    belongs to, or a path/query parameter used only to *filter*), never
+    with an unchecked client-submitted value used to *decide* what gets
+    written — see app.modules.sales.service.finalize_sale for the
+    highest-stakes case, which does this check itself for exactly that
+    reason (it is also called directly by tests/concurrency code, not
+    only through the HTTP route).
+    """
+    if current_user.store_id is not None and current_user.store_id != target_store_id:
+        raise ForbiddenError(
+            f"Your account is scoped to store {current_user.store_id} and cannot "
+            f"access store {target_store_id}",
+            error_code="STORE_ACCESS_DENIED",
+        )
+
+
+def scoped_store_filter(current_user: CurrentUser, requested_store_id: int | None) -> int | None:
+    """For list/search endpoints with an optional `store_id` filter: a
+    store-scoped user is always restricted to their own store (defaulting
+    to it when they didn't specify one, rejecting any other value they
+    did specify) — never falls back to "no filter = every store" the way
+    an unscoped cross-store user's omitted filter does.
+    """
+    if current_user.store_id is None:
+        return requested_store_id
+    if requested_store_id is not None and requested_store_id != current_user.store_id:
+        raise ForbiddenError(
+            f"Your account is scoped to store {current_user.store_id} and cannot "
+            f"view store {requested_store_id}",
+            error_code="STORE_ACCESS_DENIED",
+        )
+    return current_user.store_id
 
 
 def require_permission(permission_code: str) -> Callable[[CurrentUser], CurrentUser]:

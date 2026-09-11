@@ -154,6 +154,7 @@ describe('PosPage', () => {
           id: 42,
           store_id: 7,
           sale_number: 'S7-TEST',
+          client_transaction_id: 'test-txn-42',
           cashier_id: 1,
           status: 'COMPLETED',
           subtotal: '5.00',

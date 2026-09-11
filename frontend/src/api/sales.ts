@@ -14,6 +14,10 @@ export interface PaymentInput {
 
 export interface SaleCreateInput {
   store_id: number
+  /** Idempotency key: generate once per checkout attempt (crypto.randomUUID())
+   * and resend the SAME value on any retry of that attempt, so a
+   * double-click or a network retry can never create two sales. */
+  client_transaction_id: string
   lines: SaleLineInput[]
   payments: PaymentInput[]
 }
@@ -43,6 +47,7 @@ export interface Sale {
   id: number
   store_id: number
   sale_number: string
+  client_transaction_id: string
   cashier_id: number
   status: string
   subtotal: string

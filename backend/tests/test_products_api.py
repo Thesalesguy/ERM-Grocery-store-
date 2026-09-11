@@ -20,6 +20,7 @@ from tests.factories import (
     make_store,
     make_supplier,
     make_user_with_role,
+    unique_suffix,
 )
 from tests.helpers import auth_headers
 
@@ -212,6 +213,8 @@ def test_price_change_does_not_affect_historical_sale(client: TestClient, db: Se
         db,
         store_id=store.id,
         cashier_id=cashier.id,
+        client_transaction_id=f"txn-{unique_suffix()}",
+        caller_store_id=None,
         lines=[SaleLineInput(product_id=product.id, quantity=Decimal("1"))],
         payments=[PaymentInput(payment_method="CASH", amount=Decimal("10.00"))],
     )

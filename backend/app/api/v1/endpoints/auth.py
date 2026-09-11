@@ -15,9 +15,15 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db
 from app.core.config import get_settings
 from app.core.exceptions import UnauthorizedError
+from app.core.rate_limit import login_rate_limiter, refresh_rate_limiter
 from app.modules.auth import service
 from app.modules.auth.schemas import AccessTokenResponse, CurrentUserResponse, LoginRequest
 from app.modules.auth.service import CurrentUser, get_current_user
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -45,6 +51,11 @@ def login(
     response: Response,
     db: Session = Depends(get_db),
 ) -> AccessTokenResponse:
+    client_ip = _client_ip(request)
+    # Checked before touching the database at all (M2 hardening audit
+    # Section 10) — an IP that's already over budget shouldn't get a free
+    # password-hash-verification's worth of server work per attempt.
+    login_rate_limiter.check(client_ip)
     user, access_token, raw_refresh = service.login(
         db,
         username=payload.username,
@@ -52,6 +63,10 @@ def login(
         user_agent=request.headers.get("user-agent"),
         ip_address=request.client.host if request.client else None,
     )
+    # A successful login clears this IP's failure count — the limiter is
+    # defending against sustained guessing, not penalizing a real user who
+    # fat-fingered their password twice before getting it right.
+    login_rate_limiter.reset(client_ip)
     _set_refresh_cookie(response, raw_refresh)
     settings = get_settings()
     return AccessTokenResponse(
@@ -66,6 +81,7 @@ def refresh(
     response: Response,
     db: Session = Depends(get_db),
 ) -> AccessTokenResponse:
+    refresh_rate_limiter.check(_client_ip(request))
     raw_refresh = request.cookies.get(_REFRESH_COOKIE_NAME)
     if raw_refresh is None:
         raise UnauthorizedError("Missing refresh token")

@@ -24,7 +24,8 @@ TEST_MIGRATIONS_DATABASE_URL = os.environ.get(
 )
 M0_REVISION = "7b22f673d866"
 M1_HEAD_REVISION = "9163f992ddc1"
-M2_HEAD_REVISION = "e6180fca2ee0"
+M2_RBAC_SEED_REVISION = "e6180fca2ee0"
+M2_HEAD_REVISION = "89a42dfbfaea"  # M2 hardening: sale idempotency key
 
 
 def _alembic_config() -> Config:
@@ -75,7 +76,8 @@ def test_full_upgrade_downgrade_upgrade_cycle(migrations_db: str) -> None:
 
     command.upgrade(cfg, "head")
     # M2 adds one table (refresh_tokens); the RBAC seed migration adds
-    # rows, not tables.
+    # rows, not tables; the hardening migration adds a column
+    # (sales.client_transaction_id), not a table.
     assert _table_count(migrations_db) == 27
 
     command.downgrade(cfg, M0_REVISION)

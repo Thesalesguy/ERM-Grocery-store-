@@ -21,6 +21,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import ConflictError, NotFoundError, ValidationAppError
+from app.modules.audit import service as audit_service
 from app.modules.auth.models import Store
 from app.modules.products.models import Product, ProductBarcode, ProductCategory
 from app.modules.products.schemas import ProductBarcodeCreate, ProductCreate, ProductUpdate
@@ -55,7 +56,7 @@ def _validate_references(
         )
 
 
-def create_product(db: Session, data: ProductCreate) -> Product:
+def create_product(db: Session, data: ProductCreate, *, actor_id: int | None = None) -> Product:
     _validate_references(
         db,
         store_id=data.store_id,
@@ -83,13 +84,22 @@ def create_product(db: Session, data: ProductCreate) -> Product:
     )
     db.add(product)
     try:
-        db.commit()
+        db.flush()
     except IntegrityError as exc:
         db.rollback()
         raise ConflictError(
             f"Product with SKU {data.sku!r} already exists for store {data.store_id}",
             error_code="DUPLICATE_SKU",
         ) from exc
+    audit_service.log_event(
+        db,
+        user_id=actor_id,
+        action="PRODUCT_CREATED",
+        entity_type="product",
+        entity_id=product.id,
+        after={"sku": product.sku, "name": product.name, "current_price": product.current_price},
+    )
+    db.commit()
     db.refresh(product)
     return product
 
@@ -137,7 +147,9 @@ def list_products(
     return list(db.execute(query).scalars().all())
 
 
-def update_product(db: Session, product_id: int, data: ProductUpdate) -> Product:
+def update_product(
+    db: Session, product_id: int, data: ProductUpdate, *, actor_id: int | None = None
+) -> Product:
     product = get_product(db, product_id)
     changes = data.model_dump(exclude_unset=True)
     _validate_references(
@@ -146,16 +158,38 @@ def update_product(db: Session, product_id: int, data: ProductUpdate) -> Product
         supplier_id=changes.get("default_supplier_id"),
         tax_rate_id=changes.get("tax_rate_id"),
     )
+    before = {field: getattr(product, field) for field in changes}
     for field, value in changes.items():
         setattr(product, field, value)
+    audit_service.log_event(
+        db,
+        user_id=actor_id,
+        action="PRODUCT_UPDATED",
+        entity_type="product",
+        entity_id=product.id,
+        before=before,
+        after=changes,
+    )
     db.commit()
     db.refresh(product)
     return product
 
 
-def set_product_active(db: Session, product_id: int, is_active: bool) -> Product:
+def set_product_active(
+    db: Session, product_id: int, is_active: bool, *, actor_id: int | None = None
+) -> Product:
     product = get_product(db, product_id)
+    was_active = product.is_active
     product.is_active = is_active
+    audit_service.log_event(
+        db,
+        user_id=actor_id,
+        action="PRODUCT_ACTIVATED" if is_active else "PRODUCT_DEACTIVATED",
+        entity_type="product",
+        entity_id=product.id,
+        before={"is_active": was_active},
+        after={"is_active": is_active},
+    )
     db.commit()
     db.refresh(product)
     return product

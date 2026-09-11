@@ -9,8 +9,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
+from app.core.exceptions import NotFoundError
 from app.modules.auth.permissions import POS_USE, SALES_READ
-from app.modules.auth.service import CurrentUser, require_permission
+from app.modules.auth.service import CurrentUser, require_permission, scoped_store_filter
 from app.modules.products.models import Product
 from app.modules.sales import service
 from app.modules.sales.models import Sale
@@ -19,7 +20,7 @@ from app.modules.sales.service import PaymentInput, SaleLineInput
 
 router = APIRouter(prefix="/sales", tags=["sales"])
 
-_read = Depends(require_permission(SALES_READ))
+_read_permission = require_permission(SALES_READ)
 _pos_use = require_permission(POS_USE)
 
 
@@ -51,6 +52,8 @@ def create_sale(
         db,
         store_id=payload.store_id,
         cashier_id=current_user.id,
+        client_transaction_id=payload.client_transaction_id,
+        caller_store_id=current_user.store_id,
         lines=[
             SaleLineInput(
                 product_id=line.product_id,
@@ -75,18 +78,29 @@ def create_sale(
     return _to_sale_read(db, service.get_sale(db, sale.id))
 
 
-@router.get("", response_model=list[SaleRead], dependencies=[_read])
+@router.get("", response_model=list[SaleRead])
 def list_sales(
     store_id: int | None = None,
     limit: int = 50,
     offset: int = 0,
     db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(_read_permission),
 ) -> list[SaleRead]:
-    sales = service.list_sales(db, store_id=store_id, limit=limit, offset=offset)
+    effective_store_id = scoped_store_filter(current_user, store_id)
+    sales = service.list_sales(db, store_id=effective_store_id, limit=limit, offset=offset)
     return [_to_sale_read(db, sale) for sale in sales]
 
 
-@router.get("/{sale_id}", response_model=SaleRead, dependencies=[_read])
-def get_sale(sale_id: int, db: Session = Depends(get_db)) -> SaleRead:
+@router.get("/{sale_id}", response_model=SaleRead)
+def get_sale(
+    sale_id: int,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(_read_permission),
+) -> SaleRead:
     sale = service.get_sale(db, sale_id)
+    # A store-scoped user gets 404 (not 403) for another store's sale, so
+    # the response doesn't confirm that sale even exists elsewhere (M2
+    # hardening audit Section 12).
+    if current_user.store_id is not None and sale.store_id != current_user.store_id:
+        raise NotFoundError(f"Sale {sale_id} not found")
     return _to_sale_read(db, sale)

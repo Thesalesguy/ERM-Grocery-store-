@@ -9,8 +9,14 @@ from fastapi import APIRouter, Depends, Request
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
+from app.core.exceptions import NotFoundError
 from app.modules.auth.permissions import INVENTORY_ADJUST, INVENTORY_READ
-from app.modules.auth.service import CurrentUser, require_permission
+from app.modules.auth.service import (
+    CurrentUser,
+    enforce_store_access,
+    require_permission,
+    scoped_store_filter,
+)
 from app.modules.inventory import service
 from app.modules.inventory.schemas import (
     InventoryMovementRead,
@@ -22,7 +28,7 @@ from app.modules.products.models import Product
 
 router = APIRouter(prefix="/inventory", tags=["inventory"])
 
-_read = Depends(require_permission(INVENTORY_READ))
+_read_permission = require_permission(INVENTORY_READ)
 _adjust_permission = require_permission(INVENTORY_ADJUST)
 
 
@@ -43,7 +49,7 @@ def _to_stock_level(product: Product) -> StockLevelRead:
     )
 
 
-@router.get("/stock", response_model=list[StockLevelRead], dependencies=[_read])
+@router.get("/stock", response_model=list[StockLevelRead])
 def list_stock(
     store_id: int | None = None,
     search: str | None = None,
@@ -51,10 +57,12 @@ def list_stock(
     limit: int = 50,
     offset: int = 0,
     db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(_read_permission),
 ) -> list[StockLevelRead]:
+    effective_store_id = scoped_store_filter(current_user, store_id)
     products = service.list_stock_levels(
         db,
-        store_id=store_id,
+        store_id=effective_store_id,
         search=search,
         low_stock_only=low_stock_only,
         limit=limit,
@@ -63,24 +71,34 @@ def list_stock(
     return [_to_stock_level(p) for p in products]
 
 
-@router.get("/stock/{product_id}", response_model=StockLevelRead, dependencies=[_read])
-def get_stock(product_id: int, db: Session = Depends(get_db)) -> StockLevelRead:
+@router.get("/stock/{product_id}", response_model=StockLevelRead)
+def get_stock(
+    product_id: int,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(_read_permission),
+) -> StockLevelRead:
     product = service.get_stock_level(db, product_id)
+    if current_user.store_id is not None and current_user.store_id != product.store_id:
+        raise NotFoundError(f"Product {product_id} not found")
     return _to_stock_level(product)
 
 
-@router.get("/movements", response_model=list[InventoryMovementRead], dependencies=[_read])
+@router.get("/movements", response_model=list[InventoryMovementRead])
 def list_movements(
     product_id: int | None = None,
     movement_type: str | None = None,
+    store_id: int | None = None,
     limit: int = 50,
     offset: int = 0,
     db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(_read_permission),
 ) -> list[InventoryMovementRead]:
+    effective_store_id = scoped_store_filter(current_user, store_id)
     movements = service.list_movements(
         db,
         product_id=product_id,
         movement_type=movement_type,
+        store_id=effective_store_id,
         limit=limit,
         offset=offset,
     )
@@ -95,6 +113,9 @@ def create_adjustment(
     current_user: CurrentUser = Depends(_adjust_permission),
 ) -> StockAdjustmentRead:
     product = service.get_stock_level(db, payload.product_id)
+    # A store-scoped user cannot adjust another store's stock just by
+    # naming its product_id (M2 hardening audit Section 12).
+    enforce_store_access(current_user, product.store_id)
     adjustment = service.create_stock_adjustment(
         db,
         store_id=product.store_id,

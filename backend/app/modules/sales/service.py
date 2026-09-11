@@ -34,14 +34,14 @@ INSUFFICIENT_STOCK — never -1 stock, never two successful sales.
 
 import secrets
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal
 
 from sqlalchemy import select
-from sqlalchemy.exc import NoResultFound
+from sqlalchemy.exc import IntegrityError, NoResultFound
 from sqlalchemy.orm import Session, selectinload
 
-from app.core.exceptions import ConflictError, NotFoundError, ValidationAppError
+from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationAppError
 from app.modules.audit import service as audit_service
 from app.modules.auth.models import Store
 from app.modules.inventory import service as inventory_service
@@ -92,11 +92,26 @@ def _resolve_tax(db: Session, product: Product) -> tuple[int | None, Decimal]:
     """Returns (tax_rate_id, rate_percent). Raises ConflictError if the
     product references a tax rate that isn't currently effective —
     docs/TECHNICAL_BLUEPRINT.md Section E step 7: "using each line's
-    product.tax_class_id -> active tax_rates row as of sale date"."""
+    product.tax_class_id -> active tax_rates row as of sale date".
+
+    Timezone policy (M2 hardening audit Section 5): "sale date" is the
+    UTC calendar date at the instant of finalization — `date.today()`
+    was a latent bug here, since it reads the server process's OS-local
+    timezone (undefined/arbitrary depending on deployment, and
+    inconsistent with `completed_at`'s `datetime.now(UTC)` a few lines
+    below in the same function). A tax rate's effective_from/effective_to
+    are plain DATE columns with no per-store timezone of their own, and
+    `stores.timezone` is not wired into this comparison — using each
+    store's local calendar day is a real future refinement (a rate that
+    takes effect "at midnight" arguably means midnight in the store's own
+    timezone, not UTC), but is out of scope for this hardening pass;
+    UTC-everywhere is at least deterministic and matches every other
+    timestamp this codebase produces.
+    """
     if product.tax_rate_id is None:
         return None, Decimal("0")
     tax_rate = db.get(TaxRate, product.tax_rate_id)
-    today = date.today()
+    today = datetime.now(UTC).date()
     if (
         tax_rate is None
         or not tax_rate.is_active
@@ -116,11 +131,49 @@ def finalize_sale(
     *,
     store_id: int,
     cashier_id: int,
+    client_transaction_id: str,
+    caller_store_id: int | None,
     lines: list[SaleLineInput],
     payments: list[PaymentInput],
     ip_address: str | None = None,
     user_agent: str | None = None,
 ) -> Sale:
+    """`caller_store_id` is the authenticated cashier's own assigned store
+    (`CurrentUser.store_id`), NOT the client-submitted `store_id` — a user
+    scoped to one store must never be able to sell another store's
+    inventory by simply changing the `store_id` field in the request body
+    (M2 hardening audit Section 12). `None` means a cross-store user
+    (Admin/Manager with no store assignment), who may operate against any
+    store's `store_id`.
+
+    `client_transaction_id` is the POS's idempotency key (M2 hardening
+    audit Section 7): the same value resent on a retry (double-click,
+    network retry) returns the original sale instead of creating a
+    second one. See the early-return and IntegrityError-recovery blocks
+    below.
+    """
+    if caller_store_id is not None and caller_store_id != store_id:
+        raise ForbiddenError(
+            f"Your account is scoped to store {caller_store_id} and cannot "
+            f"transact against store {store_id}",
+            error_code="STORE_ACCESS_DENIED",
+        )
+
+    # --- Idempotency fast path ------------------------------------------
+    # A sale with this exact client_transaction_id already committed
+    # (the common case: the client's first response was lost to a network
+    # error/timeout and it retried with the same key) — return it as-is
+    # rather than re-running the whole transaction. This does NOT catch a
+    # truly simultaneous duplicate submission (two requests with the same
+    # key racing before either commits); the UNIQUE constraint on
+    # sales.client_transaction_id is the real enforcement for that case —
+    # see the IntegrityError handling around the Sale insert below.
+    existing = db.execute(
+        select(Sale).where(Sale.client_transaction_id == client_transaction_id)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+
     if not lines:
         raise ValidationAppError("A sale must have at least one line", error_code="EMPTY_CART")
     if not payments:
@@ -239,6 +292,7 @@ def finalize_sale(
     sale = Sale(
         store_id=store_id,
         sale_number=_generate_sale_number(store_id),
+        client_transaction_id=client_transaction_id,
         cashier_id=cashier_id,
         status="COMPLETED",
         subtotal=subtotal,
@@ -250,7 +304,27 @@ def finalize_sale(
         completed_at=datetime.now(UTC),
     )
     db.add(sale)
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError:
+        # The early idempotency check above missed a genuinely concurrent
+        # duplicate submission (two requests with the same
+        # client_transaction_id both passed the SELECT before either
+        # committed). The UNIQUE constraint on sales.client_transaction_id
+        # is what actually prevents two Sale rows here: PostgreSQL blocks
+        # the second INSERT until the first's transaction ends, then
+        # rejects it. Roll back everything this attempt did (no partial
+        # sale/items/movements survive) and return the row that won.
+        db.rollback()
+        winner = db.execute(
+            select(Sale).where(Sale.client_transaction_id == client_transaction_id)
+        ).scalar_one_or_none()
+        if winner is None:
+            # The constraint fired for some other reason (extremely
+            # unlikely, e.g. a hash collision on a different unique
+            # column) — re-raise rather than silently returning nothing.
+            raise
+        return winner
 
     for computed in computed_lines:
         db.add(

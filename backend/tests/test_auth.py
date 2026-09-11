@@ -2,8 +2,10 @@
 refresh/logout token lifecycle."""
 
 from fastapi.testclient import TestClient
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.modules.audit.models import AuditLog
 from app.modules.auth.permissions import ADMIN, CASHIER
 from tests.factories import DEFAULT_TEST_PASSWORD, make_store, make_user_with_role
 from tests.helpers import auth_headers, login
@@ -128,6 +130,102 @@ def test_refresh_token_rotates_and_issues_new_access_token(client: TestClient, d
     client.cookies.set("refresh_token", old_refresh_cookie)
     replay_response = client.post("/api/v1/auth/refresh")
     assert replay_response.status_code == 401
+
+
+def test_reusing_a_rotated_refresh_token_revokes_the_whole_session(
+    client: TestClient, db: Session
+) -> None:
+    """M2 hardening audit Section 9: replaying an already-rotated (i.e.
+    already-revoked) refresh token is treated as a compromise signal —
+    the response revokes every other active token for that user too, not
+    just rejecting the replay itself. So after a reuse is detected, even
+    the CURRENT legitimate refresh token (issued by the rotation the
+    attacker's replay came after) stops working, forcing a fresh login."""
+    store = make_store(db)
+    user = make_user_with_role(db, store, CASHIER, username="cashier_reuse")
+    db.commit()
+
+    login_response = client.post(
+        "/api/v1/auth/login",
+        json={"username": "cashier_reuse", "password": DEFAULT_TEST_PASSWORD},
+    )
+    stolen_old_refresh = login_response.cookies["refresh_token"]
+
+    # The legitimate client rotates once (e.g. its access token expired).
+    first_refresh = client.post("/api/v1/auth/refresh")
+    assert first_refresh.status_code == 200
+    current_refresh = client.cookies["refresh_token"]
+    assert current_refresh != stolen_old_refresh
+
+    # An attacker (or a duplicate tab) replays the now-stale, already-
+    # rotated-out token.
+    client.cookies.set("refresh_token", stolen_old_refresh)
+    replay_response = client.post("/api/v1/auth/refresh")
+    assert replay_response.status_code == 401
+
+    # The legitimate client's CURRENT token — issued by the rotation
+    # above, never itself replayed — is also dead now.
+    client.cookies.set("refresh_token", current_refresh)
+    legitimate_retry = client.post("/api/v1/auth/refresh")
+    assert legitimate_retry.status_code == 401
+
+    event_count = db.execute(
+        select(func.count())
+        .select_from(AuditLog)
+        .where(AuditLog.action == "REFRESH_TOKEN_REUSE_DETECTED", AuditLog.user_id == user.id)
+    ).scalar_one()
+    assert event_count >= 1
+
+
+def test_repeated_failed_logins_are_rate_limited(client: TestClient, db: Session) -> None:
+    """M2 hardening audit Section 10: login had no throttling at all —
+    an attacker (or a misbehaving client) could try passwords as fast as
+    the network allows. TestClient's requests all share one synthetic
+    client IP, which is exactly what lets this test exercise the
+    per-IP limiter deterministically."""
+    store = make_store(db)
+    make_user_with_role(db, store, CASHIER, username="cashier_ratelimit")
+    db.commit()
+
+    responses = [
+        client.post(
+            "/api/v1/auth/login",
+            json={"username": "cashier_ratelimit", "password": "wrong-password"},
+        )
+        for _ in range(15)
+    ]
+    statuses = [r.status_code for r in responses]
+    assert 401 in statuses, "the first several attempts should fail normally"
+    assert 429 in statuses, "sustained failures from one source must eventually be throttled"
+    limited = next(r for r in responses if r.status_code == 429)
+    assert limited.json()["error"]["code"] == "RATE_LIMITED"
+
+
+def test_successful_login_clears_the_rate_limit_counter(client: TestClient, db: Session) -> None:
+    store = make_store(db)
+    make_user_with_role(db, store, CASHIER, username="cashier_ratelimit_ok")
+    db.commit()
+
+    for _ in range(5):
+        response = client.post(
+            "/api/v1/auth/login",
+            json={"username": "cashier_ratelimit_ok", "password": "wrong-password"},
+        )
+        assert response.status_code == 401
+
+    success = client.post(
+        "/api/v1/auth/login",
+        json={"username": "cashier_ratelimit_ok", "password": DEFAULT_TEST_PASSWORD},
+    )
+    assert success.status_code == 200
+
+    # The counter was reset by the success above, so this IP is not
+    # already halfway to the limit from the failures before it.
+    follow_up = client.post(
+        "/api/v1/auth/login",
+        json={"username": "cashier_ratelimit_ok", "password": "wrong-password"},
+    )
+    assert follow_up.status_code == 401
 
 
 def test_logout_revokes_refresh_token(client: TestClient, db: Session) -> None:

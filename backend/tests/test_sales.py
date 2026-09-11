@@ -30,6 +30,7 @@ def _make_sale(db: Session, store, cashier, *, subtotal, discount_total, tax_tot
     sale = Sale(
         store_id=store.id,
         sale_number=f"SALE-{unique_suffix()}",
+        client_transaction_id=f"txn-{unique_suffix()}",
         cashier_id=cashier.id,
         status="COMPLETED",
         subtotal=subtotal,
@@ -123,6 +124,7 @@ def test_grand_total_must_equal_subtotal_minus_discount_plus_tax(db: Session) ->
     bad_sale = Sale(
         store_id=store.id,
         sale_number=f"SALE-{unique_suffix()}",
+        client_transaction_id=f"txn-{unique_suffix()}",
         cashier_id=cashier.id,
         status="COMPLETED",
         subtotal=Decimal("100.00"),
@@ -170,6 +172,7 @@ def test_invalid_sale_status_rejected(db: Session) -> None:
         Sale(
             store_id=store.id,
             sale_number=f"SALE-{unique_suffix()}",
+            client_transaction_id=f"txn-{unique_suffix()}",
             cashier_id=cashier.id,
             status="NOT_A_REAL_STATUS",
             subtotal=0,

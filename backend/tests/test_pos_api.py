@@ -15,6 +15,7 @@ from tests.factories import (
     make_store,
     make_tax_rate,
     make_user_with_role,
+    unique_suffix,
 )
 from tests.helpers import auth_headers
 
@@ -46,6 +47,7 @@ def test_scan_then_checkout_workflow(client: TestClient, db: Session) -> None:
         headers=headers,
         json={
             "store_id": store.id,
+            "client_transaction_id": f"txn-{unique_suffix()}-1",
             "lines": [{"product_id": found_product["id"], "quantity": "1"}],
             "payments": [{"payment_method": "CASH", "amount": "9.99"}],
         },
@@ -70,6 +72,7 @@ def test_multiple_quantities_and_line_total(client: TestClient, db: Session) -> 
         headers=headers,
         json={
             "store_id": store.id,
+            "client_transaction_id": f"txn-{unique_suffix()}-2",
             "lines": [{"product_id": product.id, "quantity": "4"}],
             "payments": [{"payment_method": "CASH", "amount": "14.00"}],
         },
@@ -98,6 +101,7 @@ def test_tax_is_computed_server_side(client: TestClient, db: Session) -> None:
         headers=headers,
         json={
             "store_id": store.id,
+            "client_transaction_id": f"txn-{unique_suffix()}-3",
             "lines": [{"product_id": product.id, "quantity": "1"}],
             "payments": [{"payment_method": "CASH", "amount": "11.80"}],
         },
@@ -127,6 +131,7 @@ def test_discount_is_applied_and_reduces_tax_base(client: TestClient, db: Sessio
         headers=headers,
         json={
             "store_id": store.id,
+            "client_transaction_id": f"txn-{unique_suffix()}-4",
             "lines": [{"product_id": product.id, "quantity": "1", "discount_amount": "20.00"}],
             "payments": [{"payment_method": "CASH", "amount": "88.00"}],
         },
@@ -152,6 +157,7 @@ def test_discount_exceeding_line_subtotal_rejected(client: TestClient, db: Sessi
         headers=headers,
         json={
             "store_id": store.id,
+            "client_transaction_id": f"txn-{unique_suffix()}-5",
             "lines": [{"product_id": product.id, "quantity": "1", "discount_amount": "50.00"}],
             "payments": [{"payment_method": "CASH", "amount": "1.00"}],
         },
@@ -173,6 +179,7 @@ def test_split_tender_payment(client: TestClient, db: Session) -> None:
         headers=headers,
         json={
             "store_id": store.id,
+            "client_transaction_id": f"txn-{unique_suffix()}-6",
             "lines": [{"product_id": product.id, "quantity": "1"}],
             "payments": [
                 {"payment_method": "CASH", "amount": "20.00"},
@@ -205,6 +212,7 @@ def test_receipt_contains_historical_snapshot_fields(client: TestClient, db: Ses
         headers=headers,
         json={
             "store_id": store.id,
+            "client_transaction_id": f"txn-{unique_suffix()}-7",
             "lines": [{"product_id": product.id, "quantity": "2"}],
             "payments": [{"payment_method": "CASH", "amount": "14.00"}],
         },
@@ -242,6 +250,7 @@ def test_insufficient_stock_creates_nothing(client: TestClient, db: Session) -> 
         headers=headers,
         json={
             "store_id": store.id,
+            "client_transaction_id": f"txn-{unique_suffix()}-8",
             "lines": [{"product_id": product.id, "quantity": "5"}],
             "payments": [{"payment_method": "CASH", "amount": "25.00"}],
         },
@@ -270,6 +279,7 @@ def test_underpayment_rejected_and_creates_nothing(client: TestClient, db: Sessi
         headers=headers,
         json={
             "store_id": store.id,
+            "client_transaction_id": f"txn-{unique_suffix()}-9",
             "lines": [{"product_id": product.id, "quantity": "1"}],
             "payments": [{"payment_method": "CASH", "amount": "5.00"}],
         },
@@ -294,6 +304,7 @@ def test_non_cash_overpayment_rejected(client: TestClient, db: Session) -> None:
         headers=headers,
         json={
             "store_id": store.id,
+            "client_transaction_id": f"txn-{unique_suffix()}-10",
             "lines": [{"product_id": product.id, "quantity": "1"}],
             "payments": [{"payment_method": "CARD", "amount": "50.00"}],
         },
@@ -315,12 +326,35 @@ def test_cash_overpayment_produces_change(client: TestClient, db: Session) -> No
         headers=headers,
         json={
             "store_id": store.id,
+            "client_transaction_id": f"txn-{unique_suffix()}-11",
             "lines": [{"product_id": product.id, "quantity": "1"}],
             "payments": [{"payment_method": "CASH", "amount": "50.00"}],
         },
     )
     assert response.status_code == 201
     assert response.json()["change_due"] == "30.00"
+
+
+def test_excessively_large_cart_rejected(client: TestClient, db: Session) -> None:
+    """M2 hardening audit Section 13: an unbounded `lines` array would let
+    a malicious or malformed request force the server to lock and process
+    an arbitrary number of rows in one request."""
+    store = make_store(db)
+    product = make_product(db, store, current_qty_on_hand=Decimal("1000000"))
+    _setup_cashier(db, store)
+    headers = auth_headers(client, "pos_cashier", DEFAULT_TEST_PASSWORD)
+
+    response = client.post(
+        "/api/v1/sales",
+        headers=headers,
+        json={
+            "store_id": store.id,
+            "client_transaction_id": f"txn-{unique_suffix()}",
+            "lines": [{"product_id": product.id, "quantity": "1"}] * 501,
+            "payments": [{"payment_method": "CASH", "amount": "1000000"}],
+        },
+    )
+    assert response.status_code == 422
 
 
 def test_empty_cart_rejected(client: TestClient, db: Session) -> None:
@@ -333,6 +367,7 @@ def test_empty_cart_rejected(client: TestClient, db: Session) -> None:
         headers=headers,
         json={
             "store_id": store.id,
+            "client_transaction_id": f"txn-{unique_suffix()}-12",
             "lines": [],
             "payments": [{"payment_method": "CASH", "amount": "1"}],
         },
@@ -356,6 +391,7 @@ def test_client_cannot_submit_price_or_total(client: TestClient, db: Session) ->
         headers=headers,
         json={
             "store_id": store.id,
+            "client_transaction_id": f"txn-{unique_suffix()}-13",
             "lines": [{"product_id": product.id, "quantity": "1", "unit_price_at_sale": "0.01"}],
             "payments": [{"payment_method": "CASH", "amount": "10.00"}],
         },
@@ -382,6 +418,7 @@ def test_cashier_cannot_read_sales_without_permission(client: TestClient, db: Se
         headers=headers,
         json={
             "store_id": store.id,
+            "client_transaction_id": f"txn-{unique_suffix()}-14",
             "lines": [{"product_id": product.id, "quantity": "1"}],
             "payments": [{"payment_method": "CASH", "amount": "100"}],
         },

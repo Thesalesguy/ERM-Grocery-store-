@@ -51,6 +51,15 @@ class Sale(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), nullable=False)
     sale_number: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    # Client-generated idempotency key (M2 hardening audit Section 7): the
+    # POS generates one UUID per checkout attempt and resends the SAME
+    # value on any retry (double-click, network retry after a dropped
+    # response). The UNIQUE constraint is the actual enforcement — a
+    # second INSERT with the same key is rejected by PostgreSQL even under
+    # concurrent submission, not just detected by an application-level
+    # SELECT-then-INSERT check (which has its own race). See
+    # app.modules.sales.service.finalize_sale.
+    client_transaction_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
     cashier_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="OPEN")
 
