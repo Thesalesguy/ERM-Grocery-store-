@@ -61,7 +61,7 @@ if TYPE_CHECKING:
     # import THIS module to post accounting entries, so this module must
     # not import them back at runtime — only for type-checking, which
     # never executes these imports.
-    from app.modules.ap.models import PurchaseInvoice, SupplierPayment
+    from app.modules.ap.models import PurchaseInvoice, SupplierCreditNote, SupplierPayment
     from app.modules.inventory.models import StockAdjustment
     from app.modules.purchasing.models import GoodsReceipt, PurchaseReturn
     from app.modules.sales.models import Sale, SaleReturn
@@ -606,20 +606,27 @@ def post_supplier_payment_journal(
     db: Session,
     *,
     supplier_payment: "SupplierPayment",
+    allocated_invoice_ids: list[int],
     created_by: int | None,
 ) -> JournalEntry | None:
     """Dr Accounts Payable / Cr <the real asset account the payment method
     maps to> (SUPPLIER_PAYMENT_METHOD_ACCOUNT_CODE — a DELIBERATELY
     separate mapping from sales' PAYMENT_METHOD_ACCOUNT_CODE; see that
     constant's docstring for why). One amount, used for both lines by
-    construction — this can never fail to balance."""
+    construction — this can never fail to balance.
+
+    M7 (docs/M7_ADVANCED_AP_SETTLEMENT.md Section 8/9): a payment may
+    settle several invoices via SupplierPaymentAllocation rows, but posts
+    exactly ONE journal entry for its total `amount` regardless — the
+    allocation detail is operational metadata (`allocated_invoice_ids` is
+    used only for the memo, never split into per-invoice journal lines),
+    never a reason to fragment one real cash/bank movement into several
+    accounting entries."""
     if supplier_payment.amount <= 0:
         return None
     account_code = SUPPLIER_PAYMENT_METHOD_ACCOUNT_CODE[supplier_payment.payment_method]
-    memo = (
-        f"Supplier payment {supplier_payment.id} against invoice "
-        f"{supplier_payment.purchase_invoice_id}"
-    )
+    invoices_desc = ", ".join(str(i) for i in sorted(allocated_invoice_ids))
+    memo = f"Supplier payment {supplier_payment.id} against invoice(s) {invoices_desc}"
     lines = [
         _debit(ACCOUNT_ACCOUNTS_PAYABLE, supplier_payment.amount, description=memo),
         _credit(account_code, supplier_payment.amount, description=memo),
@@ -630,6 +637,47 @@ def post_supplier_payment_journal(
         posting_date=supplier_payment.payment_date,
         source_type="SUPPLIER_PAYMENT",
         source_id=supplier_payment.id,
+        memo=memo,
+        created_by=created_by,
+        lines=lines,
+    )
+
+
+# --- Supplier credit notes (M7) ----------------------------------------------
+
+
+def post_supplier_credit_note_journal(
+    db: Session,
+    *,
+    credit_note: "SupplierCreditNote",
+    created_by: int | None,
+) -> JournalEntry | None:
+    """Dr Accounts Payable (the credit's grand_total — real AP relief) /
+    Cr Inventory (reason=GOODS_RETURN: goods already invoiced are now
+    physically leaving inventory a second time — the corresponding
+    quantity movement itself was already recorded by the referenced
+    PurchaseReturn; this journal accounts for the AP-side financial
+    consequence only, never a second inventory movement) or Cr Purchase
+    Discounts (reason=COMMERCIAL_DISCOUNT: a pure price concession, no
+    goods moved) — see docs/M7_ADVANCED_AP_SETTLEMENT.md Section 13 for
+    why these are two genuinely different economic events, never forced
+    into one generic entry."""
+    if credit_note.grand_total <= 0:
+        return None
+    credit_account = (
+        ACCOUNT_INVENTORY if credit_note.reason == "GOODS_RETURN" else ACCOUNT_PURCHASE_DISCOUNTS
+    )
+    memo = f"Supplier credit note {credit_note.id} ({credit_note.credit_number})"
+    lines = [
+        _debit(ACCOUNT_ACCOUNTS_PAYABLE, credit_note.grand_total, description=memo),
+        _credit(credit_account, credit_note.grand_total, description=memo),
+    ]
+    return _post_journal(
+        db,
+        store_id=credit_note.store_id,
+        posting_date=credit_note.credit_date,
+        source_type="SUPPLIER_CREDIT_NOTE",
+        source_id=credit_note.id,
         memo=memo,
         created_by=created_by,
         lines=lines,

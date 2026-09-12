@@ -1,19 +1,21 @@
 """Accounts Payable endpoints: purchase invoices, three-way matching,
-supplier payments, AP subledger reporting.
+multi-invoice supplier payment allocation, supplier credit notes, and AP
+subledger reporting.
 
 `ap.read` gates every GET. `ap.write` gates creating a DRAFT invoice.
 `ap.post` gates posting (financial commitment) and voiding (financial
-reversal) an invoice — the two operations that establish or undo Accounts
-Payable. `ap.pay` gates recording a supplier payment. See
-app.modules.auth.permissions and docs/M6_AP_VENDOR_ACCOUNTING.md "RBAC".
+reversal) an invoice. `ap.pay` gates recording a supplier payment.
+`ap.credit` gates creating a supplier credit note (also a financial
+commitment — single-step, immediate). See app.modules.auth.permissions and
+docs/M7_ADVANCED_AP_SETTLEMENT.md "RBAC".
 
 Store isolation mirrors sales.py/purchasing.py exactly: a store-scoped
 user's list/report requests are filtered via scoped_store_filter, a
-direct-by-ID read of another store's invoice/payment 404s (never 403 —
-doesn't confirm existence elsewhere), and every mutating endpoint calls
-enforce_store_access at the route layer IN ADDITION to the service
-layer's own independent check (defense-in-depth, proven independent by a
-mutation test in tests/test_ap_api.py).
+direct-by-ID read of another store's invoice/payment/credit-note 404s
+(never 403 — doesn't confirm existence elsewhere), and every mutating
+endpoint calls enforce_store_access at the route layer IN ADDITION to the
+service layer's own independent check (defense-in-depth, proven
+independent by a mutation test in tests/test_ap_api.py).
 """
 
 from datetime import date
@@ -25,7 +27,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db
 from app.core.exceptions import NotFoundError
 from app.modules.ap import service
-from app.modules.ap.models import PurchaseInvoice
+from app.modules.ap.models import PurchaseInvoice, SupplierCreditNote
 from app.modules.ap.schemas import (
     ApAgingRowRead,
     ApReconciliationRead,
@@ -33,16 +35,25 @@ from app.modules.ap.schemas import (
     PurchaseInvoiceCreate,
     PurchaseInvoiceLineRead,
     PurchaseInvoiceRead,
+    PurchaseInvoiceReceiptMatchRead,
     PurchaseOrderItemMatchStatusRead,
     PurchaseOrderMatchingStatusRead,
     SupplierApSummaryRead,
+    SupplierCreditNoteCreate,
+    SupplierCreditNoteRead,
     SupplierPaymentCreate,
     SupplierPaymentRead,
+    SupplierStatementLineRead,
+    SupplierStatementRead,
     SupplierTransactionRead,
     VoidPurchaseInvoiceRequest,
 )
-from app.modules.ap.service import PurchaseInvoiceLineInput
-from app.modules.auth.permissions import AP_PAY, AP_POST, AP_READ, AP_WRITE
+from app.modules.ap.service import (
+    PaymentAllocationInput,
+    PurchaseInvoiceLineInput,
+    SupplierCreditNoteLineInput,
+)
+from app.modules.auth.permissions import AP_CREDIT, AP_PAY, AP_POST, AP_READ, AP_WRITE
 from app.modules.auth.service import (
     CurrentUser,
     enforce_store_access,
@@ -58,6 +69,7 @@ _read_permission = require_permission(AP_READ)
 _write_permission = require_permission(AP_WRITE)
 _post_permission = require_permission(AP_POST)
 _pay_permission = require_permission(AP_PAY)
+_credit_permission = require_permission(AP_CREDIT)
 
 
 def _to_invoice_read(db: Session, invoice: PurchaseInvoice) -> PurchaseInvoiceRead:
@@ -72,11 +84,24 @@ def _to_invoice_read(db: Session, invoice: PurchaseInvoice) -> PurchaseInvoiceRe
         line_read = PurchaseInvoiceLineRead.model_validate(line)
         line_read.product_name = product.name if product else None
         line_read.product_sku = product.sku if product else None
+        line_read.matches = [
+            PurchaseInvoiceReceiptMatchRead.model_validate(m) for m in line.matches
+        ]
         lines.append(line_read)
     read = PurchaseInvoiceRead.model_validate(invoice)
-    read.balance_due = invoice.grand_total - invoice.amount_paid
+    read.balance_due = invoice.grand_total - invoice.amount_paid - invoice.amount_credited
     read.supplier_name = supplier.name if supplier else None
     read.lines = lines
+    return read
+
+
+def _to_credit_note_read(db: Session, credit_note: SupplierCreditNote) -> SupplierCreditNoteRead:
+    # Nested `lines`/`allocations` are populated automatically from the
+    # ORM relationships of the same name (from_attributes=True) — only
+    # supplier_name needs manual enrichment.
+    supplier = db.get(Supplier, credit_note.supplier_id)
+    read = SupplierCreditNoteRead.model_validate(credit_note)
+    read.supplier_name = supplier.name if supplier else None
     return read
 
 
@@ -194,6 +219,29 @@ def get_matching_status(
     current_user: CurrentUser = Depends(_read_permission),
 ) -> PurchaseOrderMatchingStatusRead:
     rows = service.get_invoice_matching_status(db, purchase_order_id)
+    return _matching_status_response(db, [purchase_order_id], rows)
+
+
+@router.get(
+    "/purchase-orders/matching-status",
+    response_model=PurchaseOrderMatchingStatusRead,
+)
+def get_matching_status_multi(
+    purchase_order_ids: str,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(_read_permission),
+) -> PurchaseOrderMatchingStatusRead:
+    """M7: the multi-PO matching preview for the "one invoice across
+    several purchase orders" workflow. `purchase_order_ids` is a
+    comma-separated list, e.g. `?purchase_order_ids=12,13`."""
+    ids = [int(part) for part in purchase_order_ids.split(",") if part.strip()]
+    rows = service.get_invoice_matching_status_multi(db, ids)
+    return _matching_status_response(db, ids, rows)
+
+
+def _matching_status_response(
+    db: Session, purchase_order_ids: list[int], rows: list
+) -> PurchaseOrderMatchingStatusRead:
     product_ids = {row.product_id for row in rows}
     products = {
         p.id: p for p in db.execute(select(Product).where(Product.id.in_(product_ids))).scalars()
@@ -204,6 +252,7 @@ def get_matching_status(
         items.append(
             PurchaseOrderItemMatchStatusRead(
                 purchase_order_item_id=row.purchase_order_item_id,
+                purchase_order_id=row.purchase_order_id,
                 product_id=row.product_id,
                 quantity_ordered=row.quantity_ordered,
                 quantity_received=row.quantity_received,
@@ -213,14 +262,11 @@ def get_matching_status(
                 product_sku=product.sku if product else None,
             )
         )
-    return PurchaseOrderMatchingStatusRead(purchase_order_id=purchase_order_id, items=items)
+    return PurchaseOrderMatchingStatusRead(purchase_order_ids=purchase_order_ids, items=items)
 
 
-@router.post(
-    "/invoices/{purchase_invoice_id}/payments", response_model=SupplierPaymentRead, status_code=201
-)
+@router.post("/payments", response_model=SupplierPaymentRead, status_code=201)
 def create_payment(
-    purchase_invoice_id: int,
     payload: SupplierPaymentCreate,
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_pay_permission),
@@ -228,11 +274,18 @@ def create_payment(
     enforce_store_access(current_user, payload.store_id)
     payment = service.record_supplier_payment(
         db,
-        purchase_invoice_id=purchase_invoice_id,
         store_id=payload.store_id,
+        supplier_id=payload.supplier_id,
         payment_date=payload.payment_date,
         payment_method=payload.payment_method,
         amount=payload.amount,
+        allocations=[
+            PaymentAllocationInput(
+                purchase_invoice_id=a.purchase_invoice_id,
+                amount=a.amount,
+            )
+            for a in payload.allocations
+        ],
         reference=payload.reference,
         client_transaction_id=payload.client_transaction_id,
         caller_store_id=current_user.store_id,
@@ -240,7 +293,13 @@ def create_payment(
     )
     db.commit()
     db.refresh(payment)
-    return SupplierPaymentRead.model_validate(service.get_supplier_payment(db, payment.id))
+    return _to_payment_read(service.get_supplier_payment(db, payment.id))
+
+
+def _to_payment_read(payment) -> SupplierPaymentRead:  # type: ignore[no-untyped-def]
+    # Nested `allocations` is populated automatically from the ORM
+    # relationship of the same name (from_attributes=True).
+    return SupplierPaymentRead.model_validate(payment)
 
 
 @router.get("/payments", response_model=list[SupplierPaymentRead])
@@ -262,7 +321,7 @@ def list_payments(
         limit=limit,
         offset=offset,
     )
-    return [SupplierPaymentRead.model_validate(p) for p in payments]
+    return [_to_payment_read(p) for p in payments]
 
 
 @router.get("/payments/{supplier_payment_id}", response_model=SupplierPaymentRead)
@@ -274,7 +333,78 @@ def get_payment(
     payment = service.get_supplier_payment(db, supplier_payment_id)
     if current_user.store_id is not None and payment.store_id != current_user.store_id:
         raise NotFoundError(f"Supplier payment {supplier_payment_id} not found")
-    return SupplierPaymentRead.model_validate(payment)
+    return _to_payment_read(payment)
+
+
+@router.post("/credit-notes", response_model=SupplierCreditNoteRead, status_code=201)
+def create_credit_note(
+    payload: SupplierCreditNoteCreate,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(_credit_permission),
+) -> SupplierCreditNoteRead:
+    enforce_store_access(current_user, payload.store_id)
+    credit_note = service.create_supplier_credit_note(
+        db,
+        store_id=payload.store_id,
+        supplier_id=payload.supplier_id,
+        credit_number=payload.credit_number,
+        credit_date=payload.credit_date,
+        reason=payload.reason,
+        purchase_return_id=payload.purchase_return_id,
+        lines=[
+            SupplierCreditNoteLineInput(
+                description=line.description,
+                amount=line.amount,
+                product_id=line.product_id,
+                quantity=line.quantity,
+                unit_cost=line.unit_cost,
+            )
+            for line in payload.lines
+        ],
+        allocations=[
+            PaymentAllocationInput(purchase_invoice_id=a.purchase_invoice_id, amount=a.amount)
+            for a in payload.allocations
+        ],
+        notes=payload.notes,
+        client_transaction_id=payload.client_transaction_id,
+        caller_store_id=current_user.store_id,
+        created_by=current_user.id,
+    )
+    db.commit()
+    db.refresh(credit_note)
+    return _to_credit_note_read(db, service.get_supplier_credit_note(db, credit_note.id))
+
+
+@router.get("/credit-notes", response_model=list[SupplierCreditNoteRead])
+def list_credit_notes(
+    store_id: int | None = None,
+    supplier_id: int | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(_read_permission),
+) -> list[SupplierCreditNoteRead]:
+    effective_store_id = scoped_store_filter(current_user, store_id)
+    credit_notes = service.list_supplier_credit_notes(
+        db,
+        store_id=effective_store_id,
+        supplier_id=supplier_id,
+        limit=limit,
+        offset=offset,
+    )
+    return [_to_credit_note_read(db, cn) for cn in credit_notes]
+
+
+@router.get("/credit-notes/{supplier_credit_note_id}", response_model=SupplierCreditNoteRead)
+def get_credit_note(
+    supplier_credit_note_id: int,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(_read_permission),
+) -> SupplierCreditNoteRead:
+    credit_note = service.get_supplier_credit_note(db, supplier_credit_note_id)
+    if current_user.store_id is not None and credit_note.store_id != current_user.store_id:
+        raise NotFoundError(f"Supplier credit note {supplier_credit_note_id} not found")
+    return _to_credit_note_read(db, credit_note)
 
 
 @router.get("/suppliers/{supplier_id}/summary", response_model=SupplierApSummaryRead)
@@ -306,6 +436,36 @@ def get_supplier_transactions(
         )
         for t in transactions
     ]
+
+
+@router.get("/suppliers/{supplier_id}/statement", response_model=SupplierStatementRead)
+def get_supplier_statement(
+    supplier_id: int,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(_read_permission),
+) -> SupplierStatementRead:
+    statement = service.get_supplier_statement(
+        db, supplier_id, date_from=date_from, date_to=date_to
+    )
+    return SupplierStatementRead(
+        supplier_id=statement.supplier_id,
+        date_from=statement.date_from,
+        date_to=statement.date_to,
+        opening_balance=statement.opening_balance,
+        closing_balance=statement.closing_balance,
+        lines=[
+            SupplierStatementLineRead(
+                date=line.date_,
+                transaction_type=line.transaction_type,
+                reference=line.reference,
+                amount=line.amount,
+                running_balance=line.running_balance,
+            )
+            for line in statement.lines
+        ],
+    )
 
 
 @router.get("/aging", response_model=list[ApAgingRowRead])

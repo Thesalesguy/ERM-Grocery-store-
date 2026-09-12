@@ -1,10 +1,16 @@
-"""M6 Session F: supplier payment domain logic and accounting.
+"""M6/M7 Session F: supplier payment domain logic and accounting.
 
 Focus: a payment reduces AP by exactly the amount recorded, never more
 than the invoice's own remaining balance, and posts Dr Accounts Payable /
 Cr <the real asset account the payment method maps to> — a mapping
 deliberately separate from the sales-side payment-method accounts (see
 accounting/constants.py SUPPLIER_PAYMENT_METHOD_ACCOUNT_CODE).
+
+M7: a payment is now a header + PaymentAllocationInput rows
+(docs/M7_ADVANCED_AP_SETTLEMENT.md Section 8/9) — every call below
+allocates to exactly one invoice (the M6 shape), proving the new API is a
+strict superset; test_ap_e2e_scenario.py and dedicated M7 tests exercise
+genuine multi-invoice/multi-payment allocation.
 """
 
 from datetime import date
@@ -22,7 +28,7 @@ from app.modules.accounting.constants import (
 )
 from app.modules.accounting.models import Account, JournalEntry, JournalLine
 from app.modules.ap import service as ap_service
-from app.modules.ap.service import PurchaseInvoiceLineInput
+from app.modules.ap.service import PaymentAllocationInput, PurchaseInvoiceLineInput
 from app.modules.purchasing import service as purchasing_service
 from app.modules.purchasing.models import PurchaseOrderItem
 from app.modules.purchasing.service import GoodsReceiptLineInput
@@ -68,6 +74,30 @@ def _make_posted_invoice(db: Session, store, supplier, product, *, qty: Decimal,
     return invoice
 
 
+def _pay(
+    db: Session,
+    *,
+    invoice,
+    store,
+    supplier,
+    amount: Decimal,
+    payment_method: str = "CASH",
+    payment_date_=date(2024, 1, 10),
+    client_transaction_id: str | None = None,
+):
+    return ap_service.record_supplier_payment(
+        db,
+        store_id=store.id,
+        supplier_id=supplier.id,
+        payment_date=payment_date_,
+        payment_method=payment_method,
+        amount=amount,
+        allocations=[PaymentAllocationInput(invoice.id, amount)],
+        client_transaction_id=client_transaction_id or f"ptxn-{unique_suffix()}",
+        caller_store_id=None,
+    )
+
+
 def _lines_for(db: Session, entry: JournalEntry) -> list[JournalLine]:
     return list(
         db.execute(select(JournalLine).where(JournalLine.journal_entry_id == entry.id)).scalars()
@@ -103,16 +133,7 @@ def test_partial_payment_moves_invoice_to_partially_paid(db: Session) -> None:
     )
     assert invoice.grand_total == Decimal("100.00")
 
-    payment = ap_service.record_supplier_payment(
-        db,
-        purchase_invoice_id=invoice.id,
-        store_id=store.id,
-        payment_date=date(2024, 1, 10),
-        payment_method="CASH",
-        amount=Decimal("40.00"),
-        client_transaction_id=f"ptxn-{unique_suffix()}",
-        caller_store_id=None,
-    )
+    payment = _pay(db, invoice=invoice, store=store, supplier=supplier, amount=Decimal("40.00"))
     db.commit()
     db.refresh(invoice)
     assert invoice.status == "PARTIALLY_PAID"
@@ -138,29 +159,26 @@ def test_full_payment_across_two_installments_marks_invoice_paid(db: Session) ->
         db, store, supplier, product, qty=Decimal("10"), cost=Decimal("10.00")
     )
 
-    ap_service.record_supplier_payment(
+    _pay(
         db,
-        purchase_invoice_id=invoice.id,
-        store_id=store.id,
-        payment_date=date(2024, 1, 10),
-        payment_method="BANK_TRANSFER",
+        invoice=invoice,
+        store=store,
+        supplier=supplier,
         amount=Decimal("60.00"),
-        client_transaction_id=f"ptxn-{unique_suffix()}",
-        caller_store_id=None,
+        payment_method="BANK_TRANSFER",
     )
     db.commit()
     db.refresh(invoice)
     assert invoice.status == "PARTIALLY_PAID"
 
-    second = ap_service.record_supplier_payment(
+    second = _pay(
         db,
-        purchase_invoice_id=invoice.id,
-        store_id=store.id,
-        payment_date=date(2024, 1, 15),
-        payment_method="BANK_TRANSFER",
+        invoice=invoice,
+        store=store,
+        supplier=supplier,
         amount=Decimal("40.00"),
-        client_transaction_id=f"ptxn-{unique_suffix()}",
-        caller_store_id=None,
+        payment_method="BANK_TRANSFER",
+        payment_date_=date(2024, 1, 15),
     )
     db.commit()
     db.refresh(invoice)
@@ -186,16 +204,7 @@ def test_overpayment_rejected(db: Session) -> None:
     )
 
     with pytest.raises(ConflictError) as exc_info:
-        ap_service.record_supplier_payment(
-            db,
-            purchase_invoice_id=invoice.id,
-            store_id=store.id,
-            payment_date=date(2024, 1, 10),
-            payment_method="CASH",
-            amount=Decimal("150.00"),
-            client_transaction_id=f"ptxn-{unique_suffix()}",
-            caller_store_id=None,
-        )
+        _pay(db, invoice=invoice, store=store, supplier=supplier, amount=Decimal("150.00"))
     assert exc_info.value.error_code == "OVERPAYMENT"
     db.rollback()
     db.refresh(invoice)
@@ -212,28 +221,17 @@ def test_second_payment_cannot_exceed_remaining_balance(db: Session) -> None:
         db, store, supplier, product, qty=Decimal("10"), cost=Decimal("10.00")
     )
 
-    ap_service.record_supplier_payment(
-        db,
-        purchase_invoice_id=invoice.id,
-        store_id=store.id,
-        payment_date=date(2024, 1, 10),
-        payment_method="CASH",
-        amount=Decimal("80.00"),
-        client_transaction_id=f"ptxn-{unique_suffix()}",
-        caller_store_id=None,
-    )
+    _pay(db, invoice=invoice, store=store, supplier=supplier, amount=Decimal("80.00"))
     db.commit()
 
     with pytest.raises(ConflictError) as exc_info:
-        ap_service.record_supplier_payment(
+        _pay(
             db,
-            purchase_invoice_id=invoice.id,
-            store_id=store.id,
-            payment_date=date(2024, 1, 12),
-            payment_method="CASH",
+            invoice=invoice,
+            store=store,
+            supplier=supplier,
             amount=Decimal("30.00"),  # only 20 remains
-            client_transaction_id=f"ptxn-{unique_suffix()}",
-            caller_store_id=None,
+            payment_date_=date(2024, 1, 12),
         )
     assert exc_info.value.error_code == "OVERPAYMENT"
 
@@ -274,16 +272,7 @@ def test_payment_against_draft_invoice_rejected(db: Session) -> None:
     )
     # still DRAFT — never posted
     with pytest.raises(ConflictError) as exc_info:
-        ap_service.record_supplier_payment(
-            db,
-            purchase_invoice_id=invoice.id,
-            store_id=store.id,
-            payment_date=date(2024, 1, 10),
-            payment_method="CASH",
-            amount=Decimal("5.00"),
-            client_transaction_id=f"ptxn-{unique_suffix()}",
-            caller_store_id=None,
-        )
+        _pay(db, invoice=invoice, store=store, supplier=supplier, amount=Decimal("5.00"))
     assert exc_info.value.error_code == "INVALID_INVOICE_STATE"
 
 
@@ -297,26 +286,22 @@ def test_idempotent_payment_returns_same_row_for_same_payload(db: Session) -> No
     )
     key = f"ptxn-{unique_suffix()}"
 
-    first = ap_service.record_supplier_payment(
+    first = _pay(
         db,
-        purchase_invoice_id=invoice.id,
-        store_id=store.id,
-        payment_date=date(2024, 1, 10),
-        payment_method="CASH",
+        invoice=invoice,
+        store=store,
+        supplier=supplier,
         amount=Decimal("50.00"),
         client_transaction_id=key,
-        caller_store_id=None,
     )
     db.commit()
-    second = ap_service.record_supplier_payment(
+    second = _pay(
         db,
-        purchase_invoice_id=invoice.id,
-        store_id=store.id,
-        payment_date=date(2024, 1, 10),
-        payment_method="CASH",
+        invoice=invoice,
+        store=store,
+        supplier=supplier,
         amount=Decimal("50.00"),
         client_transaction_id=key,
-        caller_store_id=None,
     )
     assert first.id == second.id
     db.refresh(invoice)
@@ -333,27 +318,23 @@ def test_conflicting_payload_with_same_payment_idempotency_key_is_rejected(db: S
     )
     key = f"ptxn-{unique_suffix()}"
 
-    ap_service.record_supplier_payment(
+    _pay(
         db,
-        purchase_invoice_id=invoice.id,
-        store_id=store.id,
-        payment_date=date(2024, 1, 10),
-        payment_method="CASH",
+        invoice=invoice,
+        store=store,
+        supplier=supplier,
         amount=Decimal("50.00"),
         client_transaction_id=key,
-        caller_store_id=None,
     )
     db.commit()
     with pytest.raises(ConflictError) as exc_info:
-        ap_service.record_supplier_payment(
+        _pay(
             db,
-            purchase_invoice_id=invoice.id,
-            store_id=store.id,
-            payment_date=date(2024, 1, 10),
-            payment_method="CASH",
+            invoice=invoice,
+            store=store,
+            supplier=supplier,
             amount=Decimal("60.00"),  # different amount
             client_transaction_id=key,
-            caller_store_id=None,
         )
     assert exc_info.value.error_code == "IDEMPOTENCY_KEY_CONFLICT"
 
@@ -366,18 +347,36 @@ def test_cannot_void_invoice_with_a_payment_recorded(db: Session) -> None:
     invoice = _make_posted_invoice(
         db, store, supplier, product, qty=Decimal("10"), cost=Decimal("10.00")
     )
-    ap_service.record_supplier_payment(
-        db,
-        purchase_invoice_id=invoice.id,
-        store_id=store.id,
-        payment_date=date(2024, 1, 10),
-        payment_method="CASH",
-        amount=Decimal("10.00"),
-        client_transaction_id=f"ptxn-{unique_suffix()}",
-        caller_store_id=None,
-    )
+    _pay(db, invoice=invoice, store=store, supplier=supplier, amount=Decimal("10.00"))
     db.commit()
 
     with pytest.raises(ConflictError) as exc_info:
         ap_service.void_purchase_invoice(db, purchase_invoice_id=invoice.id, caller_store_id=None)
     assert exc_info.value.error_code == "INVOICE_HAS_PAYMENTS"
+
+
+def test_allocations_must_sum_to_payment_amount(db: Session) -> None:
+    """M7 (docs/M7_ADVANCED_AP_SETTLEMENT.md Section 13): an unapplied
+    remainder is rejected explicitly, never silently accepted as an
+    advance."""
+    store = make_store(db)
+    supplier = make_supplier(db)
+    product = make_product(db, store)
+    db.commit()
+    invoice = _make_posted_invoice(
+        db, store, supplier, product, qty=Decimal("10"), cost=Decimal("10.00")
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        ap_service.record_supplier_payment(
+            db,
+            store_id=store.id,
+            supplier_id=supplier.id,
+            payment_date=date(2024, 1, 10),
+            payment_method="CASH",
+            amount=Decimal("100.00"),
+            allocations=[PaymentAllocationInput(invoice.id, Decimal("40.00"))],
+            client_transaction_id=f"ptxn-{unique_suffix()}",
+            caller_store_id=None,
+        )
+    assert getattr(exc_info.value, "error_code", None) == "ALLOCATION_MUST_EQUAL_PAYMENT_AMOUNT"

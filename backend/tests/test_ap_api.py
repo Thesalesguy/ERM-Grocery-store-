@@ -107,13 +107,32 @@ def test_inventory_clerk_can_write_but_not_post_or_pay(client: TestClient, db: S
     assert client.post(f"/api/v1/ap/invoices/{invoice_id}/post", headers=headers).status_code == 403
     assert (
         client.post(
-            f"/api/v1/ap/invoices/{invoice_id}/payments",
+            "/api/v1/ap/payments",
             json={
                 "store_id": store.id,
+                "supplier_id": supplier.id,
                 "payment_date": "2024-01-10",
                 "payment_method": "CASH",
                 "amount": "10.00",
+                "allocations": [{"purchase_invoice_id": invoice_id, "amount": "10.00"}],
                 "client_transaction_id": f"ptxn-{unique_suffix()}",
+            },
+            headers=headers,
+        ).status_code
+        == 403
+    )
+    assert (
+        client.post(
+            "/api/v1/ap/credit-notes",
+            json={
+                "store_id": store.id,
+                "supplier_id": supplier.id,
+                "credit_number": f"CN-{unique_suffix()}",
+                "credit_date": "2024-01-12",
+                "reason": "COMMERCIAL_DISCOUNT",
+                "lines": [{"description": "Discount", "amount": "5.00"}],
+                "allocations": [{"purchase_invoice_id": invoice_id, "amount": "5.00"}],
+                "client_transaction_id": f"ctxn-{unique_suffix()}",
             },
             headers=headers,
         ).status_code
@@ -144,17 +163,35 @@ def test_manager_can_create_post_and_pay(client: TestClient, db: Session) -> Non
     assert response.json()["status"] == "POSTED"
 
     response = client.post(
-        f"/api/v1/ap/invoices/{invoice_id}/payments",
+        "/api/v1/ap/payments",
         json={
             "store_id": store.id,
+            "supplier_id": supplier.id,
             "payment_date": "2024-01-10",
             "payment_method": "CASH",
-            "amount": "50.00",
+            "amount": "30.00",
+            "allocations": [{"purchase_invoice_id": invoice_id, "amount": "30.00"}],
             "client_transaction_id": f"ptxn-{unique_suffix()}",
         },
         headers=headers,
     )
     assert response.status_code == 201, response.text
+
+    response = client.post(
+        "/api/v1/ap/credit-notes",
+        json={
+            "store_id": store.id,
+            "supplier_id": supplier.id,
+            "credit_number": f"CN-{unique_suffix()}",
+            "credit_date": "2024-01-12",
+            "reason": "COMMERCIAL_DISCOUNT",
+            "lines": [{"description": "Discount", "amount": "5.00"}],
+            "allocations": [{"purchase_invoice_id": invoice_id, "amount": "5.00"}],
+            "client_transaction_id": f"ctxn-{unique_suffix()}",
+        },
+        headers=headers,
+    )
+    assert response.status_code == 201, response.text  # Manager also has ap.credit
 
 
 def test_auditor_can_read_but_not_write(client: TestClient, db: Session) -> None:

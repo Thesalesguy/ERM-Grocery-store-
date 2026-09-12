@@ -1,28 +1,37 @@
 """Accounts Payable business logic: purchase-invoice lifecycle, three-way
 matching against purchase orders/goods receipts, Purchase Clearing
-clearing, and supplier payments.
+clearing, multi-invoice supplier-payment allocation, and supplier credit
+notes.
 
-See docs/M6_AP_VENDOR_ACCOUNTING.md for the full design. The single most
-important technique in this file is FIFO receipt-lot matching
-(`_fifo_clearing_amount`): a PurchaseOrderItem can be received across
-several GoodsReceipts at different costs (the exact WAC-driving scenario
-M3 already supports), so "the cost of the units being invoiced" is not a
-single number — it is computed by walking that item's GoodsReceiptItem
-rows in receipt order, skipping whatever an earlier invoice already
-consumed (tracked via the same running `quantity_invoiced` cache
-`quantity_received` already uses), and pricing the newly-invoiced
-quantity at the ACTUAL recorded cost of whichever lot(s) it falls into.
-This is what lets a Purchase Clearing balance always be traced back to
-real receipt data (M6 task Section 5: "No orphan clearing balances") and
-what makes the price-variance calculation (invoiced value minus this
-FIFO-priced value) a real, derived fact rather than an invented number.
+See docs/M7_ADVANCED_AP_SETTLEMENT.md for the full M7 design and
+docs/M6_AP_VENDOR_ACCOUNTING.md for the original M6 design this extends.
+
+The single most important technique in this file is still FIFO receipt-lot
+matching (`_fifo_match_slices`): a PurchaseOrderItem can be received across
+several GoodsReceipts at different costs, so "the cost of the units being
+invoiced" is computed by walking that item's GoodsReceiptItem rows in
+receipt order, skipping whatever earlier invoices already consumed. M7's
+change is that the per-lot slices this walk produces are now PERSISTED
+(`PurchaseInvoiceReceiptMatch`) instead of only being summed into a total —
+this is what lets an invoice legitimately span multiple receipts (already
+true in M6) AND multiple purchase orders (new in M7) while still answering
+"why does this Purchase Clearing/AP amount exist" from real rows, and lets
+`void_purchase_invoice` undo an exact posting without ever recomputing
+FIFO (unsafe once other invoices have posted against the same items).
+
+Precision note: a match row's own `variance_amount` is rounded to money
+(2dp) for readability as a documentary/audit record — the actual posted
+journal amounts are computed independently from the RAW (unrounded)
+per-slice arithmetic, summed once, and ledger-quantized (6dp) exactly once
+at the end. The two are not required to sub-cent-agree; a per-row
+rounding artifact must never leak into what gets posted.
 
 Two commit conventions coexist here, matching every other service module:
-`create_purchase_invoice` (a DRAFT has no accounting/quantity effect) and
-`void_purchase_invoice` on a DRAFT commit directly. `post_purchase_invoice`,
-`void_purchase_invoice` on a POSTED invoice, and `record_supplier_payment`
-— each a genuinely atomic multi-effect transaction — never call
-commit()/rollback() themselves; the caller commits once.
+`create_purchase_invoice` (a DRAFT has no accounting/quantity effect) on
+one hand, and `post_purchase_invoice`, `void_purchase_invoice` on a POSTED
+invoice, `record_supplier_payment`, and `create_supplier_credit_note` —
+each a genuinely atomic multi-effect transaction — on the other, which
+never call commit()/rollback() themselves; the caller commits once.
 """
 
 from dataclasses import dataclass
@@ -42,10 +51,16 @@ from app.modules.accounting.constants import (
 )
 from app.modules.accounting.models import Account, JournalEntry, JournalLine
 from app.modules.ap.models import (
+    SUPPLIER_CREDIT_NOTE_REASONS,
     SUPPLIER_PAYMENT_METHODS,
     PurchaseInvoice,
     PurchaseInvoiceLine,
+    PurchaseInvoiceReceiptMatch,
+    SupplierCreditAllocation,
+    SupplierCreditNote,
+    SupplierCreditNoteLine,
     SupplierPayment,
+    SupplierPaymentAllocation,
 )
 from app.modules.audit import service as audit_service
 from app.modules.auth.models import Store
@@ -54,6 +69,7 @@ from app.modules.purchasing.models import (
     GoodsReceiptItem,
     PurchaseOrder,
     PurchaseOrderItem,
+    PurchaseReturn,
     Supplier,
 )
 
@@ -64,6 +80,9 @@ _MONEY_QUANTUM = Decimal("0.01")
 # credit they are now clearing, or a fresh, fabricated rounding mismatch
 # would appear in inventory/AP reconciliation for no real reason.
 _LEDGER_QUANTUM = Decimal("0.000001")
+
+_OUTSTANDING_INVOICE_STATUSES = ("POSTED", "PARTIALLY_PAID")
+_NON_ACCOUNTING_INVOICE_STATUSES = ("DRAFT", "VOIDED")
 
 
 def _round_money(value: Decimal) -> Decimal:
@@ -87,6 +106,23 @@ def _enforce_store_access(caller_store_id: int | None, target_store_id: int, nou
         )
 
 
+def _outstanding_balance(invoice: PurchaseInvoice) -> Decimal:
+    """The single definition of "what is still owed on this invoice" used
+    everywhere in this module — grand_total minus BOTH settlement paths
+    (docs/M7_ADVANCED_AP_SETTLEMENT.md Section 16)."""
+    return invoice.grand_total - invoice.amount_paid - invoice.amount_credited
+
+
+def _recompute_invoice_status(invoice: PurchaseInvoice) -> None:
+    settled = invoice.amount_paid + invoice.amount_credited
+    if settled >= invoice.grand_total:
+        invoice.status = "PAID"
+    elif settled > 0:
+        invoice.status = "PARTIALLY_PAID"
+    else:
+        invoice.status = "POSTED"
+
+
 # --- Purchase invoice creation (DRAFT) --------------------------------------
 
 
@@ -102,13 +138,11 @@ class PurchaseInvoiceLineInput:
 
 def _generate_invoice_client_signature(
     supplier_id: int,
-    purchase_order_id: int,
     invoice_number: str,
     lines: list[PurchaseInvoiceLineInput],
 ) -> tuple:
     return (
         supplier_id,
-        purchase_order_id,
         invoice_number,
         tuple(
             sorted(
@@ -130,13 +164,18 @@ def _match_or_reject_idempotent_invoice(
     *,
     client_transaction_id: str,
     supplier_id: int,
-    purchase_order_id: int,
     invoice_number: str,
     lines: list[PurchaseInvoiceLineInput],
 ) -> PurchaseInvoice | None:
     """Mirrors app.modules.sales.service._match_or_reject_idempotent_return
     exactly, including WHY it matters under concurrency: see this module's
-    create_purchase_invoice docstring."""
+    create_purchase_invoice docstring.
+
+    M7: no longer includes purchase_order_id in the signature —
+    purchase_order_id is now a non-authoritative display field (an
+    invoice's lines, not its header, define what it actually matches), so
+    two requests differing only in that field would otherwise be treated
+    as genuinely different when they are not."""
     existing = db.execute(
         select(PurchaseInvoice).where(
             PurchaseInvoice.client_transaction_id == client_transaction_id
@@ -155,7 +194,6 @@ def _match_or_reject_idempotent_invoice(
     )
     existing_signature = (
         existing.supplier_id,
-        existing.purchase_order_id,
         existing.invoice_number,
         tuple(
             sorted(
@@ -170,9 +208,7 @@ def _match_or_reject_idempotent_invoice(
             )
         ),
     )
-    requested_signature = _generate_invoice_client_signature(
-        supplier_id, purchase_order_id, invoice_number, lines
-    )
+    requested_signature = _generate_invoice_client_signature(supplier_id, invoice_number, lines)
     if existing_signature != requested_signature:
         raise ConflictError(
             f"client_transaction_id {client_transaction_id!r} was already used for a "
@@ -187,12 +223,12 @@ def create_purchase_invoice(
     *,
     store_id: int,
     supplier_id: int,
-    purchase_order_id: int,
     invoice_number: str,
     invoice_date: date,
     lines: list[PurchaseInvoiceLineInput],
     client_transaction_id: str,
     caller_store_id: int | None,
+    purchase_order_id: int | None = None,
     due_date: date | None = None,
     notes: str | None = None,
     created_by: int | None = None,
@@ -200,27 +236,27 @@ def create_purchase_invoice(
     """Records a supplier invoice as a DRAFT — no accounting effect, no
     quantity_invoiced change, freely re-creatable-if-wrong (delete via
     void_purchase_invoice) up until post_purchase_invoice commits it
-    financially (docs/M6_AP_VENDOR_ACCOUNTING.md "Invoice lifecycle").
+    financially (docs/M7_ADVANCED_AP_SETTLEMENT.md "Invoice lifecycle").
+
+    M7: `purchase_order_id` is now OPTIONAL and purely informational — an
+    invoice's lines may reference purchase_order_items belonging to
+    DIFFERENT purchase orders, as long as every one of those purchase
+    orders belongs to the SAME `store_id`/`supplier_id` given here (each
+    line is validated independently; there is no requirement that they
+    share one PO). If `purchase_order_id` is not given and every line
+    happens to reference the same single PO, it is filled in automatically
+    for display/filtering convenience — never used to validate anything.
 
     Two INDEPENDENT duplicate-detection mechanisms, for two different
     real failure modes (both required by M6 task Section 27's "duplicate
-    invoice" mutation target):
-    1. `client_transaction_id` idempotency (checked here, before and
-       after no lock is needed — DRAFT creation touches no shared running
-       total, so unlike post_purchase_invoice/record_supplier_payment
-       there is no second "after the lock" check to add: two concurrent
-       creates race only on the flush's IntegrityError, recovered below
-       exactly like every other module's create-with-idempotency-key
-       function).
-    2. `(supplier_id, invoice_number)` uniqueness — catches a genuinely
-       different attempt (a fresh client_transaction_id) to record the
-       SAME real-world supplier document twice.
+    invoice" mutation target, unchanged in M7):
+    1. `client_transaction_id` idempotency.
+    2. `(supplier_id, invoice_number)` uniqueness.
     """
     existing = _match_or_reject_idempotent_invoice(
         db,
         client_transaction_id=client_transaction_id,
         supplier_id=supplier_id,
-        purchase_order_id=purchase_order_id,
         invoice_number=invoice_number,
         lines=lines,
     )
@@ -237,19 +273,20 @@ def create_purchase_invoice(
         raise ValidationAppError(
             f"Supplier {supplier_id} does not exist or is inactive", error_code="INVALID_SUPPLIER"
         )
-    purchase_order = db.get(PurchaseOrder, purchase_order_id)
-    if purchase_order is None:
-        raise NotFoundError(f"Purchase order {purchase_order_id} not found")
-    if purchase_order.store_id != store_id:
-        raise ConflictError(
-            f"Purchase order {purchase_order_id} does not belong to store {store_id}",
-            error_code="STORE_MISMATCH",
-        )
-    if purchase_order.supplier_id != supplier_id:
-        raise ConflictError(
-            f"Purchase order {purchase_order_id} does not belong to supplier {supplier_id}",
-            error_code="SUPPLIER_MISMATCH",
-        )
+    if purchase_order_id is not None:
+        primary_po = db.get(PurchaseOrder, purchase_order_id)
+        if primary_po is None:
+            raise NotFoundError(f"Purchase order {purchase_order_id} not found")
+        if primary_po.store_id != store_id:
+            raise ConflictError(
+                f"Purchase order {purchase_order_id} does not belong to store {store_id}",
+                error_code="STORE_MISMATCH",
+            )
+        if primary_po.supplier_id != supplier_id:
+            raise ConflictError(
+                f"Purchase order {purchase_order_id} does not belong to supplier {supplier_id}",
+                error_code="SUPPLIER_MISMATCH",
+            )
     if not invoice_number.strip():
         raise ValidationAppError("Invoice number is required", error_code="INVALID_INVOICE_NUMBER")
 
@@ -271,6 +308,44 @@ def create_purchase_invoice(
                 "Discount/tax amounts cannot be negative", error_code="INVALID_AMOUNT"
             )
 
+    # Batched into two-then-two IN(...) queries rather than one db.get()
+    # per line per table (mirrors M6/M5's identical N+1 fix) — and, new in
+    # M7, used to validate EACH line's own purchase order against
+    # store_id/supplier_id, since the header purchase_order_id no longer
+    # does that job.
+    po_item_ids = {line.purchase_order_item_id for line in lines}
+    po_items_by_id = {
+        item.id: item
+        for item in db.execute(
+            select(PurchaseOrderItem).where(PurchaseOrderItem.id.in_(po_item_ids))
+        ).scalars()
+    }
+    missing_item_ids = po_item_ids - set(po_items_by_id)
+    if missing_item_ids:
+        raise NotFoundError(f"Purchase order item(s) {sorted(missing_item_ids)} not found")
+
+    po_ids_needed = {item.purchase_order_id for item in po_items_by_id.values()}
+    pos_by_id = {
+        po.id: po
+        for po in db.execute(
+            select(PurchaseOrder).where(PurchaseOrder.id.in_(po_ids_needed))
+        ).scalars()
+    }
+    for po_item in po_items_by_id.values():
+        po = pos_by_id.get(po_item.purchase_order_id)
+        if po is None or po.store_id != store_id or po.supplier_id != supplier_id:
+            raise ConflictError(
+                f"Purchase order item {po_item.id} belongs to a purchase order that is not "
+                f"in store {store_id} for supplier {supplier_id}",
+                error_code="PO_ITEM_STORE_SUPPLIER_MISMATCH",
+            )
+
+    resolved_purchase_order_id = purchase_order_id
+    if resolved_purchase_order_id is None:
+        distinct_pos = {item.purchase_order_id for item in po_items_by_id.values()}
+        if len(distinct_pos) == 1:
+            resolved_purchase_order_id = next(iter(distinct_pos))
+
     resolved_due_date = due_date
     if resolved_due_date is None:
         term_days = supplier.default_payment_terms_days or 0
@@ -279,7 +354,7 @@ def create_purchase_invoice(
     invoice = PurchaseInvoice(
         store_id=store_id,
         supplier_id=supplier_id,
-        purchase_order_id=purchase_order_id,
+        purchase_order_id=resolved_purchase_order_id,
         invoice_number=invoice_number,
         invoice_date=invoice_date,
         due_date=resolved_due_date,
@@ -289,6 +364,7 @@ def create_purchase_invoice(
         tax_total=Decimal("0"),
         grand_total=Decimal("0"),
         amount_paid=Decimal("0"),
+        amount_credited=Decimal("0"),
         client_transaction_id=client_transaction_id,
         notes=notes,
         created_by=created_by,
@@ -315,19 +391,6 @@ def create_purchase_invoice(
             raise
         return winner
 
-    # Batched into two IN(...) queries rather than one db.get() per line
-    # per table — a plain read with no locking/ordering requirement (the
-    # DRAFT this creates has no quantity_invoiced/accounting effect yet),
-    # so there is no reason to pay two round-trips per line for a request
-    # that can carry up to 500 (mirrors the same fix applied to M5's
-    # create_sale_return for the identical reason).
-    po_item_ids = {line.purchase_order_item_id for line in lines}
-    po_items_by_id = {
-        item.id: item
-        for item in db.execute(
-            select(PurchaseOrderItem).where(PurchaseOrderItem.id.in_(po_item_ids))
-        ).scalars()
-    }
     product_ids = {item.product_id for item in po_items_by_id.values()}
     products_by_id = {
         p.id: p for p in db.execute(select(Product).where(Product.id.in_(product_ids))).scalars()
@@ -337,12 +400,7 @@ def create_purchase_invoice(
     discount_total = Decimal("0")
     tax_total = Decimal("0")
     for line in lines:
-        po_item = po_items_by_id.get(line.purchase_order_item_id)
-        if po_item is None or po_item.purchase_order_id != purchase_order_id:
-            raise NotFoundError(
-                f"Purchase order item {line.purchase_order_item_id} not found on "
-                f"purchase order {purchase_order_id}"
-            )
+        po_item = po_items_by_id[line.purchase_order_item_id]
         product = products_by_id.get(po_item.product_id)
         description = line.description or (
             product.name if product else f"Product {po_item.product_id}"
@@ -379,7 +437,7 @@ def create_purchase_invoice(
         entity_id=invoice.id,
         after={
             "supplier_id": supplier_id,
-            "purchase_order_id": purchase_order_id,
+            "purchase_order_ids": sorted(po_ids_needed),
             "invoice_number": invoice_number,
             "grand_total": str(invoice.grand_total),
             "line_count": len(lines),
@@ -427,6 +485,7 @@ def list_purchase_invoices(
 @dataclass(frozen=True)
 class PurchaseOrderItemMatchStatus:
     purchase_order_item_id: int
+    purchase_order_id: int
     product_id: int
     quantity_ordered: Decimal
     quantity_received: Decimal
@@ -437,7 +496,7 @@ class PurchaseOrderItemMatchStatus:
 def get_invoice_matching_status(
     db: Session, purchase_order_id: int
 ) -> list[PurchaseOrderItemMatchStatus]:
-    """Read-only three-way-match preview for a PO — mirrors
+    """Read-only three-way-match preview for ONE PO — mirrors
     app.modules.sales.service.get_return_eligibility's read-only-helper
     shape. `quantity_invoiceable` is the exact ceiling
     post_purchase_invoice enforces: never received, ordered."""
@@ -447,6 +506,7 @@ def get_invoice_matching_status(
     return [
         PurchaseOrderItemMatchStatus(
             purchase_order_item_id=item.id,
+            purchase_order_id=purchase_order_id,
             product_id=item.product_id,
             quantity_ordered=item.quantity_ordered,
             quantity_received=item.quantity_received,
@@ -457,22 +517,33 @@ def get_invoice_matching_status(
     ]
 
 
-def _fifo_clearing_amount(
+def get_invoice_matching_status_multi(
+    db: Session, purchase_order_ids: list[int]
+) -> list[PurchaseOrderItemMatchStatus]:
+    """M7: the multi-PO equivalent of get_invoice_matching_status, for the
+    "one invoice across multiple POs" workflow (docs/M7_ADVANCED_AP_SETTLEMENT.md
+    Section 1) — the frontend calls this once instead of stitching together
+    several single-PO calls itself."""
+    rows: list[PurchaseOrderItemMatchStatus] = []
+    for po_id in purchase_order_ids:
+        rows.extend(get_invoice_matching_status(db, po_id))
+    return rows
+
+
+def _fifo_match_slices(
     db: Session,
     *,
     purchase_order_item_id: int,
     already_invoiced_qty: Decimal,
     additional_qty: Decimal,
-) -> Decimal:
-    """The dollar value of `additional_qty` more units of this PO item
-    being invoiced, priced at the ACTUAL recorded cost of whichever
-    GoodsReceiptItem lot(s) they fall into — walking receipt lots in
-    receipt order (oldest first), skipping `already_invoiced_qty` units
-    already consumed by earlier invoices against this same item. This is
-    what lets Purchase Clearing's GL balance always be traced back to
-    specific receipt data (module docstring above) rather than to a
-    single "the" cost per item that may not exist when an item was
-    received across multiple receipts at different costs.
+) -> list[tuple[int, Decimal, Decimal]]:
+    """Walks `purchase_order_item_id`'s GoodsReceiptItem lots in receipt
+    order (oldest first), skipping `already_invoiced_qty` units already
+    consumed by earlier invoices/lines against this same item, and returns
+    the list of (goods_receipt_item_id, matched_quantity, matched_unit_cost)
+    slices that together make up `additional_qty` more units being
+    invoiced. This is the persisted-match version of what M6 only summed
+    on the fly — see the module docstring.
 
     Callers must have already validated `already_invoiced_qty +
     additional_qty <= <that item's quantity_received>` — this function
@@ -491,7 +562,7 @@ def _fifo_clearing_amount(
     )
     skip = already_invoiced_qty
     remaining = additional_qty
-    total = Decimal("0")
+    slices: list[tuple[int, Decimal, Decimal]] = []
     for receipt_item in receipt_items:
         lot_qty = receipt_item.quantity_received
         if skip >= lot_qty:
@@ -500,7 +571,8 @@ def _fifo_clearing_amount(
         available = lot_qty - skip
         skip = Decimal("0")
         take = min(available, remaining)
-        total += take * receipt_item.unit_cost
+        if take > 0:
+            slices.append((receipt_item.id, take, receipt_item.unit_cost))
         remaining -= take
         if remaining <= 0:
             break
@@ -511,6 +583,27 @@ def _fifo_clearing_amount(
             "normal validation failure",
             error_code="MATCH_DATA_INCONSISTENT",
         )
+    return slices
+
+
+def _fifo_clearing_amount(
+    db: Session,
+    *,
+    purchase_order_item_id: int,
+    already_invoiced_qty: Decimal,
+    additional_qty: Decimal,
+) -> Decimal:
+    """Aggregate-only convenience over _fifo_match_slices, used by the
+    read-only reporting functions below (get_supplier_ap_summary,
+    purchase_clearing_reconciliation) that only need a total value for
+    STILL-UNINVOICED quantity, never a persisted per-lot record."""
+    slices = _fifo_match_slices(
+        db,
+        purchase_order_item_id=purchase_order_item_id,
+        already_invoiced_qty=already_invoiced_qty,
+        additional_qty=additional_qty,
+    )
+    total = sum((qty * cost for _, qty, cost in slices), Decimal("0"))
     return _ledger_quantize(total)
 
 
@@ -526,34 +619,29 @@ def post_purchase_invoice(
 ) -> PurchaseInvoice:
     """DRAFT -> POSTED: atomically validates three-way matching (no line
     may push cumulative quantity_invoiced past that PO item's
-    quantity_received — M6 task Section 4's explicit "PO=100,
-    Received=80, Invoice=100 must not silently become valid" example),
-    computes the FIFO-matched clearing amount and price variance per
-    line, updates quantity_invoiced, and posts the Purchase Clearing/AP/
-    variance/tax/discount journal — all in this one transaction.
+    quantity_received), computes the FIFO-matched clearing amount and
+    price variance per LINE (persisting each receipt-lot slice consumed as
+    a PurchaseInvoiceReceiptMatch row), updates quantity_invoiced, and
+    posts the Purchase Clearing/AP/variance/tax/discount journal — all in
+    this one transaction.
 
     Idempotent by state, not by a separate key (mirrors
-    submit_purchase_order's status-transition precedent, not
-    create_sale_return's client_transaction_id precedent): calling this
-    on an already-POSTED/PARTIALLY_PAID/PAID invoice is a no-op that
-    returns the current state, since posting a DRAFT is itself the only
-    state transition this function performs and it cannot happen twice.
+    submit_purchase_order's status-transition precedent): calling this on
+    an already-POSTED/PARTIALLY_PAID/PAID invoice is a no-op that returns
+    the current state.
 
-    Locking: locks the PurchaseOrder row FIRST (the exact same row
-    receive_goods locks), which serializes THIS invoice's posting against
-    both a concurrent goods receipt AND a concurrent posting of ANOTHER
-    invoice against the same PO — both mutate the same
-    PurchaseOrderItem.quantity_received/quantity_invoiced running totals.
-    The invoice's own status is re-checked immediately after acquiring
-    that lock (the M5-discovered pattern: a racing caller that already
-    posted this exact invoice may have committed while this caller
-    waited for the lock)."""
+    Locking: an invoice's lines may now reference items across MULTIPLE
+    purchase orders (M7). Every one of those PurchaseOrder rows is locked
+    — in ascending id order, a fixed, deterministic order every caller
+    (this function, receive_goods, and void_purchase_invoice) follows, so
+    two transactions racing over overlapping PO sets can never deadlock —
+    before touching any of their items. The invoice's own status is
+    re-checked immediately after acquiring those locks (the M5-discovered
+    pattern: a racing caller that already posted this exact invoice may
+    have committed while this caller waited)."""
     invoice = get_purchase_invoice(db, purchase_invoice_id)
     _enforce_store_access(caller_store_id, invoice.store_id, "this purchase invoice")
     if invoice.status != "DRAFT":
-        # Already posted (or further along) — idempotent no-op. VOIDED is
-        # the only DRAFT-adjacent state that reaches here needing a real
-        # rejection, since a voided invoice can never become POSTED.
         if invoice.status == "VOIDED":
             raise ConflictError(
                 f"Purchase invoice {purchase_invoice_id} is VOIDED and cannot be posted",
@@ -561,11 +649,36 @@ def post_purchase_invoice(
             )
         return invoice
 
-    purchase_order = db.execute(
-        select(PurchaseOrder).where(PurchaseOrder.id == invoice.purchase_order_id).with_for_update()
-    ).scalar_one_or_none()
-    if purchase_order is None:
-        raise NotFoundError(f"Purchase order {invoice.purchase_order_id} not found")
+    lines = list(invoice.lines)
+    if not lines:
+        raise ConflictError(
+            f"Purchase invoice {purchase_invoice_id} has no lines", error_code="EMPTY_INVOICE"
+        )
+
+    po_item_ids = sorted({line.purchase_order_item_id for line in lines})
+    # Selecting only the scalar column (not full ORM entities) is
+    # deliberate: a full-entity SELECT here would populate the session's
+    # identity map with PurchaseOrderItem objects BEFORE the lock below is
+    # acquired, and SQLAlchemy does not refresh already-tracked entities'
+    # attributes from a later query by default — the "fresh" read after
+    # the lock would silently return the same stale (pre-lock)
+    # quantity_invoiced values. A real concurrency test caught exactly
+    # this: two concurrent postings both succeeded because each saw the
+    # other's stale, pre-commit quantity_invoiced.
+    po_ids = sorted(
+        {
+            row[0]
+            for row in db.execute(
+                select(PurchaseOrderItem.purchase_order_id).where(
+                    PurchaseOrderItem.id.in_(po_item_ids)
+                )
+            )
+        }
+    )
+    for po_id in po_ids:
+        db.execute(
+            select(PurchaseOrder).where(PurchaseOrder.id == po_id).with_for_update()
+        ).scalar_one_or_none()
 
     db.refresh(invoice)
     if invoice.status != "DRAFT":
@@ -576,7 +689,13 @@ def post_purchase_invoice(
             )
         return invoice
 
-    lines = list(invoice.lines)
+    po_items = {
+        item.id: item
+        for item in db.execute(
+            select(PurchaseOrderItem).where(PurchaseOrderItem.id.in_(po_item_ids))
+        ).scalars()
+    }
+
     requested_by_item: dict[int, Decimal] = {}
     for line in lines:
         requested_by_item[line.purchase_order_item_id] = (
@@ -584,40 +703,60 @@ def post_purchase_invoice(
             + line.quantity_invoiced
         )
 
-    total_clearing = Decimal("0")
-    total_variance = Decimal("0")
-    invoiced_value_by_item: dict[int, Decimal] = {}
-    for line in lines:
-        invoiced_value_by_item[line.purchase_order_item_id] = invoiced_value_by_item.get(
-            line.purchase_order_item_id, Decimal("0")
-        ) + _round_money(line.quantity_invoiced * line.unit_price)
-
     for po_item_id, requested_qty in requested_by_item.items():
-        po_item = db.get(PurchaseOrderItem, po_item_id)
+        po_item = po_items.get(po_item_id)
         if po_item is None:
             # Unreachable in practice: create_purchase_invoice already
-            # validated every line's purchase_order_item_id against this
-            # same purchase_order_id, and PurchaseOrderItem rows are never
-            # deleted. Guarded anyway rather than trusting that forever.
+            # validated every line's purchase_order_item_id. Guarded
+            # anyway rather than trusting that forever.
             raise NotFoundError(f"Purchase order item {po_item_id} not found")
-        already_invoiced = po_item.quantity_invoiced
-        new_total = already_invoiced + requested_qty
+        new_total = po_item.quantity_invoiced + requested_qty
         if new_total > po_item.quantity_received:
             raise ConflictError(
                 f"Cannot invoice {requested_qty} of purchase order item {po_item_id}: only "
-                f"{po_item.quantity_received - already_invoiced} remains invoiceable (of "
-                f"{po_item.quantity_received} received)",
+                f"{po_item.quantity_received - po_item.quantity_invoiced} remains invoiceable "
+                f"(of {po_item.quantity_received} received)",
                 error_code="OVER_INVOICING",
             )
-        clearing_for_item = _fifo_clearing_amount(
+
+    # Second pass: FIFO-consume per LINE (stable id order, so two lines
+    # referencing the same po_item on this invoice consume adjacent,
+    # non-overlapping lots), persisting each slice consumed.
+    consumed_this_posting: dict[int, Decimal] = {}
+    total_clearing_raw = Decimal("0")
+    total_variance_raw = Decimal("0")
+    for line in sorted(lines, key=lambda item: item.id):
+        po_item = po_items[line.purchase_order_item_id]
+        already = po_item.quantity_invoiced + consumed_this_posting.get(po_item.id, Decimal("0"))
+        slices = _fifo_match_slices(
             db,
-            purchase_order_item_id=po_item_id,
-            already_invoiced_qty=already_invoiced,
-            additional_qty=requested_qty,
+            purchase_order_item_id=po_item.id,
+            already_invoiced_qty=already,
+            additional_qty=line.quantity_invoiced,
         )
-        total_clearing += clearing_for_item
-        total_variance += _ledger_quantize(invoiced_value_by_item[po_item_id]) - clearing_for_item
-        po_item.quantity_invoiced = new_total
+        consumed_this_posting[po_item.id] = (
+            consumed_this_posting.get(po_item.id, Decimal("0")) + line.quantity_invoiced
+        )
+        for receipt_item_id, slice_qty, slice_cost in slices:
+            raw_variance = slice_qty * (line.unit_price - slice_cost)
+            total_clearing_raw += slice_qty * slice_cost
+            total_variance_raw += raw_variance
+            db.add(
+                PurchaseInvoiceReceiptMatch(
+                    purchase_invoice_line_id=line.id,
+                    goods_receipt_item_id=receipt_item_id,
+                    matched_quantity=slice_qty,
+                    matched_unit_cost=slice_cost,
+                    variance_amount=_round_money(raw_variance),
+                )
+            )
+
+    for po_item_id, requested_qty in requested_by_item.items():
+        po_item = po_items[po_item_id]
+        po_item.quantity_invoiced = po_item.quantity_invoiced + requested_qty
+
+    total_clearing = _ledger_quantize(total_clearing_raw)
+    total_variance = _ledger_quantize(total_variance_raw)
 
     invoice.status = "POSTED"
     invoice.posted_at = datetime.now(UTC)
@@ -632,6 +771,7 @@ def post_purchase_invoice(
             "grand_total": str(invoice.grand_total),
             "clearing_amount": str(total_clearing),
             "price_variance_amount": str(total_variance),
+            "purchase_order_ids": po_ids,
         },
     )
 
@@ -647,17 +787,45 @@ def post_purchase_invoice(
     return invoice
 
 
+def _clearing_and_variance_from_matches(
+    db: Session, purchase_invoice_id: int
+) -> tuple[Decimal, Decimal]:
+    """Reads the EXACT clearing_amount/price_variance_amount posted by a
+    prior post_purchase_invoice call, straight off its own persisted
+    PurchaseInvoiceReceiptMatch rows — used by void_purchase_invoice so a
+    void's reversal is provably the mirror of what was actually posted,
+    never a fresh recomputation (unsafe once OTHER invoices against the
+    same PO items have posted in between)."""
+    rows = db.execute(
+        select(
+            PurchaseInvoiceReceiptMatch.matched_quantity,
+            PurchaseInvoiceReceiptMatch.matched_unit_cost,
+            PurchaseInvoiceLine.unit_price,
+        )
+        .join(
+            PurchaseInvoiceLine,
+            PurchaseInvoiceLine.id == PurchaseInvoiceReceiptMatch.purchase_invoice_line_id,
+        )
+        .where(PurchaseInvoiceLine.purchase_invoice_id == purchase_invoice_id)
+    ).all()
+    total_clearing_raw = Decimal("0")
+    total_variance_raw = Decimal("0")
+    for qty, cost, unit_price in rows:
+        qty = Decimal(qty)
+        cost = Decimal(cost)
+        unit_price = Decimal(unit_price)
+        total_clearing_raw += qty * cost
+        total_variance_raw += qty * (unit_price - cost)
+    return _ledger_quantize(total_clearing_raw), _ledger_quantize(total_variance_raw)
+
+
 def _extract_clearing_and_variance_from_journal(
     db: Session, journal_entry_id: int
 ) -> tuple[Decimal, Decimal]:
-    """Reads the EXACT clearing_amount/price_variance_amount posted by a
-    prior post_purchase_invoice_journal call, straight off its own
-    journal lines — used by void_purchase_invoice so a void's reversal is
-    provably the mirror of what was actually posted, never a fresh
-    recomputation that could disagree with it (e.g. because FIFO receipt-
-    lot consumption order is not safely re-derivable once OTHER invoices
-    against the same PO items have posted in between — see
-    void_purchase_invoice's docstring)."""
+    """Legacy fallback for an invoice POSTED before M7 (no persisted
+    PurchaseInvoiceReceiptMatch rows exist for it) — reads the original
+    posting's own journal lines back instead. See
+    _clearing_and_variance_from_matches for the preferred, M7 path."""
     rows = db.execute(
         select(Account.code, JournalLine.debit, JournalLine.credit)
         .join(Account, Account.id == JournalLine.account_id)
@@ -684,26 +852,19 @@ def void_purchase_invoice(
     reason: str | None = None,
     voided_by: int | None = None,
 ) -> PurchaseInvoice:
-    """Voids a DRAFT (a pure status flip — nothing financial ever
-    happened) or a POSTED-but-unpaid invoice (reverses quantity_invoiced
-    and posts an exact compensating PURCHASE_INVOICE_VOID journal entry,
-    mirroring app.modules.sales.service.void_sale's "void is a real
-    operational undo, not a generic accounting-only reversal" shape).
+    """Voids a DRAFT (a pure status flip) or a POSTED-but-unsettled invoice
+    (amount_paid == 0 AND amount_credited == 0) — reverses
+    quantity_invoiced and posts an exact compensating
+    PURCHASE_INVOICE_VOID journal entry.
 
-    Deliberately scoped to invoices with `amount_paid == 0`
-    (PARTIALLY_PAID/PAID are rejected with INVOICE_HAS_PAYMENTS) — M6
-    does not implement unwinding a supplier payment as part of a void.
-    An invoice a payment has already been recorded against must be
-    corrected through a future credit-note/refund workflow (deferred —
-    see docs/M6_AP_VENDOR_ACCOUNTING.md "Known limitations"), not through
-    this function.
+    Deliberately scoped to invoices with no payments or credits applied
+    (PARTIALLY_PAID/PAID are rejected with INVOICE_HAS_PAYMENTS) — M7 does
+    not implement unwinding a supplier payment or credit note as part of a
+    void (docs/M7_ADVANCED_AP_SETTLEMENT.md "Deferred").
 
-    Locking mirrors post_purchase_invoice: the PurchaseOrder row is
-    locked before touching any of its items' quantity_invoiced, and the
-    invoice's own status is re-checked immediately after acquiring the
-    invoice row's own FOR UPDATE lock (taken first, below) — a racing
-    concurrent void of the SAME invoice is idempotent (second caller sees
-    VOIDED and no-ops)."""
+    Locking mirrors post_purchase_invoice: every PurchaseOrder this
+    invoice's lines touch is locked, in the same ascending-id order, before
+    touching any of their quantity_invoiced."""
     invoice = db.execute(
         select(PurchaseInvoice).where(PurchaseInvoice.id == purchase_invoice_id).with_for_update()
     ).scalar_one_or_none()
@@ -715,40 +876,72 @@ def void_purchase_invoice(
         return invoice
     if invoice.status in ("PARTIALLY_PAID", "PAID"):
         raise ConflictError(
-            f"Purchase invoice {purchase_invoice_id} has payments recorded against it and "
-            "cannot be voided in M6 (deferred: a future credit-note/refund workflow would "
-            "handle this)",
+            f"Purchase invoice {purchase_invoice_id} has payments or credits recorded against "
+            "it and cannot be voided (a future refund workflow would handle this)",
             error_code="INVOICE_HAS_PAYMENTS",
         )
 
     was_posted = invoice.status == "POSTED"
     if was_posted:
-        purchase_order = db.execute(
-            select(PurchaseOrder)
-            .where(PurchaseOrder.id == invoice.purchase_order_id)
-            .with_for_update()
-        ).scalar_one_or_none()
-        if purchase_order is None:
-            raise NotFoundError(f"Purchase order {invoice.purchase_order_id} not found")
+        po_item_ids = sorted({line.purchase_order_item_id for line in invoice.lines})
+        # Scalar-column select, not a full-entity SELECT — see the
+        # identical comment in post_purchase_invoice for why: avoids
+        # pre-populating the identity map with PurchaseOrderItem objects
+        # before the lock below, which would make the later "fresh" read
+        # silently stale.
+        po_ids = sorted(
+            {
+                row[0]
+                for row in db.execute(
+                    select(PurchaseOrderItem.purchase_order_id).where(
+                        PurchaseOrderItem.id.in_(po_item_ids)
+                    )
+                )
+            }
+        )
+        for po_id in po_ids:
+            db.execute(
+                select(PurchaseOrder).where(PurchaseOrder.id == po_id).with_for_update()
+            ).scalar_one_or_none()
 
-        original_journal = db.execute(
-            select(JournalEntry).where(
-                JournalEntry.source_type == "PURCHASE_INVOICE",
-                JournalEntry.source_id == invoice.id,
-            )
-        ).scalar_one_or_none()
-        clearing_amount = Decimal("0")
-        variance_amount = Decimal("0")
-        if original_journal is not None:
-            clearing_amount, variance_amount = _extract_clearing_and_variance_from_journal(
-                db, original_journal.id
-            )
+        has_matches = (
+            db.execute(
+                select(PurchaseInvoiceReceiptMatch.id)
+                .join(
+                    PurchaseInvoiceLine,
+                    PurchaseInvoiceLine.id == PurchaseInvoiceReceiptMatch.purchase_invoice_line_id,
+                )
+                .where(PurchaseInvoiceLine.purchase_invoice_id == invoice.id)
+                .limit(1)
+            ).scalar_one_or_none()
+            is not None
+        )
+        if has_matches:
+            clearing_amount, variance_amount = _clearing_and_variance_from_matches(db, invoice.id)
+        else:
+            original_journal = db.execute(
+                select(JournalEntry).where(
+                    JournalEntry.source_type == "PURCHASE_INVOICE",
+                    JournalEntry.source_id == invoice.id,
+                )
+            ).scalar_one_or_none()
+            clearing_amount = Decimal("0")
+            variance_amount = Decimal("0")
+            if original_journal is not None:
+                clearing_amount, variance_amount = _extract_clearing_and_variance_from_journal(
+                    db, original_journal.id
+                )
 
+        po_items = {
+            item.id: item
+            for item in db.execute(
+                select(PurchaseOrderItem).where(PurchaseOrderItem.id.in_(po_item_ids))
+            ).scalars()
+        }
         for line in invoice.lines:
-            po_item = db.get(PurchaseOrderItem, line.purchase_order_item_id)
-            if po_item is None:
-                raise NotFoundError(f"Purchase order item {line.purchase_order_item_id} not found")
-            po_item.quantity_invoiced = po_item.quantity_invoiced - line.quantity_invoiced
+            po_items[line.purchase_order_item_id].quantity_invoiced = (
+                po_items[line.purchase_order_item_id].quantity_invoiced - line.quantity_invoiced
+            )
 
         accounting_service.post_purchase_invoice_void_journal(
             db,
@@ -779,22 +972,37 @@ def void_purchase_invoice(
     return invoice
 
 
-# --- Supplier payments -------------------------------------------------------
+# --- Supplier payments (M7: header + allocations) ---------------------------
+
+
+@dataclass(frozen=True)
+class PaymentAllocationInput:
+    purchase_invoice_id: int
+    amount: Decimal
 
 
 def _generate_payment_signature(
-    purchase_invoice_id: int, amount: Decimal, payment_method: str
+    supplier_id: int,
+    amount: Decimal,
+    payment_method: str,
+    allocations: list[PaymentAllocationInput],
 ) -> tuple:
-    return (purchase_invoice_id, amount, payment_method)
+    return (
+        supplier_id,
+        amount,
+        payment_method,
+        tuple(sorted((a.purchase_invoice_id, a.amount) for a in allocations)),
+    )
 
 
 def _match_or_reject_idempotent_payment(
     db: Session,
     *,
     client_transaction_id: str,
-    purchase_invoice_id: int,
+    supplier_id: int,
     amount: Decimal,
     payment_method: str,
+    allocations: list[PaymentAllocationInput],
 ) -> SupplierPayment | None:
     existing = db.execute(
         select(SupplierPayment).where(
@@ -803,10 +1011,24 @@ def _match_or_reject_idempotent_payment(
     ).scalar_one_or_none()
     if existing is None:
         return None
-    existing_signature = _generate_payment_signature(
-        existing.purchase_invoice_id, existing.amount, existing.payment_method
+    existing_allocations = (
+        db.execute(
+            select(SupplierPaymentAllocation).where(
+                SupplierPaymentAllocation.supplier_payment_id == existing.id
+            )
+        )
+        .scalars()
+        .all()
     )
-    requested_signature = _generate_payment_signature(purchase_invoice_id, amount, payment_method)
+    existing_signature = (
+        existing.supplier_id,
+        existing.amount,
+        existing.payment_method,
+        tuple(sorted((a.purchase_invoice_id, a.amount) for a in existing_allocations)),
+    )
+    requested_signature = _generate_payment_signature(
+        supplier_id, amount, payment_method, allocations
+    )
     if existing_signature != requested_signature:
         raise ConflictError(
             f"client_transaction_id {client_transaction_id!r} was already used for a "
@@ -819,95 +1041,133 @@ def _match_or_reject_idempotent_payment(
 def record_supplier_payment(
     db: Session,
     *,
-    purchase_invoice_id: int,
     store_id: int,
+    supplier_id: int,
     payment_date: date,
     payment_method: str,
     amount: Decimal,
+    allocations: list[PaymentAllocationInput],
     client_transaction_id: str,
     caller_store_id: int | None,
     reference: str | None = None,
     created_by: int | None = None,
 ) -> SupplierPayment:
-    """Atomically: idempotency fast path -> validate -> lock the
-    PurchaseInvoice row -> idempotency re-check (post-lock; see this
-    module's create_purchase_invoice docstring and
-    docs/M5_RETURNS_VOIDS_REFUNDS.md Section 11 for why this second check
-    is not redundant under a genuine concurrent race) -> validate
-    invoice state and payment amount -> apply -> audit -> post accounting
-    -> return (caller commits).
+    """Atomically: idempotency fast path -> validate -> lock every
+    allocated PurchaseInvoice (ascending id order — the same deterministic
+    ordering post_purchase_invoice/void_purchase_invoice use for
+    PurchaseOrder locks, for the same deadlock-avoidance reason) ->
+    idempotency re-check (post-lock) -> validate invoice states/amounts ->
+    apply -> audit -> post ONE accounting journal for the payment's whole
+    amount -> return (caller commits).
 
-    Overpayment is rejected outright (ConflictError, error_code=
-    OVERPAYMENT) rather than silently accepted or capped — M6 does not
-    implement a supplier-credit/advance model (M6 task Section 8: "If
-    overpayments/advances are deferred, reject them explicitly")."""
+    M7 (docs/M7_ADVANCED_AP_SETTLEMENT.md Section 8/9/13): `allocations`
+    may name several invoices (one payment settling multiple invoices) and
+    an invoice may already carry other payments (the M6
+    one-payment-per-invoice limit is gone). `allocations` must sum to
+    EXACTLY `amount` — an unapplied remainder is rejected outright
+    (ALLOCATION_MUST_EQUAL_PAYMENT_AMOUNT), not modeled as an advance (see
+    the design doc's "Deferred" section for why). Any single allocation
+    exceeding its invoice's own outstanding balance is still rejected as
+    OVERPAYMENT, exactly as M6 did at the whole-payment level."""
     if payment_method not in SUPPLIER_PAYMENT_METHODS:
         raise ValidationAppError(
             f"Invalid payment method {payment_method!r}", error_code="INVALID_PAYMENT_METHOD"
         )
     if amount <= 0:
         raise ValidationAppError("Payment amount must be positive", error_code="INVALID_AMOUNT")
-
-    existing = _match_or_reject_idempotent_payment(
-        db,
-        client_transaction_id=client_transaction_id,
-        purchase_invoice_id=purchase_invoice_id,
-        amount=amount,
-        payment_method=payment_method,
-    )
-    if existing is not None:
-        return existing
-
-    if caller_store_id is not None:
-        actual_store_id = db.execute(
-            select(PurchaseInvoice.store_id).where(PurchaseInvoice.id == purchase_invoice_id)
-        ).scalar_one_or_none()
-        if actual_store_id is not None and actual_store_id != caller_store_id:
-            raise ForbiddenError(
-                f"Your account is scoped to store {caller_store_id} and cannot pay an "
-                f"invoice in store {actual_store_id}",
-                error_code="STORE_ACCESS_DENIED",
+    if not allocations:
+        raise ValidationAppError(
+            "A payment must allocate to at least one invoice", error_code="EMPTY_ALLOCATIONS"
+        )
+    invoice_ids = [a.purchase_invoice_id for a in allocations]
+    if len(set(invoice_ids)) != len(invoice_ids):
+        raise ValidationAppError(
+            "A payment cannot allocate to the same invoice twice",
+            error_code="DUPLICATE_ALLOCATION_TARGET",
+        )
+    for allocation in allocations:
+        if allocation.amount <= 0:
+            raise ValidationAppError(
+                "Each allocation amount must be positive", error_code="INVALID_AMOUNT"
             )
-
-    invoice = db.execute(
-        select(PurchaseInvoice).where(PurchaseInvoice.id == purchase_invoice_id).with_for_update()
-    ).scalar_one_or_none()
-    if invoice is None:
-        raise NotFoundError(f"Purchase invoice {purchase_invoice_id} not found")
+    allocation_total = sum((a.amount for a in allocations), Decimal("0"))
+    if allocation_total != amount:
+        raise ValidationAppError(
+            f"Allocations sum to {allocation_total} but the payment amount is {amount} — "
+            "an unapplied remainder is not supported",
+            error_code="ALLOCATION_MUST_EQUAL_PAYMENT_AMOUNT",
+        )
 
     existing = _match_or_reject_idempotent_payment(
         db,
         client_transaction_id=client_transaction_id,
-        purchase_invoice_id=purchase_invoice_id,
+        supplier_id=supplier_id,
         amount=amount,
         payment_method=payment_method,
+        allocations=allocations,
     )
     if existing is not None:
         return existing
 
-    if invoice.store_id != store_id:
-        raise ConflictError(
-            f"Purchase invoice {purchase_invoice_id} does not belong to store {store_id}",
-            error_code="STORE_MISMATCH",
+    _enforce_store_access(caller_store_id, store_id, "supplier payments")
+
+    sorted_invoice_ids = sorted(set(invoice_ids))
+    invoices = (
+        db.execute(
+            select(PurchaseInvoice)
+            .where(PurchaseInvoice.id.in_(sorted_invoice_ids))
+            .order_by(PurchaseInvoice.id)
+            .with_for_update()
         )
-    if invoice.status not in ("POSTED", "PARTIALLY_PAID"):
-        raise ConflictError(
-            f"Purchase invoice {purchase_invoice_id} is {invoice.status} and cannot accept a "
-            "payment (must be POSTED or PARTIALLY_PAID)",
-            error_code="INVALID_INVOICE_STATE",
-        )
-    remaining = invoice.grand_total - invoice.amount_paid
-    if amount > remaining:
-        raise ConflictError(
-            f"Payment of {amount} exceeds the outstanding balance of {remaining} on purchase "
-            f"invoice {purchase_invoice_id}",
-            error_code="OVERPAYMENT",
-        )
+        .scalars()
+        .all()
+    )
+    invoices_by_id = {inv.id: inv for inv in invoices}
+
+    existing = _match_or_reject_idempotent_payment(
+        db,
+        client_transaction_id=client_transaction_id,
+        supplier_id=supplier_id,
+        amount=amount,
+        payment_method=payment_method,
+        allocations=allocations,
+    )
+    if existing is not None:
+        return existing
+
+    missing_ids = set(sorted_invoice_ids) - set(invoices_by_id)
+    if missing_ids:
+        raise NotFoundError(f"Purchase invoice(s) {sorted(missing_ids)} not found")
+
+    for allocation in allocations:
+        invoice = invoices_by_id[allocation.purchase_invoice_id]
+        if invoice.store_id != store_id:
+            raise ConflictError(
+                f"Purchase invoice {invoice.id} does not belong to store {store_id}",
+                error_code="STORE_MISMATCH",
+            )
+        if invoice.supplier_id != supplier_id:
+            raise ConflictError(
+                f"Purchase invoice {invoice.id} does not belong to supplier {supplier_id}",
+                error_code="SUPPLIER_MISMATCH",
+            )
+        if invoice.status not in _OUTSTANDING_INVOICE_STATUSES:
+            raise ConflictError(
+                f"Purchase invoice {invoice.id} is {invoice.status} and cannot accept a "
+                "payment (must be POSTED or PARTIALLY_PAID)",
+                error_code="INVALID_INVOICE_STATE",
+            )
+        remaining = _outstanding_balance(invoice)
+        if allocation.amount > remaining:
+            raise ConflictError(
+                f"Allocation of {allocation.amount} to purchase invoice {invoice.id} exceeds "
+                f"its outstanding balance of {remaining}",
+                error_code="OVERPAYMENT",
+            )
 
     payment = SupplierPayment(
         store_id=store_id,
-        supplier_id=invoice.supplier_id,
-        purchase_invoice_id=purchase_invoice_id,
+        supplier_id=supplier_id,
         payment_date=payment_date,
         payment_method=payment_method,
         amount=amount,
@@ -929,8 +1189,17 @@ def record_supplier_payment(
             raise
         return winner
 
-    invoice.amount_paid = invoice.amount_paid + amount
-    invoice.status = "PAID" if invoice.amount_paid == invoice.grand_total else "PARTIALLY_PAID"
+    for allocation in allocations:
+        invoice = invoices_by_id[allocation.purchase_invoice_id]
+        db.add(
+            SupplierPaymentAllocation(
+                supplier_payment_id=payment.id,
+                purchase_invoice_id=invoice.id,
+                amount=allocation.amount,
+            )
+        )
+        invoice.amount_paid = invoice.amount_paid + allocation.amount
+        _recompute_invoice_status(invoice)
 
     audit_service.log_event(
         db,
@@ -939,15 +1208,21 @@ def record_supplier_payment(
         entity_type="supplier_payment",
         entity_id=payment.id,
         after={
-            "purchase_invoice_id": purchase_invoice_id,
+            "supplier_id": supplier_id,
             "amount": str(amount),
             "payment_method": payment_method,
-            "resulting_invoice_status": invoice.status,
+            "allocations": [
+                {"purchase_invoice_id": a.purchase_invoice_id, "amount": str(a.amount)}
+                for a in allocations
+            ],
         },
     )
 
     accounting_service.post_supplier_payment_journal(
-        db, supplier_payment=payment, created_by=created_by
+        db,
+        supplier_payment=payment,
+        allocated_invoice_ids=sorted_invoice_ids,
+        created_by=created_by,
     )
 
     db.flush()
@@ -959,6 +1234,20 @@ def get_supplier_payment(db: Session, supplier_payment_id: int) -> SupplierPayme
     if payment is None:
         raise NotFoundError(f"Supplier payment {supplier_payment_id} not found")
     return payment
+
+
+def get_payment_allocations(
+    db: Session, supplier_payment_id: int
+) -> list[SupplierPaymentAllocation]:
+    return list(
+        db.execute(
+            select(SupplierPaymentAllocation)
+            .where(SupplierPaymentAllocation.supplier_payment_id == supplier_payment_id)
+            .order_by(SupplierPaymentAllocation.id)
+        )
+        .scalars()
+        .all()
+    )
 
 
 def list_supplier_payments(
@@ -981,32 +1270,420 @@ def list_supplier_payments(
     if supplier_id is not None:
         query = query.where(SupplierPayment.supplier_id == supplier_id)
     if purchase_invoice_id is not None:
-        query = query.where(SupplierPayment.purchase_invoice_id == purchase_invoice_id)
+        query = query.join(
+            SupplierPaymentAllocation,
+            SupplierPaymentAllocation.supplier_payment_id == SupplierPayment.id,
+        ).where(SupplierPaymentAllocation.purchase_invoice_id == purchase_invoice_id)
+    return list(db.execute(query).scalars().all())
+
+
+# --- Supplier credit notes (M7) ----------------------------------------------
+
+
+@dataclass(frozen=True)
+class SupplierCreditNoteLineInput:
+    description: str
+    amount: Decimal
+    product_id: int | None = None
+    quantity: Decimal | None = None
+    unit_cost: Decimal | None = None
+
+
+def _generate_credit_note_signature(
+    supplier_id: int,
+    credit_number: str,
+    reason: str,
+    lines: list[SupplierCreditNoteLineInput],
+    allocations: list[PaymentAllocationInput],
+) -> tuple:
+    return (
+        supplier_id,
+        credit_number,
+        reason,
+        tuple(sorted((line.description, line.amount) for line in lines)),
+        tuple(sorted((a.purchase_invoice_id, a.amount) for a in allocations)),
+    )
+
+
+def _match_or_reject_idempotent_credit_note(
+    db: Session,
+    *,
+    client_transaction_id: str,
+    supplier_id: int,
+    credit_number: str,
+    reason: str,
+    lines: list[SupplierCreditNoteLineInput],
+    allocations: list[PaymentAllocationInput],
+) -> SupplierCreditNote | None:
+    existing = db.execute(
+        select(SupplierCreditNote).where(
+            SupplierCreditNote.client_transaction_id == client_transaction_id
+        )
+    ).scalar_one_or_none()
+    if existing is None:
+        return None
+    existing_lines = (
+        db.execute(
+            select(SupplierCreditNoteLine).where(
+                SupplierCreditNoteLine.supplier_credit_note_id == existing.id
+            )
+        )
+        .scalars()
+        .all()
+    )
+    existing_allocations = (
+        db.execute(
+            select(SupplierCreditAllocation).where(
+                SupplierCreditAllocation.supplier_credit_note_id == existing.id
+            )
+        )
+        .scalars()
+        .all()
+    )
+    existing_signature = (
+        existing.supplier_id,
+        existing.credit_number,
+        existing.reason,
+        tuple(sorted((line.description, line.amount) for line in existing_lines)),
+        tuple(sorted((a.purchase_invoice_id, a.amount) for a in existing_allocations)),
+    )
+    requested_signature = _generate_credit_note_signature(
+        supplier_id, credit_number, reason, lines, allocations
+    )
+    if existing_signature != requested_signature:
+        raise ConflictError(
+            f"client_transaction_id {client_transaction_id!r} was already used for a "
+            "different credit note request",
+            error_code="IDEMPOTENCY_KEY_CONFLICT",
+        )
+    return existing
+
+
+def create_supplier_credit_note(
+    db: Session,
+    *,
+    store_id: int,
+    supplier_id: int,
+    credit_number: str,
+    credit_date: date,
+    reason: str,
+    lines: list[SupplierCreditNoteLineInput],
+    allocations: list[PaymentAllocationInput],
+    client_transaction_id: str,
+    caller_store_id: int | None,
+    purchase_return_id: int | None = None,
+    notes: str | None = None,
+    created_by: int | None = None,
+) -> SupplierCreditNote:
+    """Creates AND fully applies a supplier credit note in one atomic,
+    single-step transaction — there is no DRAFT state (unlike an invoice,
+    a credit note requires no matching decision) and no unapplied-credit
+    balance (`allocations` must sum to exactly the credit's total —
+    docs/M7_ADVANCED_AP_SETTLEMENT.md Section 14). Once created, a credit
+    note's financial values are immutable; M7 implements no void for it
+    (see the design doc's "Deferred" section).
+
+    `reason` determines the accounting treatment
+    (docs/M7_ADVANCED_AP_SETTLEMENT.md Section 13):
+    - GOODS_RETURN: requires `purchase_return_id` (the physical return
+      this credit corresponds to — the quantity movement itself was
+      already recorded by that PurchaseReturn; this only accounts for the
+      AP-side financial consequence). Posts Dr AP / Cr Inventory.
+    - COMMERCIAL_DISCOUNT: requires NO purchase_return_id (nothing
+      physically moved). Posts Dr AP / Cr Purchase Discounts.
+
+    Locking mirrors record_supplier_payment exactly: every allocated
+    PurchaseInvoice is locked in ascending id order."""
+    if reason not in SUPPLIER_CREDIT_NOTE_REASONS:
+        raise ValidationAppError(
+            f"Invalid credit note reason {reason!r}", error_code="INVALID_CREDIT_REASON"
+        )
+    if reason == "GOODS_RETURN" and purchase_return_id is None:
+        raise ValidationAppError(
+            "A GOODS_RETURN credit note must reference the purchase_return_id it corresponds to",
+            error_code="MISSING_PURCHASE_RETURN_REFERENCE",
+        )
+    if reason == "COMMERCIAL_DISCOUNT" and purchase_return_id is not None:
+        raise ValidationAppError(
+            "A COMMERCIAL_DISCOUNT credit note must not reference a purchase return — nothing "
+            "physically moved",
+            error_code="UNEXPECTED_PURCHASE_RETURN_REFERENCE",
+        )
+    if not credit_number.strip():
+        raise ValidationAppError("Credit number is required", error_code="INVALID_CREDIT_NUMBER")
+    if not lines:
+        raise ValidationAppError(
+            "A credit note must have at least one line", error_code="EMPTY_CREDIT_NOTE"
+        )
+    for line in lines:
+        if line.amount <= 0:
+            raise ValidationAppError(
+                "Each credit note line amount must be positive", error_code="INVALID_AMOUNT"
+            )
+    if not allocations:
+        raise ValidationAppError(
+            "A credit note must allocate to at least one invoice", error_code="EMPTY_ALLOCATIONS"
+        )
+    invoice_ids = [a.purchase_invoice_id for a in allocations]
+    if len(set(invoice_ids)) != len(invoice_ids):
+        raise ValidationAppError(
+            "A credit note cannot allocate to the same invoice twice",
+            error_code="DUPLICATE_ALLOCATION_TARGET",
+        )
+    for allocation in allocations:
+        if allocation.amount <= 0:
+            raise ValidationAppError(
+                "Each allocation amount must be positive", error_code="INVALID_AMOUNT"
+            )
+
+    existing = _match_or_reject_idempotent_credit_note(
+        db,
+        client_transaction_id=client_transaction_id,
+        supplier_id=supplier_id,
+        credit_number=credit_number,
+        reason=reason,
+        lines=lines,
+        allocations=allocations,
+    )
+    if existing is not None:
+        return existing
+
+    _enforce_store_access(caller_store_id, store_id, "supplier credit notes")
+
+    store = db.get(Store, store_id)
+    if store is None or not store.is_active:
+        raise NotFoundError(f"Store {store_id} not found")
+    supplier = db.get(Supplier, supplier_id)
+    if supplier is None or not supplier.is_active:
+        raise ValidationAppError(
+            f"Supplier {supplier_id} does not exist or is inactive", error_code="INVALID_SUPPLIER"
+        )
+
+    grand_total = sum((line.amount for line in lines), Decimal("0"))
+    allocation_total = sum((a.amount for a in allocations), Decimal("0"))
+    if allocation_total != grand_total:
+        raise ValidationAppError(
+            f"Allocations sum to {allocation_total} but the credit note total is {grand_total} "
+            "— an unapplied remainder is not supported",
+            error_code="ALLOCATION_MUST_EQUAL_CREDIT_AMOUNT",
+        )
+
+    if purchase_return_id is not None:
+        purchase_return = db.get(PurchaseReturn, purchase_return_id)
+        if purchase_return is None:
+            raise NotFoundError(f"Purchase return {purchase_return_id} not found")
+        if purchase_return.store_id != store_id:
+            raise ConflictError(
+                f"Purchase return {purchase_return_id} does not belong to store {store_id}",
+                error_code="STORE_MISMATCH",
+            )
+        po = db.get(PurchaseOrder, purchase_return.purchase_order_id)
+        if po is None or po.supplier_id != supplier_id:
+            raise ConflictError(
+                f"Purchase return {purchase_return_id} does not belong to supplier "
+                f"{supplier_id}",
+                error_code="SUPPLIER_MISMATCH",
+            )
+        return_value = sum(
+            (item.quantity * item.unit_cost for item in purchase_return.items), Decimal("0")
+        )
+        if grand_total > return_value:
+            raise ConflictError(
+                f"Credit note total {grand_total} exceeds purchase return {purchase_return_id}'s "
+                f"own value of {return_value}",
+                error_code="CREDIT_EXCEEDS_RETURN_VALUE",
+            )
+
+    sorted_invoice_ids = sorted(set(invoice_ids))
+    invoices = (
+        db.execute(
+            select(PurchaseInvoice)
+            .where(PurchaseInvoice.id.in_(sorted_invoice_ids))
+            .order_by(PurchaseInvoice.id)
+            .with_for_update()
+        )
+        .scalars()
+        .all()
+    )
+    invoices_by_id = {inv.id: inv for inv in invoices}
+
+    existing = _match_or_reject_idempotent_credit_note(
+        db,
+        client_transaction_id=client_transaction_id,
+        supplier_id=supplier_id,
+        credit_number=credit_number,
+        reason=reason,
+        lines=lines,
+        allocations=allocations,
+    )
+    if existing is not None:
+        return existing
+
+    missing_ids = set(sorted_invoice_ids) - set(invoices_by_id)
+    if missing_ids:
+        raise NotFoundError(f"Purchase invoice(s) {sorted(missing_ids)} not found")
+
+    for allocation in allocations:
+        invoice = invoices_by_id[allocation.purchase_invoice_id]
+        if invoice.store_id != store_id:
+            raise ConflictError(
+                f"Purchase invoice {invoice.id} does not belong to store {store_id}",
+                error_code="STORE_MISMATCH",
+            )
+        if invoice.supplier_id != supplier_id:
+            raise ConflictError(
+                f"Purchase invoice {invoice.id} does not belong to supplier {supplier_id}",
+                error_code="SUPPLIER_MISMATCH",
+            )
+        if invoice.status not in _OUTSTANDING_INVOICE_STATUSES:
+            raise ConflictError(
+                f"Purchase invoice {invoice.id} is {invoice.status} and cannot accept a "
+                "credit (must be POSTED or PARTIALLY_PAID)",
+                error_code="INVALID_INVOICE_STATE",
+            )
+        remaining = _outstanding_balance(invoice)
+        if allocation.amount > remaining:
+            raise ConflictError(
+                f"Allocation of {allocation.amount} to purchase invoice {invoice.id} exceeds "
+                f"its outstanding balance of {remaining}",
+                error_code="OVER_ALLOCATION",
+            )
+
+    credit_note = SupplierCreditNote(
+        store_id=store_id,
+        supplier_id=supplier_id,
+        credit_number=credit_number,
+        credit_date=credit_date,
+        reason=reason,
+        purchase_return_id=purchase_return_id,
+        grand_total=grand_total,
+        amount_allocated=Decimal("0"),
+        client_transaction_id=client_transaction_id,
+        notes=notes,
+        created_by=created_by,
+    )
+    db.add(credit_note)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        constraint = getattr(getattr(exc.orig, "diag", None), "constraint_name", None)
+        if constraint == "uq_supplier_credit_notes_supplier_credit_number":
+            raise ConflictError(
+                f"Supplier {supplier_id} already has a credit note numbered {credit_number!r}",
+                error_code="DUPLICATE_SUPPLIER_CREDIT_NUMBER",
+            ) from exc
+        winner = db.execute(
+            select(SupplierCreditNote).where(
+                SupplierCreditNote.client_transaction_id == client_transaction_id
+            )
+        ).scalar_one_or_none()
+        if winner is None:
+            raise
+        return winner
+
+    for line in lines:
+        db.add(
+            SupplierCreditNoteLine(
+                supplier_credit_note_id=credit_note.id,
+                product_id=line.product_id,
+                description=line.description,
+                quantity=line.quantity,
+                unit_cost=line.unit_cost,
+                amount=line.amount,
+            )
+        )
+
+    for allocation in allocations:
+        invoice = invoices_by_id[allocation.purchase_invoice_id]
+        db.add(
+            SupplierCreditAllocation(
+                supplier_credit_note_id=credit_note.id,
+                purchase_invoice_id=invoice.id,
+                amount=allocation.amount,
+            )
+        )
+        invoice.amount_credited = invoice.amount_credited + allocation.amount
+        _recompute_invoice_status(invoice)
+
+    credit_note.amount_allocated = grand_total
+
+    audit_service.log_event(
+        db,
+        user_id=created_by,
+        action="SUPPLIER_CREDIT_NOTE_CREATED",
+        entity_type="supplier_credit_note",
+        entity_id=credit_note.id,
+        after={
+            "supplier_id": supplier_id,
+            "reason": reason,
+            "grand_total": str(grand_total),
+            "purchase_return_id": purchase_return_id,
+            "allocations": [
+                {"purchase_invoice_id": a.purchase_invoice_id, "amount": str(a.amount)}
+                for a in allocations
+            ],
+        },
+    )
+
+    accounting_service.post_supplier_credit_note_journal(
+        db, credit_note=credit_note, created_by=created_by
+    )
+
+    db.flush()
+    return credit_note
+
+
+def get_supplier_credit_note(db: Session, supplier_credit_note_id: int) -> SupplierCreditNote:
+    credit_note = db.get(SupplierCreditNote, supplier_credit_note_id)
+    if credit_note is None:
+        raise NotFoundError(f"Supplier credit note {supplier_credit_note_id} not found")
+    return credit_note
+
+
+def list_supplier_credit_notes(
+    db: Session,
+    *,
+    store_id: int | None = None,
+    supplier_id: int | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[SupplierCreditNote]:
+    query = (
+        select(SupplierCreditNote)
+        .order_by(SupplierCreditNote.credit_date.desc(), SupplierCreditNote.id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    if store_id is not None:
+        query = query.where(SupplierCreditNote.store_id == store_id)
+    if supplier_id is not None:
+        query = query.where(SupplierCreditNote.supplier_id == supplier_id)
     return list(db.execute(query).scalars().all())
 
 
 # --- AP subledger / reporting ------------------------------------------------
 
-_OUTSTANDING_INVOICE_STATUSES = ("POSTED", "PARTIALLY_PAID")
-
 
 @dataclass(frozen=True)
 class SupplierApSummary:
     supplier_id: int
-    total_owed: Decimal  # Σ (grand_total - amount_paid) across POSTED/PARTIALLY_PAID invoices
+    total_owed: Decimal  # Σ outstanding balance across POSTED/PARTIALLY_PAID invoices
     total_overdue: Decimal  # the portion of total_owed whose due_date has passed
     total_current: Decimal  # total_owed - total_overdue
     total_paid: Decimal  # Σ amount_paid across every invoice ever (lifetime)
+    total_credited: Decimal  # Σ amount_credited across every invoice ever (lifetime)
     outstanding_purchase_clearing: Decimal  # received, not yet invoiced, across this supplier's POs
 
 
 def get_supplier_ap_summary(
     db: Session, supplier_id: int, *, as_of: date | None = None
 ) -> SupplierApSummary:
-    """Answers the M6 task Section 7 checklist for one supplier. Every
-    figure here is derived directly from PurchaseInvoice/SupplierPayment
-    rows (the AP subledger) — never from a separately-maintained running
-    total, so it always reconciles to what the rows actually say."""
+    """Answers the M6/M7 task checklist for one supplier. Every figure
+    here is derived directly from PurchaseInvoice/SupplierPayment/
+    SupplierCreditNote rows (the AP subledger) — never from a separately-
+    maintained running total, so it always reconciles to what the rows
+    actually say."""
     as_of = as_of or date.today()
     invoices = list(
         db.execute(select(PurchaseInvoice).where(PurchaseInvoice.supplier_id == supplier_id))
@@ -1016,10 +1693,12 @@ def get_supplier_ap_summary(
     total_owed = Decimal("0")
     total_overdue = Decimal("0")
     total_paid = Decimal("0")
+    total_credited = Decimal("0")
     for invoice in invoices:
         total_paid += invoice.amount_paid
+        total_credited += invoice.amount_credited
         if invoice.status in _OUTSTANDING_INVOICE_STATUSES:
-            balance = invoice.grand_total - invoice.amount_paid
+            balance = _outstanding_balance(invoice)
             total_owed += balance
             if invoice.due_date < as_of:
                 total_overdue += balance
@@ -1048,13 +1727,14 @@ def get_supplier_ap_summary(
         total_overdue=total_overdue,
         total_current=total_current,
         total_paid=total_paid,
+        total_credited=total_credited,
         outstanding_purchase_clearing=outstanding_clearing,
     )
 
 
 @dataclass(frozen=True)
 class SupplierTransaction:
-    transaction_type: str  # "INVOICE" or "PAYMENT"
+    transaction_type: str  # "INVOICE", "PAYMENT", or "CREDIT_NOTE"
     id: int
     date_: date
     reference: str
@@ -1073,29 +1753,163 @@ def get_supplier_transaction_history(db: Session, supplier_id: int) -> list[Supp
         .scalars()
         .all()
     )
-    transactions = [
-        SupplierTransaction(
-            transaction_type="INVOICE",
-            id=inv.id,
-            date_=inv.invoice_date,
-            reference=inv.invoice_number,
-            amount=inv.grand_total,
-            status=inv.status,
-        )
-        for inv in invoices
-    ] + [
-        SupplierTransaction(
-            transaction_type="PAYMENT",
-            id=pay.id,
-            date_=pay.payment_date,
-            reference=pay.reference or f"Payment {pay.id}",
-            amount=pay.amount,
-            status="RECORDED",
-        )
-        for pay in payments
-    ]
+    credit_notes = (
+        db.execute(select(SupplierCreditNote).where(SupplierCreditNote.supplier_id == supplier_id))
+        .scalars()
+        .all()
+    )
+    transactions = (
+        [
+            SupplierTransaction(
+                transaction_type="INVOICE",
+                id=inv.id,
+                date_=inv.invoice_date,
+                reference=inv.invoice_number,
+                amount=inv.grand_total,
+                status=inv.status,
+            )
+            for inv in invoices
+        ]
+        + [
+            SupplierTransaction(
+                transaction_type="PAYMENT",
+                id=pay.id,
+                date_=pay.payment_date,
+                reference=pay.reference or f"Payment {pay.id}",
+                amount=pay.amount,
+                status="RECORDED",
+            )
+            for pay in payments
+        ]
+        + [
+            SupplierTransaction(
+                transaction_type="CREDIT_NOTE",
+                id=cn.id,
+                date_=cn.credit_date,
+                reference=cn.credit_number,
+                amount=cn.grand_total,
+                status="APPLIED",
+            )
+            for cn in credit_notes
+        ]
+    )
     transactions.sort(key=lambda t: (t.date_, t.id))
     return transactions
+
+
+@dataclass(frozen=True)
+class SupplierStatementLine:
+    date_: date
+    transaction_type: str  # INVOICE | PAYMENT | CREDIT_NOTE
+    reference: str
+    amount: Decimal  # signed effect on the balance owed to the supplier
+    running_balance: Decimal
+
+
+@dataclass(frozen=True)
+class SupplierStatement:
+    supplier_id: int
+    date_from: date | None
+    date_to: date | None
+    opening_balance: Decimal
+    lines: list[SupplierStatementLine]
+    closing_balance: Decimal
+
+
+def get_supplier_statement(
+    db: Session,
+    supplier_id: int,
+    *,
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> SupplierStatement:
+    """A chronological reconstruction of the supplier balance from
+    invoices/payments/credit-notes — never from a cached total
+    (docs/M7_ADVANCED_AP_SETTLEMENT.md Section 16). With no date filters,
+    `closing_balance` equals `get_supplier_ap_summary(...).total_owed`
+    exactly (proven in tests): every invoice's amount_paid/amount_credited
+    is itself the sum of allocations from these SAME payments/credit
+    notes, so summing (Σ non-draft/voided invoice grand_totals) - (Σ
+    payments) - (Σ credit notes) telescopes to (Σ outstanding invoice
+    balances)."""
+    invoices = (
+        db.execute(
+            select(PurchaseInvoice).where(
+                PurchaseInvoice.supplier_id == supplier_id,
+                PurchaseInvoice.status.notin_(_NON_ACCOUNTING_INVOICE_STATUSES),
+            )
+        )
+        .scalars()
+        .all()
+    )
+    payments = (
+        db.execute(select(SupplierPayment).where(SupplierPayment.supplier_id == supplier_id))
+        .scalars()
+        .all()
+    )
+    credit_notes = (
+        db.execute(select(SupplierCreditNote).where(SupplierCreditNote.supplier_id == supplier_id))
+        .scalars()
+        .all()
+    )
+
+    # The tiebreaker for same-day events CANNOT be each row's own primary
+    # key: PurchaseInvoice/SupplierPayment/SupplierCreditNote are three
+    # independent auto-increment sequences, so comparing their raw `id`
+    # values across tables is meaningless (a live smoke test caught this
+    # producing a nonsensical statement order — credit note before the
+    # payment before the invoice it was created against, purely because
+    # that table's sequence happened to start lower). `created_at` (real
+    # insertion order, from TimestampMixin on every one of these models)
+    # is the only value that actually orders same-day events correctly.
+    events: list[tuple[date, str, str, Decimal, datetime]] = (
+        [
+            (inv.invoice_date, "INVOICE", inv.invoice_number, inv.grand_total, inv.created_at)
+            for inv in invoices
+        ]
+        + [
+            (pay.payment_date, "PAYMENT", f"Payment {pay.id}", -pay.amount, pay.created_at)
+            for pay in payments
+        ]
+        + [
+            (cn.credit_date, "CREDIT_NOTE", cn.credit_number, -cn.grand_total, cn.created_at)
+            for cn in credit_notes
+        ]
+    )
+    events.sort(key=lambda e: (e[0], e[4]))
+
+    opening_balance = Decimal("0")
+    in_range: list[tuple[date, str, str, Decimal, datetime]] = []
+    for event_date, ttype, reference, amount, created_at in events:
+        if date_from is not None and event_date < date_from:
+            opening_balance += amount
+            continue
+        if date_to is not None and event_date > date_to:
+            continue
+        in_range.append((event_date, ttype, reference, amount, created_at))
+
+    running = opening_balance
+    lines: list[SupplierStatementLine] = []
+    for event_date, ttype, reference, amount, _created_at in in_range:
+        running += amount
+        lines.append(
+            SupplierStatementLine(
+                date_=event_date,
+                transaction_type=ttype,
+                reference=reference,
+                amount=amount,
+                running_balance=running,
+            )
+        )
+
+    return SupplierStatement(
+        supplier_id=supplier_id,
+        date_from=date_from,
+        date_to=date_to,
+        opening_balance=opening_balance,
+        lines=lines,
+        closing_balance=running,
+    )
 
 
 @dataclass(frozen=True)
@@ -1114,7 +1928,9 @@ def ap_aging(
 ) -> list[ApAgingRow]:
     """Standard aging buckets (current / 1-30 / 31-60 / 61-90 / 90+ days
     past due_date) for every outstanding (POSTED/PARTIALLY_PAID) invoice,
-    grouped by supplier."""
+    grouped by supplier. The bucketed balance is `_outstanding_balance`
+    (grand_total - amount_paid - amount_credited) — a credit note reduces
+    an invoice's aged balance exactly like a payment does."""
     as_of = as_of or date.today()
     query = select(PurchaseInvoice).where(PurchaseInvoice.status.in_(_OUTSTANDING_INVOICE_STATUSES))
     if store_id is not None:
@@ -1123,7 +1939,7 @@ def ap_aging(
 
     buckets: dict[int, dict[str, Decimal]] = {}
     for invoice in invoices:
-        balance = invoice.grand_total - invoice.amount_paid
+        balance = _outstanding_balance(invoice)
         if balance <= 0:
             continue
         row = buckets.setdefault(
@@ -1172,15 +1988,9 @@ class ApReconciliationRow:
 
 def ap_reconciliation(db: Session, *, store_id: int | None = None) -> ApReconciliationRow:
     """Compares the Accounts Payable GL control-account balance against
-    the AP subledger total (Σ outstanding invoice balances) — the M6
-    task Section 7/20 financial-control requirement, same shape as
-    accounting.service.inventory_reconciliation. Expected to match
-    exactly: every SupplierPayment reduces both the invoice's own
-    amount_paid AND posts the identical amount to the AP account, and
-    every posted invoice's grand_total is exactly what gets credited to
-    AP (post_purchase_invoice_journal derives the AP credit directly from
-    the invoice's own stored grand_total — never a separately-computed
-    value)."""
+    the AP subledger total (Σ outstanding invoice balances, now net of
+    both payments AND credit notes) — unchanged mechanism from M6, same
+    shape as accounting.service.inventory_reconciliation."""
     rows = accounting_service.trial_balance(db, store_id=store_id)
     ap_row = next((r for r in rows if r.account_code == ACCOUNT_ACCOUNTS_PAYABLE), None)
     gl_balance = (ap_row.total_credit - ap_row.total_debit) if ap_row else Decimal("0")
@@ -1189,7 +1999,7 @@ def ap_reconciliation(db: Session, *, store_id: int | None = None) -> ApReconcil
     if store_id is not None:
         query = query.where(PurchaseInvoice.store_id == store_id)
     subledger_total = sum(
-        (invoice.grand_total - invoice.amount_paid for invoice in db.execute(query).scalars()),
+        (_outstanding_balance(invoice) for invoice in db.execute(query).scalars()),
         Decimal("0"),
     )
     return ApReconciliationRow(
@@ -1213,10 +2023,9 @@ def purchase_clearing_reconciliation(
 ) -> PurchaseClearingReconciliationRow:
     """Compares the Purchase Clearing GL balance against the sum, across
     every PurchaseOrderItem (optionally scoped to one store), of the
-    FIFO-priced value still received-but-not-invoiced
-    (docs/M6_AP_VENDOR_ACCOUNTING.md 'Purchase Clearing lifecycle') — the
-    M6 task Section 5/20 "no orphan clearing balances" requirement made
-    checkable."""
+    FIFO-priced value still received-but-not-invoiced — unchanged from M6
+    (credit notes never touch Purchase Clearing; see
+    docs/M7_ADVANCED_AP_SETTLEMENT.md Section 13)."""
     rows = accounting_service.trial_balance(db, store_id=store_id)
     clearing_row = next((r for r in rows if r.account_code == ACCOUNT_PURCHASE_CLEARING), None)
     gl_balance = (

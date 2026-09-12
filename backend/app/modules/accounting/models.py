@@ -70,6 +70,16 @@ NORMAL_BALANCES = ("DEBIT", "CREDIT")
 # Payable). Each is produced by its own dedicated app.modules.ap.service
 # function, alongside the real operational state change it accounts for
 # — never posted standalone.
+# M7 adds SUPPLIER_CREDIT_NOTE (docs/M7_ADVANCED_AP_SETTLEMENT.md Section
+# 13): posted when a supplier credit note is created — reduces Accounts
+# Payable against either Inventory (GOODS_RETURN) or Purchase Discounts
+# (COMMERCIAL_DISCOUNT). A credit note has no operational void in M7 (see
+# the design doc's "Deferred" section), so unlike PURCHASE_INVOICE it has
+# no *_VOID counterpart yet — it is still included here (not left
+# reversible through the generic mechanism) because reversing it here
+# would not undo amount_allocated/amount_credited on the invoices it
+# touched, the same divergence risk every other automated type guards
+# against.
 AUTOMATED_SOURCE_TYPES = (
     "SALE",
     "PURCHASE_RECEIPT",
@@ -79,6 +89,7 @@ AUTOMATED_SOURCE_TYPES = (
     "PURCHASE_INVOICE",
     "PURCHASE_INVOICE_VOID",
     "SUPPLIER_PAYMENT",
+    "SUPPLIER_CREDIT_NOTE",
 )
 SOURCE_TYPES = AUTOMATED_SOURCE_TYPES + ("MANUAL",)
 ENTRY_TYPES = ("STANDARD", "REVERSAL")

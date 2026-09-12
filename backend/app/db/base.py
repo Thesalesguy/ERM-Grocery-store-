@@ -9,7 +9,12 @@ from app.modules.accounting.models import Account, JournalEntry, JournalLine  # 
 from app.modules.ap.models import (  # noqa: F401
     PurchaseInvoice,
     PurchaseInvoiceLine,
+    PurchaseInvoiceReceiptMatch,
+    SupplierCreditAllocation,
+    SupplierCreditNote,
+    SupplierCreditNoteLine,
     SupplierPayment,
+    SupplierPaymentAllocation,
 )
 from app.modules.audit.models import AuditLog  # noqa: F401
 from app.modules.auth.models import (  # noqa: F401

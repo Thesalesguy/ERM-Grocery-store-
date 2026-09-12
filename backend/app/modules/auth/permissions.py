@@ -55,6 +55,12 @@ AP_READ = "ap.read"
 AP_WRITE = "ap.write"
 AP_POST = "ap.post"
 AP_PAY = "ap.pay"
+# M7 (docs/M7_ADVANCED_AP_SETTLEMENT.md "RBAC"): creating a supplier
+# credit note is a financial-commitment action (it posts a journal
+# immediately, single-step) exactly like ap.post/ap.pay — kept as its own
+# code rather than folded into ap.post so a role could plausibly have one
+# without the other, though M7's own matrix always grants them together.
+AP_CREDIT = "ap.credit"
 
 ALL_PERMISSIONS: dict[str, str] = {
     PRODUCTS_READ: "View products and barcodes",
@@ -85,6 +91,7 @@ ALL_PERMISSIONS: dict[str, str] = {
         "establishing/reversing AP"
     ),
     AP_PAY: "Record a supplier payment, settling Accounts Payable",
+    AP_CREDIT: "Create a supplier credit note, reducing Accounts Payable",
 }
 
 # --- Roles --------------------------------------------------------------
@@ -127,6 +134,7 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         AP_WRITE,
         AP_POST,
         AP_PAY,
+        AP_CREDIT,
     ],
     CASHIER: [
         PRODUCTS_READ,

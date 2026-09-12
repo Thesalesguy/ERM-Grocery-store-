@@ -15,8 +15,12 @@ from sqlalchemy.orm import Session
 from app.modules.accounting import service as accounting_service
 from app.modules.accounting.models import JournalEntry
 from app.modules.ap import service as ap_service
-from app.modules.ap.models import PurchaseInvoice, SupplierPayment
-from app.modules.ap.service import PurchaseInvoiceLineInput
+from app.modules.ap.models import PurchaseInvoice, SupplierCreditNote, SupplierPayment
+from app.modules.ap.service import (
+    PaymentAllocationInput,
+    PurchaseInvoiceLineInput,
+    SupplierCreditNoteLineInput,
+)
 from app.modules.audit import service as audit_service
 from app.modules.purchasing import service as purchasing_service
 from app.modules.purchasing.models import PurchaseOrderItem
@@ -193,11 +197,12 @@ def test_failure_during_payment_accounting_rolls_back_everything(
     with pytest.raises(RuntimeError, match="forced failure"):
         ap_service.record_supplier_payment(
             db,
-            purchase_invoice_id=invoice.id,
             store_id=store.id,
+            supplier_id=supplier.id,
             payment_date=date(2024, 1, 10),
             payment_method="CASH",
             amount=Decimal("20.00"),
+            allocations=[PaymentAllocationInput(invoice.id, Decimal("20.00"))],
             client_transaction_id=txn_id,
             caller_store_id=None,
         )
@@ -239,11 +244,12 @@ def test_failure_during_payment_audit_rolls_back_everything(
     with pytest.raises(RuntimeError, match="forced failure"):
         ap_service.record_supplier_payment(
             db,
-            purchase_invoice_id=invoice.id,
             store_id=store.id,
+            supplier_id=supplier.id,
             payment_date=date(2024, 1, 10),
             payment_method="CASH",
             amount=Decimal("10.00"),
+            allocations=[PaymentAllocationInput(invoice.id, Decimal("10.00"))],
             client_transaction_id=txn_id,
             caller_store_id=None,
         )
@@ -257,3 +263,90 @@ def test_failure_during_payment_audit_rolls_back_everything(
         ).scalar_one_or_none()
         is None
     )
+
+
+def test_failure_during_credit_note_accounting_rolls_back_everything(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M7 Section 23: force failure after credit note creation/allocation
+    but during journal posting — zero financial residue (no credit note
+    row, no amount_credited bump)."""
+    store = make_store(db)
+    supplier = make_supplier(db)
+    product = make_product(db, store)
+    db.commit()
+    po, item = _receive(db, store, supplier, product, qty=Decimal("10"), cost=Decimal("5.00"))
+    invoice = _draft_invoice(
+        db, store, supplier, item, qty=Decimal("10"), cost=Decimal("5.00"), po_id=po.id
+    )
+    ap_service.post_purchase_invoice(db, purchase_invoice_id=invoice.id, caller_store_id=None)
+    db.commit()
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("forced failure inside credit note accounting posting")
+
+    monkeypatch.setattr(accounting_service, "post_supplier_credit_note_journal", _boom)
+
+    txn_id = f"ctxn-{unique_suffix()}"
+    with pytest.raises(RuntimeError, match="forced failure"):
+        ap_service.create_supplier_credit_note(
+            db,
+            store_id=store.id,
+            supplier_id=supplier.id,
+            credit_number=f"CN-{unique_suffix()}",
+            credit_date=date(2024, 1, 12),
+            reason="COMMERCIAL_DISCOUNT",
+            lines=[SupplierCreditNoteLineInput(description="Discount", amount=Decimal("10.00"))],
+            allocations=[PaymentAllocationInput(invoice.id, Decimal("10.00"))],
+            client_transaction_id=txn_id,
+            caller_store_id=None,
+        )
+    db.rollback()
+
+    reloaded = db.get(PurchaseInvoice, invoice.id)
+    assert reloaded.amount_credited == Decimal("0.00")
+    assert (
+        db.execute(
+            select(SupplierCreditNote).where(SupplierCreditNote.client_transaction_id == txn_id)
+        ).scalar_one_or_none()
+        is None
+    )
+
+
+def test_failure_during_credit_note_audit_rolls_back_everything(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = make_store(db)
+    supplier = make_supplier(db)
+    product = make_product(db, store)
+    db.commit()
+    po, item = _receive(db, store, supplier, product, qty=Decimal("5"), cost=Decimal("5.00"))
+    invoice = _draft_invoice(
+        db, store, supplier, item, qty=Decimal("5"), cost=Decimal("5.00"), po_id=po.id
+    )
+    ap_service.post_purchase_invoice(db, purchase_invoice_id=invoice.id, caller_store_id=None)
+    db.commit()
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("forced failure inside audit logging")
+
+    monkeypatch.setattr(audit_service, "log_event", _boom)
+
+    txn_id = f"ctxn-{unique_suffix()}"
+    with pytest.raises(RuntimeError, match="forced failure"):
+        ap_service.create_supplier_credit_note(
+            db,
+            store_id=store.id,
+            supplier_id=supplier.id,
+            credit_number=f"CN-{unique_suffix()}",
+            credit_date=date(2024, 1, 12),
+            reason="COMMERCIAL_DISCOUNT",
+            lines=[SupplierCreditNoteLineInput(description="Discount", amount=Decimal("5.00"))],
+            allocations=[PaymentAllocationInput(invoice.id, Decimal("5.00"))],
+            client_transaction_id=txn_id,
+            caller_store_id=None,
+        )
+    db.rollback()
+
+    reloaded = db.get(PurchaseInvoice, invoice.id)
+    assert reloaded.amount_credited == Decimal("0.00")

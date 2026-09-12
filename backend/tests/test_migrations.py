@@ -31,6 +31,7 @@ M4_ACCOUNTING_CORE_REVISION = "8df037a45976"  # M4: chart of accounts, journal e
 M4_HEAD_REVISION = "581d2a07f38c"  # M4 hardening: allow MANUAL journal source type
 M5_HEAD_REVISION = "35d411b947ec"  # M5: sale returns quantity tracking and idempotency
 M6_HEAD_REVISION = "36173e29a9f0"  # M6: accounts payable, purchase invoices, supplier payments
+M7_HEAD_REVISION = "a4f2c8e91b6d"  # M7: advanced AP settlement, credit notes, payment allocation
 
 
 def _alembic_config() -> Config:
@@ -101,17 +102,23 @@ def test_full_upgrade_downgrade_upgrade_cycle(migrations_db: str) -> None:
     # tax_refunded/unit_cost_refunded), not tables.
     assert _table_count(migrations_db) == 30
 
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, M6_HEAD_REVISION)
     # M6 adds three tables: purchase_invoices, purchase_invoice_lines,
     # supplier_payments.
     assert _table_count(migrations_db) == 33
+
+    command.upgrade(cfg, "head")
+    # M7 adds five tables: purchase_invoice_receipt_matches,
+    # supplier_payment_allocations, supplier_credit_notes,
+    # supplier_credit_note_lines, supplier_credit_allocations.
+    assert _table_count(migrations_db) == 38
 
     command.downgrade(cfg, M0_REVISION)
     assert _table_count(migrations_db) == 8
 
     command.upgrade(cfg, "head")
-    assert _table_count(migrations_db) == 33
-    assert _current_revision(migrations_db) == M6_HEAD_REVISION
+    assert _table_count(migrations_db) == 38
+    assert _current_revision(migrations_db) == M7_HEAD_REVISION
 
 
 def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
@@ -127,4 +134,65 @@ def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
     finally:
         engine.dispose()
     assert role_count == 5
-    assert permission_count == 23
+    assert permission_count == 24
+
+
+def test_m7_downgrade_refuses_when_credit_note_data_exists(migrations_db: str) -> None:
+    """M7 Section 33: the downgrade guard must fail LOUDLY, before any
+    destructive step, when real M7-only data exists that the M6 schema
+    cannot represent — proven here against a real populated database, not
+    just an empty one (the exact discipline that caught M6's own
+    downgrade-vs-populated-data bug)."""
+    from sqlalchemy.exc import DBAPIError, InternalError
+
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, "head")
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            store_id = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, created_at) "
+                "VALUES ('T', 'UTC', true, now()) RETURNING id"
+            ).scalar_one()
+            supplier_id = conn.exec_driver_sql(
+                "INSERT INTO suppliers (name, is_active, created_at) "
+                "VALUES ('S', true, now()) RETURNING id"
+            ).scalar_one()
+            conn.exec_driver_sql(
+                "INSERT INTO supplier_credit_notes "
+                "(store_id, supplier_id, credit_number, credit_date, reason, "
+                " grand_total, amount_allocated, client_transaction_id, created_at) "
+                f"VALUES ({store_id}, {supplier_id}, 'CN-1', '2024-01-01', "
+                "'COMMERCIAL_DISCOUNT', 10.00, 0, 'ctxn-guard-test', now())"
+            )
+    finally:
+        engine.dispose()
+
+    try:
+        with pytest.raises((DBAPIError, InternalError)):
+            command.downgrade(cfg, M6_HEAD_REVISION)
+
+        # The failed downgrade must not have left the database partially
+        # migrated — Postgres transactional DDL rolls the whole migration
+        # back.
+        assert _current_revision(migrations_db) == M7_HEAD_REVISION
+        assert _table_count(migrations_db) == 38
+    finally:
+        # Clean up the blocking row NO MATTER WHAT the assertions above
+        # did, so a failure here can never poison the shared migrations
+        # test database for every other test in this file's next run (the
+        # exact failure mode this very fix was needed for during this
+        # audit — a prior version of this test without the finally left
+        # a real leftover row that broke every other migration test until
+        # manually purged).
+        engine = create_engine(migrations_db)
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "DELETE FROM supplier_credit_notes WHERE credit_number = 'CN-1'"
+                )
+        finally:
+            engine.dispose()
+        command.downgrade(cfg, "base")

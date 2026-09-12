@@ -9,7 +9,7 @@ const AUTH_ROUTES_JSON = {
   username: 'manager',
   full_name: 'Store Manager',
   store_id: 7,
-  permissions: ['ap.read', 'ap.write', 'ap.post', 'ap.pay'],
+  permissions: ['ap.read', 'ap.write', 'ap.post', 'ap.pay', 'ap.credit'],
 }
 
 function AuthGate({ children }: { children: React.ReactNode }) {
@@ -48,10 +48,11 @@ const SAMPLE_PO = {
 }
 
 const SAMPLE_MATCHING = {
-  purchase_order_id: 42,
+  purchase_order_ids: [42],
   items: [
     {
       purchase_order_item_id: 100,
+      purchase_order_id: 42,
       product_id: 55,
       quantity_ordered: '10.000',
       quantity_received: '10.000',
@@ -77,6 +78,7 @@ const SAMPLE_DRAFT_INVOICE = {
   tax_total: '0.00',
   grand_total: '100.00',
   amount_paid: '0.00',
+  amount_credited: '0.00',
   balance_due: '100.00',
   client_transaction_id: 'itxn-1',
   notes: null,
@@ -97,11 +99,14 @@ const SAMPLE_DRAFT_INVOICE = {
       line_total: '100.00',
       product_name: 'Widget',
       product_sku: 'WID-1',
+      matches: [],
     },
   ],
 }
 
-function stubFetch(handler: (url: string, method: string) => Response | null) {
+function stubFetch(
+  handler: (url: string, method: string, init?: RequestInit) => Response | null,
+) {
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: string | URL, init?: RequestInit) => {
@@ -121,7 +126,7 @@ function stubFetch(handler: (url: string, method: string) => Response | null) {
       if (url.includes('/auth/me')) {
         return { ok: true, status: 200, json: async () => AUTH_ROUTES_JSON } as Response
       }
-      const response = handler(url, method)
+      const response = handler(url, method, init)
       if (response) return response
       throw new Error(`no route for ${method} ${url}`)
     }),
@@ -150,7 +155,7 @@ describe('AccountsPayablePage', () => {
     })
     await renderAp()
 
-    fireEvent.change(screen.getByPlaceholderText('Purchase Order ID'), { target: { value: '42' } })
+    fireEvent.change(screen.getByPlaceholderText(/Purchase Order ID/), { target: { value: '42' } })
     fireEvent.click(screen.getByRole('button', { name: /find po/i }))
 
     await waitFor(() => expect(screen.getByText('PO7-TEST')).toBeInTheDocument())
@@ -190,7 +195,7 @@ describe('AccountsPayablePage', () => {
     })
     await renderAp()
 
-    fireEvent.change(screen.getByPlaceholderText('Purchase Order ID'), { target: { value: '42' } })
+    fireEvent.change(screen.getByPlaceholderText(/Purchase Order ID/), { target: { value: '42' } })
     fireEvent.click(screen.getByRole('button', { name: /find po/i }))
     await waitFor(() => expect(screen.getByText('Widget')).toBeInTheDocument())
 
@@ -210,6 +215,113 @@ describe('AccountsPayablePage', () => {
     fireEvent.click(screen.getByRole('button', { name: /post invoice/i }))
     await waitFor(() => expect(screen.getByText('Posted')).toBeInTheDocument())
     expect(posted).toBe(true)
+  })
+
+  it('records a multi-allocation payment and issues a credit note against a posted invoice', async () => {
+    let paymentBody: Record<string, unknown> | null = null
+    let creditNoteBody: Record<string, unknown> | null = null
+    const postedInvoice = { ...SAMPLE_DRAFT_INVOICE, status: 'POSTED' }
+    stubFetch((url, method, init) => {
+      if (url.includes('/ap/purchase-orders/42/matching-status')) {
+        return jsonResponse(200, SAMPLE_MATCHING)
+      }
+      if (url.includes('/purchasing/purchase-orders/42')) {
+        return jsonResponse(200, SAMPLE_PO)
+      }
+      if (url.endsWith('/ap/invoices') && method === 'POST') {
+        return jsonResponse(201, postedInvoice)
+      }
+      if (url.includes('/ap/invoices/900') && method === 'GET') {
+        return jsonResponse(200, postedInvoice)
+      }
+      if (url.endsWith('/ap/payments') && method === 'POST') {
+        paymentBody = JSON.parse((init?.body as string) ?? '{}')
+        return jsonResponse(201, {
+          id: 1,
+          store_id: 7,
+          supplier_id: 3,
+          payment_date: '2024-01-10',
+          payment_method: 'CASH',
+          amount: '55.00',
+          reference: null,
+          client_transaction_id: 'ptxn-1',
+          created_at: '2024-01-10T00:00:00Z',
+          allocations: [
+            { id: 1, purchase_invoice_id: 900, amount: '40.00' },
+            { id: 2, purchase_invoice_id: 901, amount: '15.00' },
+          ],
+        })
+      }
+      if (url.endsWith('/ap/credit-notes') && method === 'POST') {
+        creditNoteBody = JSON.parse((init?.body as string) ?? '{}')
+        return jsonResponse(201, {
+          id: 5,
+          store_id: 7,
+          supplier_id: 3,
+          credit_number: 'CN-1',
+          credit_date: '2024-01-12',
+          reason: 'COMMERCIAL_DISCOUNT',
+          purchase_return_id: null,
+          grand_total: '10.00',
+          amount_allocated: '10.00',
+          client_transaction_id: 'ctxn-1',
+          notes: null,
+          created_at: '2024-01-12T00:00:00Z',
+          voided_at: null,
+          supplier_name: 'Acme Distributors',
+          lines: [],
+          allocations: [],
+        })
+      }
+      return null
+    })
+    await renderAp()
+
+    fireEvent.change(screen.getByPlaceholderText(/Purchase Order ID/), { target: { value: '42' } })
+    fireEvent.click(screen.getByRole('button', { name: /find po/i }))
+    await waitFor(() => expect(screen.getByText('Widget')).toBeInTheDocument())
+
+    fireEvent.change(screen.getByPlaceholderText("Supplier's invoice number"), {
+      target: { value: 'INV-TEST' },
+    })
+    fireEvent.click(screen.getByRole('checkbox'))
+    fireEvent.change(screen.getByPlaceholderText('0'), { target: { value: '10' } })
+    fireEvent.change(screen.getByPlaceholderText('0.00'), { target: { value: '10.00' } })
+    fireEvent.click(screen.getByRole('button', { name: /create draft invoice/i }))
+    await waitFor(() => expect(screen.getByText('Posted')).toBeInTheDocument())
+
+    // Record a payment allocating to this invoice AND another invoice.
+    fireEvent.change(screen.getByPlaceholderText('Amount for this invoice'), {
+      target: { value: '40.00' },
+    })
+    fireEvent.click(screen.getByText('+ Allocate to another invoice'))
+    fireEvent.change(screen.getByPlaceholderText('Invoice ID'), { target: { value: '901' } })
+    // Two "Amount" fields exist simultaneously: the new allocation row's,
+    // and the credit-note section's own — the allocation row renders first.
+    fireEvent.change(screen.getAllByPlaceholderText('Amount')[0], { target: { value: '15.00' } })
+    fireEvent.click(screen.getByRole('button', { name: /record payment/i }))
+
+    await waitFor(() => expect(paymentBody).not.toBeNull())
+    expect(paymentBody).toMatchObject({
+      amount: '55.00',
+      allocations: [
+        { purchase_invoice_id: 900, amount: '40.00' },
+        { purchase_invoice_id: 901, amount: '15.00' },
+      ],
+    })
+
+    // Issue a credit note against the same invoice.
+    fireEvent.change(screen.getByPlaceholderText('Credit note number'), {
+      target: { value: 'CN-1' },
+    })
+    fireEvent.change(screen.getAllByPlaceholderText('Amount')[0], { target: { value: '10.00' } })
+    fireEvent.click(screen.getByRole('button', { name: /create credit note/i }))
+
+    await waitFor(() => expect(creditNoteBody).not.toBeNull())
+    expect(creditNoteBody).toMatchObject({
+      reason: 'COMMERCIAL_DISCOUNT',
+      allocations: [{ purchase_invoice_id: 900, amount: '10.00' }],
+    })
   })
 
   it('does not show write controls for a read-only user', async () => {
