@@ -15,6 +15,7 @@ from app.core.security import hash_password
 from app.modules.auth.models import Role, Store, User, UserRole
 from app.modules.products.models import Product, ProductCategory
 from app.modules.purchasing.models import PurchaseOrder, Supplier
+from app.modules.replenishment.models import SupplierProduct
 from app.modules.tax.models import TaxRate
 
 DEFAULT_TEST_PASSWORD = "Test-Password-123!"
@@ -138,3 +139,21 @@ def make_purchase_order(
     db.add(purchase_order)
     db.flush()
     return purchase_order
+
+
+def make_supplier_product(
+    db: Session, supplier: Supplier, product: Product, **overrides
+) -> SupplierProduct:
+    defaults = dict(
+        supplier_id=supplier.id,
+        product_id=product.id,
+        pack_size=Decimal("1"),
+        unit_cost=Decimal("1.00"),
+        effective_date=date(2024, 1, 1),
+        is_active=True,
+    )
+    defaults.update(overrides)
+    supplier_product = SupplierProduct(**defaults)
+    db.add(supplier_product)
+    db.flush()
+    return supplier_product

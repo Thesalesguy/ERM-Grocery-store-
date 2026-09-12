@@ -13,6 +13,7 @@ import { ReportsPage } from './pages/ReportsPage'
 import { SalesPage } from './pages/SalesPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { StockCountsPage } from './pages/StockCountsPage'
+import { SupplyChainPage } from './pages/SupplyChainPage'
 import { SuppliersPage } from './pages/SuppliersPage'
 import { TransfersPage } from './pages/TransfersPage'
 import { UsersPage } from './pages/UsersPage'
@@ -78,6 +79,14 @@ function App() {
             element={
               <RequirePermission permission="purchasing.read">
                 <SuppliersPage />
+              </RequirePermission>
+            }
+          />
+          <Route
+            path="supply-chain"
+            element={
+              <RequirePermission permission="supply_chain.read">
+                <SupplyChainPage />
               </RequirePermission>
             }
           />

@@ -82,6 +82,20 @@ INVENTORY_COUNT_POST = "inventory.count.post"
 INVENTORY_TRANSFER_WRITE = "inventory.transfer.write"
 INVENTORY_TRANSFER_SHIP = "inventory.transfer.ship"
 INVENTORY_TRANSFER_RECEIVE = "inventory.transfer.receive"
+# M9 (docs/M9_SUPPLY_CHAIN_DESIGN.md "design answer #19"): four tiers
+# mirroring the count/transfer split — read is separate from plan
+# (generating recommendations is inventory-adjacent data work, not a
+# financial commitment) which is separate from approve (a purchasing
+# decision) which is separate from execute (the action that actually
+# creates a real PO/transfer). Inventory Clerk gets read+plan only —
+# approving/executing purchasing on the business's behalf is withheld
+# from the same role that already lacks ap.post/ap.pay and
+# inventory.count.review/post, for the identical separation-of-duties
+# reason.
+SUPPLY_CHAIN_READ = "supply_chain.read"
+SUPPLY_CHAIN_PLAN = "supply_chain.plan"
+SUPPLY_CHAIN_APPROVE = "supply_chain.approve"
+SUPPLY_CHAIN_EXECUTE = "supply_chain.execute"
 
 ALL_PERMISSIONS: dict[str, str] = {
     PRODUCTS_READ: "View products and barcodes",
@@ -119,6 +133,10 @@ ALL_PERMISSIONS: dict[str, str] = {
     INVENTORY_TRANSFER_WRITE: "Create and cancel a draft inter-store transfer",
     INVENTORY_TRANSFER_SHIP: "Ship an inter-store transfer from its source store",
     INVENTORY_TRANSFER_RECEIVE: "Receive an inter-store transfer at its destination store",
+    SUPPLY_CHAIN_READ: "View replenishment plans, supplier catalog, and supply-chain metrics",
+    SUPPLY_CHAIN_PLAN: "Generate replenishment recommendations and cancel a plan",
+    SUPPLY_CHAIN_APPROVE: "Approve a replenishment recommendation",
+    SUPPLY_CHAIN_EXECUTE: "Execute an approved plan into a real purchase order or transfer",
 }
 
 # --- Roles --------------------------------------------------------------
@@ -168,6 +186,10 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         INVENTORY_TRANSFER_WRITE,
         INVENTORY_TRANSFER_SHIP,
         INVENTORY_TRANSFER_RECEIVE,
+        SUPPLY_CHAIN_READ,
+        SUPPLY_CHAIN_PLAN,
+        SUPPLY_CHAIN_APPROVE,
+        SUPPLY_CHAIN_EXECUTE,
     ],
     CASHIER: [
         PRODUCTS_READ,
@@ -198,6 +220,8 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         INVENTORY_TRANSFER_WRITE,
         INVENTORY_TRANSFER_SHIP,
         INVENTORY_TRANSFER_RECEIVE,
+        SUPPLY_CHAIN_READ,
+        SUPPLY_CHAIN_PLAN,
     ],
     AUDITOR: [
         PRODUCTS_READ,
@@ -209,5 +233,6 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         ACCOUNTING_READ,
         SALES_RETURN_READ,
         AP_READ,
+        SUPPLY_CHAIN_READ,
     ],
 }

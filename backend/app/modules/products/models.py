@@ -86,6 +86,15 @@ class Product(TimestampMixin, Base):
 
     tax_rate_id: Mapped[int | None] = mapped_column(ForeignKey("tax_rates.id"))
     reorder_point: Mapped[Decimal | None] = mapped_column(Numeric(14, 3))
+    # M9 (docs/M9_SUPPLY_CHAIN_DESIGN.md "Design Decision 10"): these live
+    # on Product, not a separate (store, product)-keyed policy table —
+    # Product already IS that pair. NULL target_stock_quantity means "aim
+    # for reorder_point itself" (no separate buffer configured);
+    # minimum_stock_quantity is the urgent-priority floor (distinct from
+    # reorder_point, which is the normal-priority trigger) and folds in
+    # what would otherwise be a separate, synonymous "safety stock" field.
+    target_stock_quantity: Mapped[Decimal | None] = mapped_column(Numeric(14, 3))
+    minimum_stock_quantity: Mapped[Decimal | None] = mapped_column(Numeric(14, 3))
 
     # Inventory cache (docs/TECHNICAL_BLUEPRINT.md Section G): the
     # authoritative source of truth is the inventory_movements ledger.

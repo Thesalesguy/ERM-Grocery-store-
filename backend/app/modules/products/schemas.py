@@ -26,6 +26,12 @@ class ProductCreate(BaseModel):
     current_price: Decimal = Field(ge=0)
     tax_rate_id: int | None = None
     reorder_point: Decimal | None = Field(default=None, ge=0)
+    # M9 supply-chain policy fields (docs/M9_SUPPLY_CHAIN_DESIGN.md Design
+    # Decision 10): the replenish-up-to target and the URGENT-classification
+    # floor. Both optional — a product with only reorder_point set still
+    # gets NORMAL-urgency recommendations targeting reorder_point itself.
+    target_stock_quantity: Decimal | None = Field(default=None, ge=0)
+    minimum_stock_quantity: Decimal | None = Field(default=None, ge=0)
     allow_negative_stock: bool = False
 
 
@@ -42,6 +48,8 @@ class ProductUpdate(BaseModel):
     current_price: Decimal | None = Field(default=None, ge=0)
     tax_rate_id: int | None = None
     reorder_point: Decimal | None = Field(default=None, ge=0)
+    target_stock_quantity: Decimal | None = Field(default=None, ge=0)
+    minimum_stock_quantity: Decimal | None = Field(default=None, ge=0)
     allow_negative_stock: bool | None = None
 
     model_config = ConfigDict(extra="forbid")
@@ -63,6 +71,8 @@ class ProductRead(BaseModel):
     current_cost: Decimal
     tax_rate_id: int | None
     reorder_point: Decimal | None
+    target_stock_quantity: Decimal | None
+    minimum_stock_quantity: Decimal | None
     current_qty_on_hand: Decimal
     allow_negative_stock: bool
     is_active: bool

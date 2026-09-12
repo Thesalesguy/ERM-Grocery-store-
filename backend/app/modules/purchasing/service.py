@@ -222,7 +222,7 @@ def _generate_purchase_number(store_id: int) -> str:
     return f"PO{store_id}-{timestamp}-{secrets.token_hex(3).upper()}"
 
 
-def create_purchase_order(
+def _create_purchase_order_inner(
     db: Session,
     *,
     store_id: int,
@@ -233,12 +233,19 @@ def create_purchase_order(
     notes: str | None = None,
     created_by: int | None = None,
     caller_store_id: int | None = None,
+    replenishment_plan_id: int | None = None,
 ) -> PurchaseOrder:
-    """Created in DRAFT — items are freely editable/re-creatable until
-    `submit_purchase_order` moves it to ORDERED (docs/
-    M3_PURCHASING_RECEIVING_WAC.md "PO lifecycle"). Never touches
-    inventory (docs/TECHNICAL_BLUEPRINT.md Section F invariant, unchanged
-    from M1) — only a goods receipt does that."""
+    """All of `create_purchase_order`'s validation/creation logic, minus
+    `commit()`/`refresh()` — so a caller that needs this atomic with OTHER
+    effects in the same transaction (M9's replenishment-plan execution:
+    docs/M9_SUPPLY_CHAIN_DESIGN.md "Design Decision 3") can call this
+    directly and commit once, itself, alongside those other effects.
+    `create_purchase_order` below is the thin, commit-per-call wrapper
+    every existing caller keeps using unchanged.
+
+    `replenishment_plan_id` (M9): set only when this PO is being generated
+    BY replenishment-plan execution, tracing it back to the plan that
+    produced it — never set by the ordinary manual-creation route."""
     _enforce_store_access(caller_store_id, store_id, "purchase orders")
 
     store = db.get(Store, store_id)
@@ -260,6 +267,7 @@ def create_purchase_order(
         expected_date=expected_date,
         notes=notes,
         created_by=created_by,
+        replenishment_plan_id=replenishment_plan_id,
     )
     db.add(purchase_order)
     db.flush()
@@ -283,7 +291,40 @@ def create_purchase_order(
             "purchase_number": purchase_order.purchase_number,
             "supplier_id": supplier_id,
             "line_count": len(lines),
+            "replenishment_plan_id": replenishment_plan_id,
         },
+    )
+    db.flush()
+    return purchase_order
+
+
+def create_purchase_order(
+    db: Session,
+    *,
+    store_id: int,
+    supplier_id: int,
+    order_date: date,
+    lines: list[PurchaseOrderItemInput],
+    expected_date: date | None = None,
+    notes: str | None = None,
+    created_by: int | None = None,
+    caller_store_id: int | None = None,
+) -> PurchaseOrder:
+    """Created in DRAFT — items are freely editable/re-creatable until
+    `submit_purchase_order` moves it to ORDERED (docs/
+    M3_PURCHASING_RECEIVING_WAC.md "PO lifecycle"). Never touches
+    inventory (docs/TECHNICAL_BLUEPRINT.md Section F invariant, unchanged
+    from M1) — only a goods receipt does that."""
+    purchase_order = _create_purchase_order_inner(
+        db,
+        store_id=store_id,
+        supplier_id=supplier_id,
+        order_date=order_date,
+        lines=lines,
+        expected_date=expected_date,
+        notes=notes,
+        created_by=created_by,
+        caller_store_id=caller_store_id,
     )
     db.commit()
     db.refresh(purchase_order)

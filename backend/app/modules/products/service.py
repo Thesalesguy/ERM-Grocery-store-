@@ -76,6 +76,8 @@ def create_product(db: Session, data: ProductCreate, *, actor_id: int | None = N
         current_price=data.current_price,
         tax_rate_id=data.tax_rate_id,
         reorder_point=data.reorder_point,
+        target_stock_quantity=data.target_stock_quantity,
+        minimum_stock_quantity=data.minimum_stock_quantity,
         allow_negative_stock=data.allow_negative_stock,
         # Deliberately not from `data`: cost and on-hand quantity are
         # system-managed and only ever move through inventory movements.

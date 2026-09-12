@@ -42,6 +42,7 @@ from app.modules.purchasing.models import (  # noqa: F401
     PurchaseReturnItem,
     Supplier,
 )
+from app.modules.replenishment.models import ReplenishmentPlan, SupplierProduct  # noqa: F401
 from app.modules.sales.models import (  # noqa: F401
     Payment,
     Sale,
