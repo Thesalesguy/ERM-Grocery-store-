@@ -90,6 +90,16 @@ AUTOMATED_SOURCE_TYPES = (
     "PURCHASE_INVOICE_VOID",
     "SUPPLIER_PAYMENT",
     "SUPPLIER_CREDIT_NOTE",
+    # M8 (docs/M8_ADVANCED_INVENTORY_DESIGN.md "Design Decision 9"):
+    # INTER_STORE_TRANSFER_SHIP posts once per transfer (shipping is a
+    # single event — Design Decision 8); INTER_STORE_TRANSFER_RECEIVE
+    # posts once per InterStoreTransferReceipt (a transfer may have
+    # several). Both blocked from generic reversal for the same reason
+    # every automated type is: reversing the journal alone would not
+    # undo the real inventory movement (TRANSFER_OUT/TRANSFER_IN) or the
+    # transfer's own shipped_quantity/received_quantity running totals.
+    "INTER_STORE_TRANSFER_SHIP",
+    "INTER_STORE_TRANSFER_RECEIVE",
 )
 SOURCE_TYPES = AUTOMATED_SOURCE_TYPES + ("MANUAL",)
 ENTRY_TYPES = ("STANDARD", "REVERSAL")

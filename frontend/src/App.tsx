@@ -12,7 +12,9 @@ import { PurchasingPage } from './pages/PurchasingPage'
 import { ReportsPage } from './pages/ReportsPage'
 import { SalesPage } from './pages/SalesPage'
 import { SettingsPage } from './pages/SettingsPage'
+import { StockCountsPage } from './pages/StockCountsPage'
 import { SuppliersPage } from './pages/SuppliersPage'
+import { TransfersPage } from './pages/TransfersPage'
 import { UsersPage } from './pages/UsersPage'
 
 function App() {
@@ -44,6 +46,22 @@ function App() {
             element={
               <RequirePermission permission="inventory.read">
                 <InventoryPage />
+              </RequirePermission>
+            }
+          />
+          <Route
+            path="stock-counts"
+            element={
+              <RequirePermission permission="inventory.read">
+                <StockCountsPage />
+              </RequirePermission>
+            }
+          />
+          <Route
+            path="transfers"
+            element={
+              <RequirePermission permission="inventory.read">
+                <TransfersPage />
               </RequirePermission>
             }
           />

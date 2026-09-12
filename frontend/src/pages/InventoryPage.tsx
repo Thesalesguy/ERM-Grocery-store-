@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import * as inventoryApi from '../api/inventory'
+import * as replenishmentApi from '../api/replenishment'
 import { ApiError } from '../api/client'
 import { useAuth } from '../auth/AuthContext'
 
@@ -85,6 +86,79 @@ function AdjustmentForm({ onDone }: { onDone: () => void }) {
         {isSubmitting ? 'Saving…' : 'Apply adjustment'}
       </button>
     </form>
+  )
+}
+
+function ReplenishmentSuggestions({ storeId }: { storeId: number | null }) {
+  const [suggestions, setSuggestions] = useState<replenishmentApi.ReplenishmentSuggestion[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    async function load() {
+      setLoading(true)
+      setError(null)
+      try {
+        const data = await replenishmentApi.getReplenishmentSuggestions({
+          store_id: storeId ?? undefined,
+        })
+        if (!cancelled) setSuggestions(data)
+      } catch {
+        if (!cancelled) setError('Could not load replenishment suggestions.')
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }
+    load()
+    return () => {
+      cancelled = true
+    }
+  }, [storeId])
+
+  if (loading) return <p className="mt-4 text-gray-500">Loading suggestions…</p>
+  if (error) return <p className="mt-4 text-red-600">{error}</p>
+  if (suggestions.length === 0) {
+    return <p className="mt-4 text-sm text-gray-500">Nothing below its reorder point right now.</p>
+  }
+
+  return (
+    <table className="mt-4 w-full text-left text-sm">
+      <thead>
+        <tr className="border-b border-gray-200 text-gray-500">
+          <th className="py-2 pr-4">SKU</th>
+          <th className="py-2 pr-4">Name</th>
+          <th className="py-2 pr-4">Position</th>
+          <th className="py-2 pr-4">Reorder point</th>
+          <th className="py-2 pr-4">Suggested transfer</th>
+          <th className="py-2 pr-4">Suggested purchase</th>
+        </tr>
+      </thead>
+      <tbody>
+        {suggestions.map((s) => (
+          <tr key={s.product_id} className="border-b border-gray-100">
+            <td className="py-2 pr-4 font-mono text-xs">{s.sku}</td>
+            <td className="py-2 pr-4">{s.name}</td>
+            <td className="py-2 pr-4">{s.inventory_position}</td>
+            <td className="py-2 pr-4">{s.reorder_point}</td>
+            <td className="py-2 pr-4">
+              {s.suggested_transfer_quantity !== '0' ? (
+                <span>
+                  {s.suggested_transfer_quantity}
+                  {s.sister_store_surplus_source_store_id !== null &&
+                    ` (from store ${s.sister_store_surplus_source_store_id})`}
+                </span>
+              ) : (
+                '—'
+              )}
+            </td>
+            <td className="py-2 pr-4">
+              {s.suggested_purchase_quantity !== '0' ? s.suggested_purchase_quantity : '—'}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
   )
 }
 
@@ -175,6 +249,13 @@ export function InventoryPage() {
           </tbody>
         </table>
       )}
+
+      <h2 className="mt-8 text-lg font-semibold text-gray-900">Replenishment suggestions</h2>
+      <p className="mt-1 text-xs text-gray-500">
+        Decision support only — creating a purchase order or transfer from a suggestion is a
+        separate, deliberate step.
+      </p>
+      <ReplenishmentSuggestions storeId={user?.store_id ?? null} />
     </div>
   )
 }

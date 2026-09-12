@@ -18,25 +18,56 @@ must agree — enforced by ck_inventory_movements_direction below — but
 there is deliberately no blanket "quantity must be positive" constraint,
 since direction is the whole point of the sign.
 
-Multi-store transfers (TRANSFER_IN/TRANSFER_OUT) are NOT included in the
-movement_type set. The blueprint's assumption #1 scopes v1 to a single
-store per product row (products.store_id), so there is nothing to
-transfer between yet; adding transfer types now would be unused surface
-area. Revisit when multi-store is actually implemented.
+M8 (docs/M8_ADVANCED_INVENTORY_DESIGN.md "Design Decision 6/7") adds
+TRANSFER_IN/TRANSFER_OUT — exactly the movement types this docstring
+anticipated, now that inter-store transfers exist. `Product` remains
+store-scoped (unchanged): a transfer moves value between two DISTINCT
+product rows (the source store's row and the destination store's own,
+pre-existing row for the same SKU), so a `TRANSFER_OUT` movement against
+the source product and a `TRANSFER_IN` movement against the destination
+product are two separate ledger rows, exactly like a sale and a receipt
+are two separate rows today — never one row that somehow spans stores.
 """
 
+from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import CheckConstraint, ForeignKey, Index, Numeric, String, Text
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base_class import Base, TimestampMixin
 
-_INCREASING_MOVEMENT_TYPES = ("PURCHASE_RECEIPT", "SALE_RETURN", "STOCK_ADJUSTMENT_IN")
-_DECREASING_MOVEMENT_TYPES = ("SALE", "PURCHASE_RETURN", "STOCK_ADJUSTMENT_OUT")
+_INCREASING_MOVEMENT_TYPES = (
+    "PURCHASE_RECEIPT",
+    "SALE_RETURN",
+    "STOCK_ADJUSTMENT_IN",
+    "TRANSFER_IN",
+)
+_DECREASING_MOVEMENT_TYPES = (
+    "SALE",
+    "PURCHASE_RETURN",
+    "STOCK_ADJUSTMENT_OUT",
+    "TRANSFER_OUT",
+)
 MOVEMENT_TYPES = _INCREASING_MOVEMENT_TYPES + _DECREASING_MOVEMENT_TYPES
 
-REFERENCE_TYPES = ("purchase_order", "sale", "sale_return", "purchase_return", "stock_adjustment")
+REFERENCE_TYPES = (
+    "purchase_order",
+    "sale",
+    "sale_return",
+    "purchase_return",
+    "stock_adjustment",
+    "inter_store_transfer",
+)
 
 
 class InventoryMovement(TimestampMixin, Base):
@@ -113,3 +144,107 @@ class StockAdjustment(TimestampMixin, Base):
     notes: Mapped[str | None] = mapped_column(Text)
     created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
     approved_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    # M8 (docs/M8_ADVANCED_INVENTORY_DESIGN.md "Design Decision 1"): set
+    # only for a StockAdjustment created by post_stock_count — traces a
+    # STOCKTAKE_CORRECTION adjustment back to the count that produced it.
+    # NULL for every other reason_code and for pre-M8 rows.
+    stock_count_id: Mapped[int | None] = mapped_column(ForeignKey("stock_counts.id"))
+
+
+# --- Stock counts / physical inventory (M8) ---------------------------------
+
+STOCK_COUNT_STATUSES = ("DRAFT", "OPEN", "COUNTED", "REVIEWED", "POSTED", "CANCELLED")
+# Statuses from which a count may still be cancelled — never POSTED (the
+# whole point of posting is to be the point of no return, same rule every
+# other financial document in this codebase follows).
+_CANCELLABLE_STOCK_COUNT_STATUSES = ("DRAFT", "OPEN", "COUNTED", "REVIEWED")
+# Statuses in which a count entry (or recount) may still be recorded —
+# see docs/M8_ADVANCED_INVENTORY_DESIGN.md "Design Decision 3".
+_COUNTABLE_STOCK_COUNT_STATUSES = ("OPEN", "COUNTED")
+
+
+class StockCount(TimestampMixin, Base):
+    """A physical inventory count scoped to exactly one store. See
+    docs/M8_ADVANCED_INVENTORY_DESIGN.md "Design Decision 2" for the full
+    lifecycle and "Design Decision 5" for why posting recomputes variance
+    against CURRENT on-hand quantity rather than blindly trusting the
+    `expected_quantity` snapshot on each line."""
+
+    __tablename__ = "stock_counts"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('" + "', '".join(STOCK_COUNT_STATUSES) + "')",
+            name="ck_stock_counts_status",
+        ),
+        Index("ix_stock_counts_store_id", "store_id"),
+        Index("ix_stock_counts_status", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), nullable=False)
+    count_number: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="DRAFT")
+    # Optional scoping convenience captured at creation — expands into
+    # concrete StockCountLine rows at DRAFT time and is never
+    # re-evaluated later (docs/M8_ADVANCED_INVENTORY_DESIGN.md "Design
+    # Decision 1": a product added to the category after the count
+    # started is never silently swept in).
+    category_id: Mapped[int | None] = mapped_column(ForeignKey("product_categories.id"))
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    opened_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reviewed_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    posted_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancelled_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    lines: Mapped[list["StockCountLine"]] = relationship(back_populates="stock_count")
+
+
+class StockCountLine(TimestampMixin, Base):
+    """One product's expected/counted quantity within a StockCount.
+    Unique per (stock_count_id, product_id) — there is no separate
+    "recount" row type; a recount overwrites this same row's
+    counted_quantity/counted_by/counted_at under a row lock, with the
+    prior value preserved in the audit log (Design Decision 3)."""
+
+    __tablename__ = "stock_count_lines"
+    __table_args__ = (
+        UniqueConstraint("stock_count_id", "product_id", name="uq_stock_count_lines_count_product"),
+        CheckConstraint(
+            "expected_quantity IS NULL OR expected_quantity >= 0",
+            name="ck_stock_count_lines_expected_non_negative",
+        ),
+        CheckConstraint(
+            "counted_quantity IS NULL OR counted_quantity >= 0",
+            name="ck_stock_count_lines_counted_non_negative",
+        ),
+        Index("ix_stock_count_lines_stock_count_id", "stock_count_id"),
+        Index("ix_stock_count_lines_product_id", "product_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    stock_count_id: Mapped[int] = mapped_column(ForeignKey("stock_counts.id"), nullable=False)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), nullable=False)
+    # NULL at DRAFT (scope is fixed by this row's mere existence, but the
+    # quantity snapshot is not taken yet — Design Decision 2). Captured
+    # exactly once at DRAFT -> OPEN, or re-snapshotted during a
+    # drift-triggered recount (Design Decision 3) — never recomputed
+    # silently at posting.
+    expected_quantity: Mapped[Decimal | None] = mapped_column(Numeric(14, 3))
+    expected_unit_cost: Mapped[Decimal | None] = mapped_column(Numeric(14, 6))
+    # NULL means "not yet counted" — deliberately distinct from 0, which
+    # means "counted and found to be zero" (Design Decision 4).
+    counted_quantity: Mapped[Decimal | None] = mapped_column(Numeric(14, 3))
+    counted_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    counted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # How many times this line has been (re)counted — incremented on
+    # every count-entry call, including the first. Purely informational
+    # (the audit log is the real history); lets a reviewer see "this line
+    # was recounted" at a glance without reading audit_logs.
+    recount_number: Mapped[int] = mapped_column(nullable=False, default=0)
+
+    stock_count: Mapped[StockCount] = relationship(back_populates="lines")

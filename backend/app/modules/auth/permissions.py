@@ -61,6 +61,27 @@ AP_PAY = "ap.pay"
 # code rather than folded into ap.post so a role could plausibly have one
 # without the other, though M7's own matrix always grants them together.
 AP_CREDIT = "ap.credit"
+# M8 (docs/M8_ADVANCED_INVENTORY_DESIGN.md "Design Decision 2"): stock
+# counting is split into three tiers exactly like AP's write/post/pay
+# split — data entry (count.write covers create/open/count-entry/recount/
+# cancel) is separate from the review checkpoint (count.review) which is
+# separate from the financial-commitment posting step (count.post), so a
+# role can plausibly have one without the others (Inventory Clerk gets
+# only the first below — a deliberate separation-of-duties choice: the
+# person entering counts is never the same tier that commits them to the
+# GL, mirroring real stocktake controls).
+INVENTORY_COUNT_WRITE = "inventory.count.write"
+INVENTORY_COUNT_REVIEW = "inventory.count.review"
+INVENTORY_COUNT_POST = "inventory.count.post"
+# Transfer permissions split by the three real operational actions
+# (docs/M8_ADVANCED_INVENTORY_DESIGN.md "Design Decision 7"): drafting a
+# transfer is not itself a financial commitment (no inventory moves yet),
+# but shipping and receiving each move real stock and are kept as their
+# own codes so a store's own staff can be granted receive without ship
+# (or vice versa) if a future role needs that split.
+INVENTORY_TRANSFER_WRITE = "inventory.transfer.write"
+INVENTORY_TRANSFER_SHIP = "inventory.transfer.ship"
+INVENTORY_TRANSFER_RECEIVE = "inventory.transfer.receive"
 
 ALL_PERMISSIONS: dict[str, str] = {
     PRODUCTS_READ: "View products and barcodes",
@@ -92,6 +113,12 @@ ALL_PERMISSIONS: dict[str, str] = {
     ),
     AP_PAY: "Record a supplier payment, settling Accounts Payable",
     AP_CREDIT: "Create a supplier credit note, reducing Accounts Payable",
+    INVENTORY_COUNT_WRITE: "Create, open, count, recount, and cancel a stock count",
+    INVENTORY_COUNT_REVIEW: "Review a counted stock count before posting",
+    INVENTORY_COUNT_POST: "Post a reviewed stock count, committing its variance to the GL",
+    INVENTORY_TRANSFER_WRITE: "Create and cancel a draft inter-store transfer",
+    INVENTORY_TRANSFER_SHIP: "Ship an inter-store transfer from its source store",
+    INVENTORY_TRANSFER_RECEIVE: "Receive an inter-store transfer at its destination store",
 }
 
 # --- Roles --------------------------------------------------------------
@@ -135,6 +162,12 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         AP_POST,
         AP_PAY,
         AP_CREDIT,
+        INVENTORY_COUNT_WRITE,
+        INVENTORY_COUNT_REVIEW,
+        INVENTORY_COUNT_POST,
+        INVENTORY_TRANSFER_WRITE,
+        INVENTORY_TRANSFER_SHIP,
+        INVENTORY_TRANSFER_RECEIVE,
     ],
     CASHIER: [
         PRODUCTS_READ,
@@ -157,6 +190,14 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         # "record what the paperwork says").
         AP_READ,
         AP_WRITE,
+        # Counting/entering data is a clerk-level task; reviewing and
+        # posting the financial variance is not (see the permission
+        # constants' own docstring above for the separation-of-duties
+        # reasoning).
+        INVENTORY_COUNT_WRITE,
+        INVENTORY_TRANSFER_WRITE,
+        INVENTORY_TRANSFER_SHIP,
+        INVENTORY_TRANSFER_RECEIVE,
     ],
     AUDITOR: [
         PRODUCTS_READ,

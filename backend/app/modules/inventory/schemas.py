@@ -4,7 +4,7 @@ levels, and manual stock adjustments."""
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
 
 class InventoryMovementRead(BaseModel):
@@ -69,4 +69,74 @@ class StockAdjustmentRead(BaseModel):
     notes: str | None
     created_by: int | None
     approved_by: int | None
+    stock_count_id: int | None
     created_at: datetime
+
+
+# --- Stock counts (M8) -------------------------------------------------------
+
+
+class StockCountCreate(BaseModel):
+    store_id: int
+    category_id: int | None = None
+    product_ids: list[int] | None = Field(default=None, max_length=5000)
+    notes: str | None = Field(default=None, max_length=2000)
+
+
+class StockCountLineRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    stock_count_id: int
+    product_id: int
+    expected_quantity: Decimal | None
+    expected_unit_cost: Decimal | None
+    counted_quantity: Decimal | None
+    counted_by: int | None
+    counted_at: datetime | None
+    recount_number: int
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def variance_quantity(self) -> Decimal | None:
+        if self.counted_quantity is None or self.expected_quantity is None:
+            return None
+        return self.counted_quantity - self.expected_quantity
+
+
+class StockCountRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    store_id: int
+    count_number: str
+    status: str
+    category_id: int | None
+    notes: str | None
+    created_by: int | None
+    opened_by: int | None
+    opened_at: datetime | None
+    reviewed_by: int | None
+    reviewed_at: datetime | None
+    posted_by: int | None
+    posted_at: datetime | None
+    cancelled_by: int | None
+    cancelled_at: datetime | None
+    created_at: datetime
+
+
+class StockCountWithLinesRead(StockCountRead):
+    lines: list[StockCountLineRead]
+
+
+class StockCountEntryCreate(BaseModel):
+    product_id: int
+    counted_quantity: Decimal = Field(ge=0)
+
+
+class StockCountCancelRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=1000)
+
+
+class StockCountReopenRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=1000)

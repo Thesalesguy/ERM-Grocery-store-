@@ -76,8 +76,9 @@ def test_manager_can_read_accounts_and_journals(client: TestClient, db: Session)
     response = client.get("/api/v1/accounting/accounts", headers=headers)
     assert response.status_code == 200
     # 13 from M4 + 5 new M6 AP accounts (Bank Account, Accounts Payable,
-    # Purchase Price Variance, Purchase Discounts, Purchase Tax Expense).
-    assert len(response.json()) == 18
+    # Purchase Price Variance, Purchase Discounts, Purchase Tax Expense)
+    # + 1 new M8 account (Inventory In Transit).
+    assert len(response.json()) == 19
 
     response = client.get(f"/api/v1/accounting/journals?store_id={store.id}", headers=headers)
     assert response.status_code == 200

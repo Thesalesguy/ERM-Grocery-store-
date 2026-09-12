@@ -37,6 +37,7 @@ from app.modules.accounting.constants import (
     ACCOUNT_COGS,
     ACCOUNT_INVENTORY,
     ACCOUNT_INVENTORY_ADJUSTMENT_GAIN,
+    ACCOUNT_INVENTORY_IN_TRANSIT,
     ACCOUNT_INVENTORY_SHRINKAGE_EXPENSE,
     ACCOUNT_PURCHASE_CLEARING,
     ACCOUNT_PURCHASE_DISCOUNTS,
@@ -66,6 +67,7 @@ if TYPE_CHECKING:
     from app.modules.purchasing.models import GoodsReceipt, PurchaseReturn
     from app.modules.sales.models import Sale, SaleReturn
     from app.modules.sales.service import PaymentInput, _ComputedLine
+    from app.modules.transfers.models import InterStoreTransfer, InterStoreTransferReceipt
 
 
 @dataclass(frozen=True)
@@ -738,6 +740,76 @@ def post_stock_adjustment_journal(
         source_type="STOCK_ADJUSTMENT",
         source_id=stock_adjustment.id,
         memo=f"Stock adjustment {stock_adjustment.id}",
+        created_by=created_by,
+        lines=lines,
+    )
+
+
+# --- Inter-store transfers (M8) ----------------------------------------------
+
+
+def post_transfer_shipment_journal(
+    db: Session,
+    *,
+    transfer: "InterStoreTransfer",
+    shipped_value: Decimal,  # Σ shipped_quantity * unit_cost_at_shipment across lines
+    created_by: int | None,
+) -> JournalEntry | None:
+    """Dr Inventory In Transit / Cr Inventory, posted against the SOURCE
+    store (docs/M8_ADVANCED_INVENTORY_DESIGN.md 'Design Decision 9'). No
+    P&L impact — a pure balance-sheet reclassification of the same asset.
+    `shipped_value` is computed once by app.modules.transfers.service from
+    the exact (quantity, unit_cost_at_shipment) pairs also used to post
+    each TRANSFER_OUT movement — never re-derived here.
+
+    Returns None and posts nothing if the shipped value is zero (a
+    zero-cost product shipped for free — a real, legitimate scenario,
+    same convention as every other zero-value post_*_journal function)."""
+    if shipped_value <= 0:
+        return None
+    memo = f"Transfer {transfer.id} ({transfer.transfer_number}) shipped"
+    lines = [
+        _debit(ACCOUNT_INVENTORY_IN_TRANSIT, shipped_value, description=memo),
+        _credit(ACCOUNT_INVENTORY, shipped_value, description=memo),
+    ]
+    return _post_journal(
+        db,
+        store_id=transfer.from_store_id,
+        posting_date=transfer.shipped_at.date() if transfer.shipped_at else date.today(),
+        source_type="INTER_STORE_TRANSFER_SHIP",
+        source_id=transfer.id,
+        memo=memo,
+        created_by=created_by,
+        lines=lines,
+    )
+
+
+def post_transfer_receipt_journal(
+    db: Session,
+    *,
+    transfer_receipt: "InterStoreTransferReceipt",
+    received_value: Decimal,  # Σ quantity_received * unit_cost_at_shipment across items
+    created_by: int | None,
+) -> JournalEntry | None:
+    """Dr Inventory / Cr Inventory In Transit, posted against the
+    DESTINATION store — the exact mirror of post_transfer_shipment_journal,
+    using the SAME frozen unit_cost_at_shipment (never the destination's
+    own post-receipt WAC, which is itself derived FROM this value — using
+    it on both sides of its own derivation would be circular)."""
+    if received_value <= 0:
+        return None
+    memo = f"Transfer receipt {transfer_receipt.id} (transfer {transfer_receipt.transfer_id})"
+    lines = [
+        _debit(ACCOUNT_INVENTORY, received_value, description=memo),
+        _credit(ACCOUNT_INVENTORY_IN_TRANSIT, received_value, description=memo),
+    ]
+    return _post_journal(
+        db,
+        store_id=transfer_receipt.store_id,
+        posting_date=transfer_receipt.received_date,
+        source_type="INTER_STORE_TRANSFER_RECEIVE",
+        source_id=transfer_receipt.id,
+        memo=memo,
         created_by=created_by,
         lines=lines,
     )

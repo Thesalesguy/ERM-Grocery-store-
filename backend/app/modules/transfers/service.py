@@ -1,0 +1,683 @@
+"""Inter-store transfer business logic: draft creation, shipment (single
+event, from the source store), receipt (possibly several events, at the
+destination store), cancellation, and in-transit reconciliation.
+
+See docs/M8_ADVANCED_INVENTORY_DESIGN.md "Design Decisions 6-10" for the
+full design. The two highest-stakes functions here — `ship_transfer` and
+`receive_transfer` — follow the exact same locking/idempotency/atomicity
+discipline as app.modules.purchasing.service.receive_goods: lock the
+transfer header first, then every distinct affected PRODUCT row in
+ascending id order, validate under those locks, then post the inventory
+movement(s) and the matching accounting journal inline, in the same
+uncommitted transaction the caller commits once.
+"""
+
+import secrets
+from dataclasses import dataclass
+from datetime import UTC, date, datetime
+from decimal import ROUND_HALF_UP, Decimal
+
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationAppError
+from app.modules.accounting import service as accounting_service
+from app.modules.accounting.constants import ACCOUNT_INVENTORY_IN_TRANSIT
+from app.modules.audit import service as audit_service
+from app.modules.auth.models import Store
+from app.modules.inventory import service as inventory_service
+from app.modules.products.models import Product
+from app.modules.transfers.models import (
+    _CANCELLABLE_TRANSFER_STATUSES,
+    InterStoreTransfer,
+    InterStoreTransferLine,
+    InterStoreTransferReceipt,
+    InterStoreTransferReceiptItem,
+)
+
+_LEDGER_QUANTUM = Decimal("0.000001")  # matches accounting/service.py's own quantum
+
+
+def _quantize(value: Decimal) -> Decimal:
+    return value.quantize(_LEDGER_QUANTUM, rounding=ROUND_HALF_UP)
+
+
+def _enforce_store_access(caller_store_id: int | None, target_store_id: int, noun: str) -> None:
+    if caller_store_id is not None and caller_store_id != target_store_id:
+        raise ForbiddenError(
+            f"Your account is scoped to store {caller_store_id} and cannot access "
+            f"{noun} in store {target_store_id}",
+            error_code="STORE_ACCESS_DENIED",
+        )
+
+
+def _generate_transfer_number(from_store_id: int, to_store_id: int) -> str:
+    timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+    return f"XFER{from_store_id}-{to_store_id}-{timestamp}-{secrets.token_hex(3).upper()}"
+
+
+# --- Draft creation ----------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TransferLineInput:
+    source_product_id: int
+    requested_quantity: Decimal
+    # Explicit override for the rare deliberate SKU remap (Design
+    # Decision 6). When None, resolved by matching SKU in the
+    # destination store; if no match exists, line creation is rejected —
+    # the system never auto-creates a destination catalog entry.
+    destination_product_id: int | None = None
+
+
+def create_transfer(
+    db: Session,
+    *,
+    from_store_id: int,
+    to_store_id: int,
+    requested_date: date,
+    lines: list[TransferLineInput],
+    notes: str | None = None,
+    requested_by: int | None = None,
+    caller_store_id: int | None = None,
+) -> InterStoreTransfer:
+    """DRAFT: header + lines only, no inventory effect
+    (docs/M8_ADVANCED_INVENTORY_DESIGN.md 'Design Decision 7' — there is
+    no separate REQUESTED/APPROVED state; drafting is not itself a
+    financial or inventory commitment). Either store's own staff may
+    create a transfer between their store and another."""
+    if caller_store_id is not None and caller_store_id not in (from_store_id, to_store_id):
+        raise ForbiddenError(
+            f"Your account is scoped to store {caller_store_id} and cannot create a "
+            f"transfer between stores {from_store_id} and {to_store_id}",
+            error_code="STORE_ACCESS_DENIED",
+        )
+
+    if from_store_id == to_store_id:
+        raise ValidationAppError(
+            "Source and destination stores must be different", error_code="SAME_STORE_TRANSFER"
+        )
+    from_store = db.get(Store, from_store_id)
+    if from_store is None or not from_store.is_active:
+        raise NotFoundError(f"Store {from_store_id} not found")
+    to_store = db.get(Store, to_store_id)
+    if to_store is None or not to_store.is_active:
+        raise NotFoundError(f"Store {to_store_id} not found")
+
+    if not lines:
+        raise ValidationAppError(
+            "A transfer must have at least one line", error_code="EMPTY_TRANSFER"
+        )
+    for line in lines:
+        if line.requested_quantity <= 0:
+            raise ValidationAppError(
+                "Requested quantity must be positive", error_code="INVALID_QUANTITY"
+            )
+
+    source_product_ids = {line.source_product_id for line in lines}
+    source_products = {
+        p.id: p
+        for p in db.execute(select(Product).where(Product.id.in_(source_product_ids))).scalars()
+    }
+    missing_source = source_product_ids - set(source_products)
+    if missing_source:
+        raise NotFoundError(f"Source product(s) {sorted(missing_source)} not found")
+    for product in source_products.values():
+        if product.store_id != from_store_id:
+            raise ConflictError(
+                f"Product {product.id} does not belong to source store {from_store_id}",
+                error_code="STORE_MISMATCH",
+            )
+
+    resolved_lines: list[tuple[TransferLineInput, int]] = []
+    for line in lines:
+        source_product = source_products[line.source_product_id]
+        if line.destination_product_id is not None:
+            destination_product = db.get(Product, line.destination_product_id)
+            if destination_product is None:
+                raise NotFoundError(f"Product {line.destination_product_id} not found")
+            if destination_product.store_id != to_store_id:
+                raise ConflictError(
+                    f"Product {line.destination_product_id} does not belong to destination "
+                    f"store {to_store_id}",
+                    error_code="STORE_MISMATCH",
+                )
+        else:
+            destination_product = db.execute(
+                select(Product).where(
+                    Product.store_id == to_store_id, Product.sku == source_product.sku
+                )
+            ).scalar_one_or_none()
+            if destination_product is None:
+                raise NotFoundError(
+                    f"No product with SKU {source_product.sku!r} exists in destination store "
+                    f"{to_store_id} — create the catalog entry there before transferring "
+                    "this SKU (never auto-created)",
+                    error_code="DESTINATION_PRODUCT_NOT_FOUND",
+                )
+        resolved_lines.append((line, destination_product.id))
+
+    transfer = InterStoreTransfer(
+        from_store_id=from_store_id,
+        to_store_id=to_store_id,
+        transfer_number=_generate_transfer_number(from_store_id, to_store_id),
+        status="DRAFT",
+        requested_date=requested_date,
+        notes=notes,
+        requested_by=requested_by,
+    )
+    db.add(transfer)
+    db.flush()
+    for line, destination_product_id in resolved_lines:
+        db.add(
+            InterStoreTransferLine(
+                transfer_id=transfer.id,
+                source_product_id=line.source_product_id,
+                destination_product_id=destination_product_id,
+                requested_quantity=line.requested_quantity,
+                shipped_quantity=Decimal("0"),
+                received_quantity=Decimal("0"),
+            )
+        )
+
+    audit_service.log_event(
+        db,
+        user_id=requested_by,
+        action="TRANSFER_CREATED",
+        entity_type="inter_store_transfer",
+        entity_id=transfer.id,
+        after={
+            "from_store_id": from_store_id,
+            "to_store_id": to_store_id,
+            "line_count": len(lines),
+        },
+    )
+    db.commit()
+    db.refresh(transfer)
+    return transfer
+
+
+def get_transfer(db: Session, transfer_id: int) -> InterStoreTransfer:
+    transfer = db.get(InterStoreTransfer, transfer_id)
+    if transfer is None:
+        raise NotFoundError(f"Transfer {transfer_id} not found")
+    return transfer
+
+
+def list_transfers(
+    db: Session,
+    *,
+    from_store_id: int | None = None,
+    to_store_id: int | None = None,
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[InterStoreTransfer]:
+    query = (
+        select(InterStoreTransfer)
+        .order_by(InterStoreTransfer.created_at.desc(), InterStoreTransfer.id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    if from_store_id is not None:
+        query = query.where(InterStoreTransfer.from_store_id == from_store_id)
+    if to_store_id is not None:
+        query = query.where(InterStoreTransfer.to_store_id == to_store_id)
+    if status is not None:
+        query = query.where(InterStoreTransfer.status == status)
+    return list(db.execute(query).scalars().all())
+
+
+# --- Shipment (the single ship event) ---------------------------------------
+
+
+@dataclass(frozen=True)
+class ShipLineInput:
+    transfer_line_id: int
+    quantity_to_ship: Decimal
+
+
+def ship_transfer(
+    db: Session,
+    *,
+    transfer_id: int,
+    lines: list[ShipLineInput],
+    client_transaction_id: str,
+    caller_store_id: int | None,
+    shipped_by: int | None = None,
+) -> InterStoreTransfer:
+    """DRAFT -> SHIPPED. A transfer ships exactly once (Design Decision
+    8) — a line's own `quantity_to_ship` may be less than
+    `requested_quantity` (a genuine partial shipment) and a line omitted
+    from `lines` entirely ships 0. Locks the transfer header first (so a
+    second concurrent ship attempt on the SAME transfer serializes and,
+    on losing, sees SHIPPED already), then every distinct SOURCE product
+    touched, ascending id order — the identical deadlock-safe pattern
+    receive_goods uses for the same reason."""
+    existing = db.execute(
+        select(InterStoreTransfer).where(
+            InterStoreTransfer.ship_client_transaction_id == client_transaction_id
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+
+    if not lines:
+        raise ValidationAppError(
+            "A shipment must include at least one line", error_code="EMPTY_SHIPMENT"
+        )
+    for line in lines:
+        if line.quantity_to_ship <= 0:
+            raise ValidationAppError(
+                "Shipped quantity must be positive", error_code="INVALID_QUANTITY"
+            )
+
+    transfer = db.execute(
+        select(InterStoreTransfer).where(InterStoreTransfer.id == transfer_id).with_for_update()
+    ).scalar_one_or_none()
+    if transfer is None:
+        raise NotFoundError(f"Transfer {transfer_id} not found")
+    _enforce_store_access(caller_store_id, transfer.from_store_id, "shipping this transfer")
+
+    # Post-lock idempotency re-check (the M5/M6/M7-discovered pattern: a
+    # racing caller may have already shipped this exact transfer while
+    # this caller waited for the lock).
+    if transfer.ship_client_transaction_id == client_transaction_id:
+        return transfer
+    if transfer.status != "DRAFT":
+        raise ConflictError(
+            f"Transfer {transfer_id} is {transfer.status}, not DRAFT — a transfer can only "
+            "be shipped once",
+            error_code="INVALID_TRANSFER_STATE",
+        )
+
+    line_ids = {line.transfer_line_id for line in lines}
+    db_lines = {
+        line.id: line
+        for line in db.execute(
+            select(InterStoreTransferLine).where(InterStoreTransferLine.id.in_(line_ids))
+        ).scalars()
+    }
+    for input_line in lines:
+        db_line = db_lines.get(input_line.transfer_line_id)
+        if db_line is None or db_line.transfer_id != transfer_id:
+            raise NotFoundError(
+                f"Transfer line {input_line.transfer_line_id} not found on transfer "
+                f"{transfer_id}"
+            )
+        if input_line.quantity_to_ship > db_line.requested_quantity:
+            raise ConflictError(
+                f"Cannot ship {input_line.quantity_to_ship} of line "
+                f"{input_line.transfer_line_id}: only {db_line.requested_quantity} was "
+                "requested",
+                error_code="OVER_SHIPMENT",
+            )
+
+    distinct_source_product_ids = sorted(
+        {db_lines[line.transfer_line_id].source_product_id for line in lines}
+    )
+    locked_products = {
+        product_id: inventory_service.lock_product_for_update(db, product_id)
+        for product_id in distinct_source_product_ids
+    }
+
+    transfer.ship_client_transaction_id = client_transaction_id
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        winner = db.execute(
+            select(InterStoreTransfer).where(
+                InterStoreTransfer.ship_client_transaction_id == client_transaction_id
+            )
+        ).scalar_one_or_none()
+        if winner is None:
+            raise
+        return winner
+
+    total_shipped_value = Decimal("0")
+    for input_line in lines:
+        db_line = db_lines[input_line.transfer_line_id]
+        product = locked_products[db_line.source_product_id]
+        unit_cost = product.current_cost
+        db_line.shipped_quantity = input_line.quantity_to_ship
+        db_line.unit_cost_at_shipment = unit_cost
+        total_shipped_value += _quantize(input_line.quantity_to_ship * unit_cost)
+        inventory_service.record_movement(
+            db,
+            product=product,
+            store_id=transfer.from_store_id,
+            movement_type="TRANSFER_OUT",
+            quantity_delta=-input_line.quantity_to_ship,
+            unit_cost_at_movement=unit_cost,
+            reference_type="inter_store_transfer",
+            reference_id=transfer.id,
+            created_by=shipped_by,
+        )
+
+    transfer.status = "SHIPPED"
+    transfer.shipped_by = shipped_by
+    transfer.shipped_at = datetime.now(UTC)
+
+    audit_service.log_event(
+        db,
+        user_id=shipped_by,
+        action="TRANSFER_SHIPPED",
+        entity_type="inter_store_transfer",
+        entity_id=transfer.id,
+        after={"line_count": len(lines), "shipped_value": str(total_shipped_value)},
+    )
+
+    accounting_service.post_transfer_shipment_journal(
+        db, transfer=transfer, shipped_value=total_shipped_value, created_by=shipped_by
+    )
+
+    db.flush()
+    return transfer
+
+
+# --- Receipt (possibly several events) --------------------------------------
+
+
+@dataclass(frozen=True)
+class ReceiveLineInput:
+    transfer_line_id: int
+    quantity_received: Decimal
+
+
+def receive_transfer(
+    db: Session,
+    *,
+    transfer_id: int,
+    received_date: date,
+    lines: list[ReceiveLineInput],
+    client_transaction_id: str,
+    caller_store_id: int | None,
+    received_by: int | None = None,
+    notes: str | None = None,
+) -> InterStoreTransferReceipt:
+    """SHIPPED, one or more receipt events, each capped at
+    (shipped_quantity - already received) per line. Mirrors
+    receive_goods's locking/idempotency shape exactly: lock the transfer
+    header first, then every distinct DESTINATION product touched,
+    ascending id order. Uses the FROZEN unit_cost_at_shipment for the
+    destination's own WAC recompute — never the destination's current
+    WAC (Design Decision 4/9)."""
+    existing = db.execute(
+        select(InterStoreTransferReceipt).where(
+            InterStoreTransferReceipt.client_transaction_id == client_transaction_id
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+
+    if not lines:
+        raise ValidationAppError(
+            "A transfer receipt must have at least one line", error_code="EMPTY_RECEIPT"
+        )
+    for line in lines:
+        if line.quantity_received <= 0:
+            raise ValidationAppError(
+                "Received quantity must be positive", error_code="INVALID_QUANTITY"
+            )
+
+    transfer = db.execute(
+        select(InterStoreTransfer).where(InterStoreTransfer.id == transfer_id).with_for_update()
+    ).scalar_one_or_none()
+    if transfer is None:
+        raise NotFoundError(f"Transfer {transfer_id} not found")
+    _enforce_store_access(caller_store_id, transfer.to_store_id, "receiving this transfer")
+
+    # Post-lock idempotency re-check.
+    existing = db.execute(
+        select(InterStoreTransferReceipt).where(
+            InterStoreTransferReceipt.client_transaction_id == client_transaction_id
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+
+    if transfer.status != "SHIPPED":
+        raise ConflictError(
+            f"Transfer {transfer_id} is {transfer.status} and cannot be received (must be "
+            "SHIPPED)",
+            error_code="INVALID_TRANSFER_STATE",
+        )
+
+    requested_by_line: dict[int, Decimal] = {}
+    for line in lines:
+        requested_by_line[line.transfer_line_id] = (
+            requested_by_line.get(line.transfer_line_id, Decimal("0")) + line.quantity_received
+        )
+
+    line_ids = set(requested_by_line)
+    db_lines = {
+        line.id: line
+        for line in db.execute(
+            select(InterStoreTransferLine).where(InterStoreTransferLine.id.in_(line_ids))
+        ).scalars()
+    }
+    for transfer_line_id, requested_qty in requested_by_line.items():
+        db_line = db_lines.get(transfer_line_id)
+        if db_line is None or db_line.transfer_id != transfer_id:
+            raise NotFoundError(
+                f"Transfer line {transfer_line_id} not found on transfer {transfer_id}"
+            )
+        remaining = db_line.shipped_quantity - db_line.received_quantity
+        if requested_qty > remaining:
+            raise ConflictError(
+                f"Cannot receive {requested_qty} of line {transfer_line_id}: only "
+                f"{remaining} remains unreceived (of {db_line.shipped_quantity} shipped)",
+                error_code="OVER_RECEIPT",
+            )
+
+    distinct_destination_product_ids = sorted(
+        {db_lines[line_id].destination_product_id for line_id in requested_by_line}
+    )
+    locked_products = {
+        product_id: inventory_service.lock_product_for_update(db, product_id)
+        for product_id in distinct_destination_product_ids
+    }
+
+    receipt = InterStoreTransferReceipt(
+        transfer_id=transfer_id,
+        store_id=transfer.to_store_id,
+        client_transaction_id=client_transaction_id,
+        received_date=received_date,
+        received_by=received_by,
+        notes=notes,
+    )
+    db.add(receipt)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        winner = db.execute(
+            select(InterStoreTransferReceipt).where(
+                InterStoreTransferReceipt.client_transaction_id == client_transaction_id
+            )
+        ).scalar_one_or_none()
+        if winner is None:
+            raise
+        return winner
+
+    total_received_value = Decimal("0")
+    for line in lines:
+        db_line = db_lines[line.transfer_line_id]
+        product = locked_products[db_line.destination_product_id]
+        # Guaranteed non-null: only a SHIPPED transfer's lines reach here
+        # (checked above), and ship_transfer always sets
+        # unit_cost_at_shipment before advancing the transfer to SHIPPED.
+        assert db_line.unit_cost_at_shipment is not None
+        unit_cost = db_line.unit_cost_at_shipment
+        new_wac = inventory_service.compute_new_wac(
+            existing_qty=product.current_qty_on_hand,
+            existing_wac=product.current_cost,
+            received_qty=line.quantity_received,
+            received_unit_cost=unit_cost,
+        )
+        inventory_service.record_movement(
+            db,
+            product=product,
+            store_id=transfer.to_store_id,
+            movement_type="TRANSFER_IN",
+            quantity_delta=line.quantity_received,
+            unit_cost_at_movement=unit_cost,
+            reference_type="inter_store_transfer",
+            reference_id=transfer.id,
+            created_by=received_by,
+            new_product_cost=new_wac,
+        )
+        total_received_value += _quantize(line.quantity_received * unit_cost)
+        db.add(
+            InterStoreTransferReceiptItem(
+                inter_store_transfer_receipt_id=receipt.id,
+                inter_store_transfer_line_id=line.transfer_line_id,
+                quantity_received=line.quantity_received,
+            )
+        )
+
+    for transfer_line_id, requested_qty in requested_by_line.items():
+        db_lines[transfer_line_id].received_quantity = (
+            db_lines[transfer_line_id].received_quantity + requested_qty
+        )
+
+    audit_service.log_event(
+        db,
+        user_id=received_by,
+        action="TRANSFER_RECEIPT_COMPLETED",
+        entity_type="inter_store_transfer_receipt",
+        entity_id=receipt.id,
+        after={
+            "transfer_id": transfer_id,
+            "line_count": len(lines),
+            "received_value": str(total_received_value),
+        },
+    )
+
+    accounting_service.post_transfer_receipt_journal(
+        db, transfer_receipt=receipt, received_value=total_received_value, created_by=received_by
+    )
+
+    db.flush()
+    return receipt
+
+
+def get_transfer_receipt(db: Session, transfer_receipt_id: int) -> InterStoreTransferReceipt:
+    receipt = db.get(InterStoreTransferReceipt, transfer_receipt_id)
+    if receipt is None:
+        raise NotFoundError(f"Transfer receipt {transfer_receipt_id} not found")
+    return receipt
+
+
+def list_transfer_receipts(db: Session, *, transfer_id: int) -> list[InterStoreTransferReceipt]:
+    return list(
+        db.execute(
+            select(InterStoreTransferReceipt)
+            .where(InterStoreTransferReceipt.transfer_id == transfer_id)
+            .order_by(InterStoreTransferReceipt.created_at)
+        )
+        .scalars()
+        .all()
+    )
+
+
+# --- Cancellation --------------------------------------------------------
+
+
+def cancel_transfer(
+    db: Session,
+    transfer_id: int,
+    *,
+    actor_id: int | None,
+    caller_store_id: int | None,
+    reason: str | None = None,
+) -> InterStoreTransfer:
+    """Only legal from DRAFT (Design Decision 7) — once SHIPPED, inventory
+    has already left the source store; reversing that safely is deferred
+    (see the design doc's 'Deferred' section), not attempted here as an
+    unsafe partial fix."""
+    transfer = db.execute(
+        select(InterStoreTransfer).where(InterStoreTransfer.id == transfer_id).with_for_update()
+    ).scalar_one_or_none()
+    if transfer is None:
+        raise NotFoundError(f"Transfer {transfer_id} not found")
+    if caller_store_id is not None and caller_store_id not in (
+        transfer.from_store_id,
+        transfer.to_store_id,
+    ):
+        raise ForbiddenError(
+            f"Your account is scoped to store {caller_store_id} and cannot cancel this " "transfer",
+            error_code="STORE_ACCESS_DENIED",
+        )
+    if transfer.status == "CANCELLED":
+        return transfer
+    if transfer.status not in _CANCELLABLE_TRANSFER_STATUSES:
+        raise ConflictError(
+            f"Transfer {transfer_id} is {transfer.status} and cannot be cancelled (only a "
+            "DRAFT transfer can be — inventory has already moved otherwise)",
+            error_code="INVALID_TRANSFER_STATE",
+        )
+    transfer.status = "CANCELLED"
+    transfer.cancelled_by = actor_id
+    transfer.cancelled_at = datetime.now(UTC)
+    audit_service.log_event(
+        db,
+        user_id=actor_id,
+        action="TRANSFER_CANCELLED",
+        entity_type="inter_store_transfer",
+        entity_id=transfer.id,
+        after={"status": "CANCELLED", "reason": reason},
+    )
+    db.commit()
+    db.refresh(transfer)
+    return transfer
+
+
+# --- Reconciliation ----------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class InventoryInTransitReconciliationRow:
+    gl_in_transit_balance: Decimal
+    outstanding_in_transit_total: Decimal
+    discrepancy: Decimal
+
+
+def inventory_in_transit_reconciliation(db: Session) -> InventoryInTransitReconciliationRow:
+    """Compares the Inventory In Transit GL balance against Σ
+    (shipped_quantity - received_quantity) * unit_cost_at_shipment across
+    every not-fully-received transfer line — company-wide, not
+    per-store, since the account represents value in transit BETWEEN
+    stores, not within one (docs/M8_ADVANCED_INVENTORY_DESIGN.md
+    'Design Decision 9')."""
+    rows = accounting_service.trial_balance(db)
+    account_row = next((r for r in rows if r.account_code == ACCOUNT_INVENTORY_IN_TRANSIT), None)
+    gl_balance = (
+        (account_row.total_debit - account_row.total_credit) if account_row else Decimal("0")
+    )
+
+    outstanding_lines = list(
+        db.execute(
+            select(InterStoreTransferLine).where(
+                InterStoreTransferLine.shipped_quantity > InterStoreTransferLine.received_quantity
+            )
+        )
+        .scalars()
+        .all()
+    )
+    outstanding_total = Decimal("0")
+    for line in outstanding_lines:
+        # Guaranteed non-null: shipped_quantity > received_quantity >= 0
+        # means this line has been shipped, and ship_transfer always sets
+        # unit_cost_at_shipment before shipped_quantity becomes positive.
+        assert line.unit_cost_at_shipment is not None
+        outstanding_total += _quantize(
+            (line.shipped_quantity - line.received_quantity) * line.unit_cost_at_shipment
+        )
+    return InventoryInTransitReconciliationRow(
+        gl_in_transit_balance=gl_balance,
+        outstanding_in_transit_total=outstanding_total,
+        discrepancy=gl_balance - outstanding_total,
+    )

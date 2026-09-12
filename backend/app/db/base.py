@@ -26,7 +26,12 @@ from app.modules.auth.models import (  # noqa: F401
     User,
     UserRole,
 )
-from app.modules.inventory.models import InventoryMovement, StockAdjustment  # noqa: F401
+from app.modules.inventory.models import (  # noqa: F401
+    InventoryMovement,
+    StockAdjustment,
+    StockCount,
+    StockCountLine,
+)
 from app.modules.products.models import Product, ProductBarcode, ProductCategory  # noqa: F401
 from app.modules.purchasing.models import (  # noqa: F401
     GoodsReceipt,
@@ -45,3 +50,9 @@ from app.modules.sales.models import (  # noqa: F401
     SaleReturnItem,
 )
 from app.modules.tax.models import TaxRate  # noqa: F401
+from app.modules.transfers.models import (  # noqa: F401
+    InterStoreTransfer,
+    InterStoreTransferLine,
+    InterStoreTransferReceipt,
+    InterStoreTransferReceiptItem,
+)

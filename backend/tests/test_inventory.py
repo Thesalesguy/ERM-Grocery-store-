@@ -123,7 +123,7 @@ def test_unknown_movement_type_rejected(db: Session) -> None:
         InventoryMovement(
             store_id=store.id,
             product_id=product.id,
-            movement_type="TRANSFER_IN",  # not in MOVEMENT_TYPES for M1
+            movement_type="NOT_A_REAL_MOVEMENT_TYPE",  # not in MOVEMENT_TYPES
             quantity_delta=Decimal("5"),
             unit_cost_at_movement=Decimal("1"),
             resulting_quantity_on_hand=Decimal("5"),

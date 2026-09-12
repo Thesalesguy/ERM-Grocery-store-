@@ -20,6 +20,17 @@ ACCOUNT_MOBILE_MONEY_CLEARING = "1020"
 ACCOUNT_BANK_TRANSFER_CLEARING = "1030"
 ACCOUNT_OTHER_PAYMENT_CLEARING = "1040"
 ACCOUNT_INVENTORY = "1500"
+# Goods shipped from a source store but not yet received at the
+# destination (docs/M8_ADVANCED_INVENTORY_DESIGN.md "Design Decision 9").
+# A genuine new economic position with no existing account able to
+# represent it: collapsing this into plain Inventory would make the
+# per-store operational stock level (which correctly excludes in-transit
+# goods — you cannot sell what hasn't arrived) permanently diverge from
+# the GL Inventory balance (which must include it, since the business
+# still owns the value) with no way to reconcile the difference. No P&L
+# impact ever touches this account — a transfer is a pure balance-sheet
+# reclassification of the same asset.
+ACCOUNT_INVENTORY_IN_TRANSIT = "1520"
 # A real operating bank account (docs/M6_AP_VENDOR_ACCOUNTING.md "Supplier
 # payment accounting") — deliberately DISTINCT from the sales-side
 # BANK_TRANSFER/CARD/MOBILE_MONEY "Clearing" accounts above, which model
@@ -162,6 +173,15 @@ SYSTEM_ACCOUNTS: list[tuple[str, str, str, str, str]] = [
         "ASSET",
         "DEBIT",
         "Weighted-average cost value of on-hand stock across all stores.",
+    ),
+    (
+        ACCOUNT_INVENTORY_IN_TRANSIT,
+        "Inventory In Transit",
+        "ASSET",
+        "DEBIT",
+        "Goods shipped from a source store but not yet received at the destination store "
+        "(docs/M8_ADVANCED_INVENTORY_DESIGN.md 'Transfer accounting'); a pure balance-sheet "
+        "reclassification with no P&L impact.",
     ),
     (
         ACCOUNT_PURCHASE_CLEARING,
