@@ -3,7 +3,11 @@ import * as transfersApi from '../api/transfers'
 import { ApiError } from '../api/client'
 import { useAuth } from '../auth/AuthContext'
 
-function CreateTransferForm({ onCreated }: { onCreated: (t: transfersApi.TransferWithLines) => void }) {
+function CreateTransferForm({
+  onCreated,
+}: {
+  onCreated: (t: transfersApi.TransferWithLines) => void
+}) {
   const [fromStoreId, setFromStoreId] = useState('')
   const [toStoreId, setToStoreId] = useState('')
   const [sourceProductId, setSourceProductId] = useState('')

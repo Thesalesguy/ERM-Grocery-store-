@@ -185,8 +185,7 @@ function CountDetail({
         <div>
           <h2 className="text-sm font-semibold text-gray-900">{count.count_number}</h2>
           <p className="text-xs text-gray-500">
-            Store {count.store_id} ·{' '}
-            <span className="font-medium uppercase">{count.status}</span>
+            Store {count.store_id} · <span className="font-medium uppercase">{count.status}</span>
           </p>
         </div>
         <div className="flex gap-2">

@@ -104,9 +104,7 @@ const SAMPLE_DRAFT_INVOICE = {
   ],
 }
 
-function stubFetch(
-  handler: (url: string, method: string, init?: RequestInit) => Response | null,
-) {
+function stubFetch(handler: (url: string, method: string, init?: RequestInit) => Response | null) {
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: string | URL, init?: RequestInit) => {

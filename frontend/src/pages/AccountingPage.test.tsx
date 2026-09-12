@@ -87,10 +87,7 @@ describe('AccountingPage', () => {
   })
 
   it('lists journal entries by default', async () => {
-    mockFetchRoutes([
-      ...AUTH_ROUTES,
-      { path: '/api/v1/accounting/journals', json: [SAMPLE_ENTRY] },
-    ])
+    mockFetchRoutes([...AUTH_ROUTES, { path: '/api/v1/accounting/journals', json: [SAMPLE_ENTRY] }])
     await renderAccounting()
 
     await waitFor(() => expect(screen.getByText('JE7-TEST')).toBeInTheDocument())
@@ -183,7 +180,9 @@ describe('AccountingPage', () => {
     await waitFor(() => expect(screen.getByText('JE7-TEST')).toBeInTheDocument())
     fireEvent.click(screen.getByText('JE7-TEST'))
 
-    await waitFor(() => expect(screen.getByRole('button', { name: /reverse entry/i })).toBeInTheDocument())
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /reverse entry/i })).toBeInTheDocument(),
+    )
     fireEvent.click(screen.getByRole('button', { name: /reverse entry/i }))
 
     await waitFor(() => expect(reverseCalled).toBe(true))

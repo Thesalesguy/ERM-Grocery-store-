@@ -19,5 +19,7 @@ export interface ReplenishmentSuggestion {
 export function getReplenishmentSuggestions(
   params: { store_id?: number } = {},
 ): Promise<ReplenishmentSuggestion[]> {
-  return apiFetch<ReplenishmentSuggestion[]>(`/api/v1/replenishment/suggestions${buildQuery(params)}`)
+  return apiFetch<ReplenishmentSuggestion[]>(
+    `/api/v1/replenishment/suggestions${buildQuery(params)}`,
+  )
 }

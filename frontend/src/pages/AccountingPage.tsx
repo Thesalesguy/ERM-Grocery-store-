@@ -139,12 +139,8 @@ function JournalDetail({
                 <span className="font-mono text-xs text-gray-500">{line.account_code}</span>{' '}
                 {line.account_name}
               </td>
-              <td className="py-1 pr-4 text-right">
-                {Number(line.debit) > 0 ? line.debit : ''}
-              </td>
-              <td className="py-1 pr-4 text-right">
-                {Number(line.credit) > 0 ? line.credit : ''}
-              </td>
+              <td className="py-1 pr-4 text-right">{Number(line.debit) > 0 ? line.debit : ''}</td>
+              <td className="py-1 pr-4 text-right">{Number(line.credit) > 0 ? line.credit : ''}</td>
             </tr>
           ))}
         </tbody>
@@ -156,9 +152,9 @@ function JournalDetail({
         !entry.is_reversed &&
         entry.source_type !== 'MANUAL' && (
           <p className="mt-2 text-xs text-gray-500">
-            This entry was posted automatically from a {entry.source_type.toLowerCase()} and
-            cannot be reversed here — doing so would correct the accounting without undoing the
-            operational transaction (inventory, payment, stock) that produced it.
+            This entry was posted automatically from a {entry.source_type.toLowerCase()} and cannot
+            be reversed here — doing so would correct the accounting without undoing the operational
+            transaction (inventory, payment, stock) that produced it.
           </p>
         )}
       <div className="mt-4 flex gap-2">

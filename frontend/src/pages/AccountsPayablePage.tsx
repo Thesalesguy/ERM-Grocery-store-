@@ -104,9 +104,9 @@ function InvoiceDetail({ invoiceId, onBack }: { invoiceId: number; onBack: () =>
   const [paymentAmount, setPaymentAmount] = useState('')
   const [paymentMethod, setPaymentMethod] =
     useState<apApi.SupplierPaymentCreateInput['payment_method']>('CASH')
-  const [extraAllocations, setExtraAllocations] = useState<
-    { invoiceId: string; amount: string }[]
-  >([])
+  const [extraAllocations, setExtraAllocations] = useState<{ invoiceId: string; amount: string }[]>(
+    [],
+  )
   const [creditReason, setCreditReason] =
     useState<apApi.SupplierCreditNoteReason>('COMMERCIAL_DISCOUNT')
   const [creditAmount, setCreditAmount] = useState('')
@@ -161,9 +161,7 @@ function InvoiceDetail({ invoiceId, onBack }: { invoiceId: number; onBack: () =>
             amount: row.amount,
           })),
       ]
-      const total = allocations
-        .reduce((sum, a) => sum + Number(a.amount || 0), 0)
-        .toFixed(2)
+      const total = allocations.reduce((sum, a) => sum + Number(a.amount || 0), 0).toFixed(2)
       await apApi.createPayment({
         store_id: user.store_id,
         supplier_id: invoice.supplier_id,
@@ -404,8 +402,8 @@ function InvoiceDetail({ invoiceId, onBack }: { invoiceId: number; onBack: () =>
             </p>
           )}
           <p className="mt-2 text-xs text-gray-400">
-            A credit note is immutable once created and fully applied to this invoice
-            immediately — never left as an unapplied balance.
+            A credit note is immutable once created and fully applied to this invoice immediately —
+            never left as an unapplied balance.
           </p>
         </div>
       )}
@@ -582,8 +580,8 @@ function NewInvoiceForm({
       </button>
       <p className="mt-2 text-xs text-gray-400">
         Line totals, tax, and the invoice grand total are calculated by the server from what you
-        enter here — never displayed as an estimate before the server confirms them. Posting will
-        be rejected (not silently accepted) if any line would exceed what was actually received.
+        enter here — never displayed as an estimate before the server confirms them. Posting will be
+        rejected (not silently accepted) if any line would exceed what was actually received.
       </p>
     </div>
   )
@@ -613,9 +611,7 @@ function PurchaseOrderWorkflow({
       setPurchaseOrders(pos)
       setMatching(matchStatus)
     } catch (err) {
-      setLoadError(
-        err instanceof ApiError ? err.message : 'Could not load this purchase order.',
-      )
+      setLoadError(err instanceof ApiError ? err.message : 'Could not load this purchase order.')
     }
   }
 
