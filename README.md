@@ -1,4 +1,4 @@
-# Grocery Store ERP/POS
+# ERP-Grocery-store
 
 A production-oriented, self-hosted ERP/POS system for a grocery store: barcode POS, inventory
 with Weighted Average Cost, purchasing/goods receiving, and Profit & Loss reporting.
