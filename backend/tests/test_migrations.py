@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import Engine, create_engine, inspect
 
 from alembic import command
 from app.core.config import get_settings
@@ -365,4 +365,202 @@ def test_m9_downgrade_refuses_when_generated_po_exists(migrations_db: str) -> No
                 )
         finally:
             engine.dispose()
+        command.downgrade(cfg, "base")
+
+
+def _capture_m0_m8_integrity_snapshot(engine: Engine) -> dict[str, object]:
+    """A deterministic snapshot of every M0-M8 BUSINESS/OPERATIONAL
+    table's row count plus a handful of monetary/quantity aggregates —
+    used to prove the M9 migration (upgrade, downgrade, and re-upgrade)
+    never silently alters pre-existing operational/accounting data.
+    Column additions (`replenishment_plan_id`, `target_stock_quantity`,
+    `minimum_stock_quantity`) are all nullable, so they must never change
+    any of these numbers.
+
+    Deliberately EXCLUDES `permissions`/`role_permissions`/`roles`: this
+    codebase's M2 RBAC-seed migration (e6180fca2ee0) imports the LIVE
+    `app.modules.auth.permissions.ALL_PERMISSIONS`/`ROLE_PERMISSIONS`
+    dicts rather than a frozen historical snapshot (see that file's own
+    docstring — a deliberate M2-era design choice, not an M9 defect), and
+    every milestone from M4 onward (M4, M5, M6, M7, M8, M9 — verified by
+    grepping alembic/versions/*.py for this import) follows the same
+    add-permissions-then-delete-them-on-downgrade pattern. The practical
+    effect: in a from-scratch test build against TODAY's code, M2 already
+    seeds ALL currently-defined permissions (including M9's
+    supply_chain.* ones) at the M2 step, so "M8 head" and "M9 head" show
+    IDENTICAL permission counts in this environment, and M9's own
+    downgrade (which unconditionally deletes its 4 permission codes,
+    mirroring M8/M7/M6/M5/M4's identical pattern) then removes 4 rows
+    that a freshly-built "M8 head" would still have — a real, but
+    SYSTEMIC AND PRE-EXISTING (not M9-specific) migration-testing
+    limitation, documented in docs/M9_HARDENING_AUDIT.md rather than
+    patched ad hoc in only one milestone's migration file. This function
+    still captures those three tables' counts for visibility in the
+    returned dict; the caller must not assert equality on them."""
+    with engine.connect() as conn:
+        counts = {}
+        for table in (
+            "stores",
+            "product_categories",
+            "products",
+            "suppliers",
+            "purchase_orders",
+            "purchase_order_items",
+            "inter_store_transfers",
+            "inter_store_transfer_lines",
+        ):
+            counts[f"count:{table}"] = conn.exec_driver_sql(
+                f"SELECT COUNT(*) FROM {table}"
+            ).scalar_one()
+        for informational_table in ("permissions", "roles", "role_permissions"):
+            counts[f"informational_only:{informational_table}"] = conn.exec_driver_sql(
+                f"SELECT COUNT(*) FROM {informational_table}"
+            ).scalar_one()
+        counts["sum:products.current_qty_on_hand"] = conn.exec_driver_sql(
+            "SELECT COALESCE(SUM(current_qty_on_hand), 0) FROM products"
+        ).scalar_one()
+        counts["sum:products.current_cost"] = conn.exec_driver_sql(
+            "SELECT COALESCE(SUM(current_cost), 0) FROM products"
+        ).scalar_one()
+        counts["sum:purchase_order_items.quantity_ordered"] = conn.exec_driver_sql(
+            "SELECT COALESCE(SUM(quantity_ordered), 0) FROM purchase_order_items"
+        ).scalar_one()
+        counts["sum:purchase_order_items.quantity_received"] = conn.exec_driver_sql(
+            "SELECT COALESCE(SUM(quantity_received), 0) FROM purchase_order_items"
+        ).scalar_one()
+        counts["sum:inter_store_transfer_lines.requested_quantity"] = conn.exec_driver_sql(
+            "SELECT COALESCE(SUM(requested_quantity), 0) FROM inter_store_transfer_lines"
+        ).scalar_one()
+        counts["sum:inter_store_transfer_lines.shipped_quantity"] = conn.exec_driver_sql(
+            "SELECT COALESCE(SUM(shipped_quantity), 0) FROM inter_store_transfer_lines"
+        ).scalar_one()
+        return counts
+
+
+def test_m0_m8_data_integrity_survives_m9_upgrade_downgrade_reupgrade(
+    migrations_db: str,
+) -> None:
+    """Phase 10 of the M9 hardening pass: populates real M0-M8 data (a
+    store, category, product, supplier, a purchase order with a partially
+    received line, and an inter-store transfer with a partially shipped
+    line), captures a row-count-and-aggregate snapshot, then proves that
+    snapshot is BIT-FOR-BIT identical after upgrading to M9 head, after
+    downgrading back to M8 head, and after re-upgrading to M9 head again.
+    A single divergence anywhere would mean the M9 migration silently
+    altered pre-existing operational data — exactly what this test exists
+    to catch."""
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M8_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            store_id = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, created_at) "
+                "VALUES ('Integrity Store', 'UTC', true, now()) RETURNING id"
+            ).scalar_one()
+            category_id = conn.exec_driver_sql(
+                "INSERT INTO product_categories (name, is_active, created_at) "
+                "VALUES ('Integrity Category', true, now()) RETURNING id"
+            ).scalar_one()
+            supplier_id = conn.exec_driver_sql(
+                "INSERT INTO suppliers (name, is_active, created_at) "
+                "VALUES ('Integrity Supplier', true, now()) RETURNING id"
+            ).scalar_one()
+            product_id = conn.exec_driver_sql(
+                "INSERT INTO products "
+                "(store_id, category_id, sku, name, unit_of_measure, is_weighed, "
+                " current_price, current_cost, current_qty_on_hand, "
+                " allow_negative_stock, is_active, created_at) "
+                f"VALUES ({store_id}, {category_id}, 'SKU-INTEGRITY', 'Integrity Product', "
+                "'each', false, 9.99, 4.50, 37.500, false, true, now()) RETURNING id"
+            ).scalar_one()
+            store_b_id = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, created_at) "
+                "VALUES ('Integrity Store B', 'UTC', true, now()) RETURNING id"
+            ).scalar_one()
+            product_b_id = conn.exec_driver_sql(
+                "INSERT INTO products "
+                "(store_id, category_id, sku, name, unit_of_measure, is_weighed, "
+                " current_price, current_cost, current_qty_on_hand, "
+                " allow_negative_stock, is_active, created_at) "
+                f"VALUES ({store_b_id}, {category_id}, 'SKU-INTEGRITY', 'Integrity Product B', "
+                "'each', false, 9.99, 0, 3.000, false, true, now()) RETURNING id"
+            ).scalar_one()
+            purchase_order_id = conn.exec_driver_sql(
+                "INSERT INTO purchase_orders "
+                "(store_id, supplier_id, purchase_number, status, order_date, created_at) "
+                f"VALUES ({store_id}, {supplier_id}, 'PO-INTEGRITY', 'PARTIALLY_RECEIVED', "
+                "CURRENT_DATE, now()) RETURNING id"
+            ).scalar_one()
+            conn.exec_driver_sql(
+                "INSERT INTO purchase_order_items "
+                "(purchase_order_id, product_id, quantity_ordered, quantity_received, "
+                " quantity_invoiced, unit_cost) "
+                f"VALUES ({purchase_order_id}, {product_id}, 20.000, 7.000, 0, 4.50)"
+            )
+            transfer_id = conn.exec_driver_sql(
+                "INSERT INTO inter_store_transfers "
+                "(from_store_id, to_store_id, transfer_number, status, requested_date, "
+                " created_at) "
+                f"VALUES ({store_id}, {store_b_id}, 'TR-INTEGRITY', 'SHIPPED', CURRENT_DATE, "
+                "now()) RETURNING id"
+            ).scalar_one()
+            conn.exec_driver_sql(
+                "INSERT INTO inter_store_transfer_lines "
+                "(transfer_id, source_product_id, destination_product_id, requested_quantity, "
+                " shipped_quantity, received_quantity) "
+                f"VALUES ({transfer_id}, {product_id}, {product_b_id}, 15.000, 15.000, 6.000)"
+            )
+    finally:
+        engine.dispose()
+
+    def _business_keys(snapshot: dict[str, object]) -> dict[str, object]:
+        return {k: v for k, v in snapshot.items() if not k.startswith("informational_only:")}
+
+    engine = create_engine(migrations_db)
+    try:
+        before_m9 = _capture_m0_m8_integrity_snapshot(engine)
+    finally:
+        engine.dispose()
+
+    try:
+        command.upgrade(cfg, "head")
+        engine = create_engine(migrations_db)
+        try:
+            after_m9_upgrade = _capture_m0_m8_integrity_snapshot(engine)
+        finally:
+            engine.dispose()
+        assert _business_keys(after_m9_upgrade) == _business_keys(before_m9), (
+            "M9 upgrade altered pre-existing M0-M8 BUSINESS data: "
+            f"{ {k: v for k, v in after_m9_upgrade.items() if v != before_m9[k]} }"
+        )
+
+        command.downgrade(cfg, M8_HEAD_REVISION)
+        engine = create_engine(migrations_db)
+        try:
+            after_downgrade = _capture_m0_m8_integrity_snapshot(engine)
+        finally:
+            engine.dispose()
+        assert _business_keys(after_downgrade) == _business_keys(before_m9), (
+            "M9 downgrade altered pre-existing M0-M8 BUSINESS data: "
+            f"{ {k: v for k, v in after_downgrade.items() if v != before_m9[k]} }"
+        )
+        # The permissions/role_permissions counts are captured for
+        # visibility only (see _capture_m0_m8_integrity_snapshot's
+        # docstring for why they are a known, pre-existing, cross-
+        # milestone RBAC-seeding characteristic, not asserted equal).
+
+        command.upgrade(cfg, "head")
+        engine = create_engine(migrations_db)
+        try:
+            after_reupgrade = _capture_m0_m8_integrity_snapshot(engine)
+        finally:
+            engine.dispose()
+        assert _business_keys(after_reupgrade) == _business_keys(before_m9), (
+            "M9 re-upgrade altered pre-existing M0-M8 BUSINESS data: "
+            f"{ {k: v for k, v in after_reupgrade.items() if v != before_m9[k]} }"
+        )
+    finally:
         command.downgrade(cfg, "base")

@@ -38,15 +38,6 @@ from app.modules.transfers.service import TransferLineInput, _create_transfer_in
 _OPEN_PO_STATUSES = ("DRAFT", "ORDERED", "PARTIALLY_RECEIVED")
 
 
-def _enforce_store_access(caller_store_id: int | None, target_store_id: int, noun: str) -> None:
-    if caller_store_id is not None and caller_store_id != target_store_id:
-        raise ForbiddenError(
-            f"Your account is scoped to store {caller_store_id} and cannot access "
-            f"{noun} in store {target_store_id}",
-            error_code="STORE_ACCESS_DENIED",
-        )
-
-
 def _enforce_plan_access(caller_store_id: int | None, plan: ReplenishmentPlan) -> None:
     """A store-scoped caller may act on a plan if their store is the
     DESTINATION, or — for a transfer plan — the SOURCE (mirrors
@@ -118,6 +109,42 @@ def _open_purchase_order_quantities(db: Session, product_ids: list[int]) -> dict
         if remaining > 0:
             result[product_id] = result.get(product_id, Decimal("0")) + remaining
     return result
+
+
+def _committed_outbound_transfer_quantity(db: Session, source_product_id: int) -> Decimal:
+    """Sum of `requested_quantity` on every DRAFT transfer line already
+    drawing on this source product — i.e. every OTHER replenishment plan
+    that has already been EXECUTED (creating a real, linked DRAFT
+    transfer) but not yet actually shipped.
+
+    This is the fix for a real over-allocation defect found during M9
+    hardening (docs/M9_HARDENING_AUDIT.md Section "Defect 3"): two
+    independently-approved TRANSFER-sourced plans drawing on the SAME
+    source product each revalidate against `current_qty_on_hand` at
+    execution time, but execution only ever creates a DRAFT transfer —
+    it never decrements on-hand quantity (Design Decision 9; only a real
+    `ship_transfer` call does that). Without this check, two plans could
+    each be approved for up to the full source surplus and both execute
+    successfully, together committing more than the source's real
+    surplus above its own reorder point — silently depleting the source
+    store's own reorder-protected stock once both transfers eventually
+    ship, defeating the entire point of Design Decision 6.
+
+    Locking discipline: `execute_plan` already locks the source product
+    row (`inventory_service.lock_product_for_update`) before this is
+    called, so a concurrently-executing sibling/competing plan's own
+    commit (which creates the DRAFT transfer line this query counts) is
+    guaranteed to be visible here under READ COMMITTED — the row lock is
+    what serializes the two executions; this query is what makes the
+    second one see the first one's commitment once serialized."""
+    return db.execute(
+        select(func.coalesce(func.sum(InterStoreTransferLine.requested_quantity), Decimal("0")))
+        .join(InterStoreTransfer, InterStoreTransfer.id == InterStoreTransferLine.transfer_id)
+        .where(
+            InterStoreTransferLine.source_product_id == source_product_id,
+            InterStoreTransfer.status == "DRAFT",
+        )
+    ).scalar_one()
 
 
 def compute_positions_bulk(db: Session, products: list[Product]) -> dict[int, PositionBreakdown]:
@@ -948,17 +975,26 @@ def execute_plan(
         plan.executed_unit_cost = supplier_product.unit_cost
     else:
         assert source_product is not None  # guaranteed by source_type == "TRANSFER" above
+        already_committed = _committed_outbound_transfer_quantity(db, source_product.id)
         source_surplus = max(
             Decimal("0"),
-            source_product.current_qty_on_hand - (source_product.reorder_point or Decimal("0")),
+            source_product.current_qty_on_hand
+            - (source_product.reorder_point or Decimal("0"))
+            - already_committed,
         )
         rounded_quantity = min(executable_quantity, source_surplus)
         if rounded_quantity <= 0:
             plan.status = "STALE"
             plan.stale_detected_at = datetime.now(UTC)
+            commitment_note = (
+                f" (accounting for {already_committed} already committed to other "
+                "not-yet-shipped transfers)"
+                if already_committed > 0
+                else ""
+            )
             plan.stale_reason = (
                 f"Source store {plan.source_store_id} no longer has surplus above its own "
-                "reorder point."
+                f"reorder point{commitment_note}."
             )
             audit_service.log_event(
                 db,
@@ -1146,7 +1182,42 @@ def get_exceptions(db: Session, *, store_id: int | None = None) -> list[SupplyCh
     product_query = select(Product).where(Product.is_active.is_(True))
     if store_id is not None:
         product_query = product_query.where(Product.store_id == store_id)
-    for product in db.execute(product_query).scalars().all():
+    products = list(db.execute(product_query).scalars().all())
+
+    # Bulk-fetch every distinct default supplier referenced, and bulk-check
+    # which (supplier, product) pairs have an active current price — a
+    # per-product `db.get(Supplier, ...)` plus `get_current_supplier_product`
+    # call is a real N+1 at "thousands of products" scale (found during M9
+    # hardening); both are now single queries regardless of product count.
+    default_supplier_ids = {p.default_supplier_id for p in products if p.default_supplier_id}
+    suppliers_by_id = (
+        {
+            s.id: s
+            for s in db.execute(
+                select(Supplier).where(Supplier.id.in_(default_supplier_ids))
+            ).scalars()
+        }
+        if default_supplier_ids
+        else {}
+    )
+    pairs_with_current_price: set[tuple[int, int]] = set()
+    if default_supplier_ids:
+        candidate_product_ids = [
+            p.id for p in products if p.default_supplier_id in default_supplier_ids
+        ]
+        for supplier_id, product_id in db.execute(
+            select(SupplierProduct.supplier_id, SupplierProduct.product_id)
+            .where(
+                SupplierProduct.supplier_id.in_(default_supplier_ids),
+                SupplierProduct.product_id.in_(candidate_product_ids),
+                SupplierProduct.is_active.is_(True),
+                SupplierProduct.effective_date <= today,
+            )
+            .distinct()
+        ).all():
+            pairs_with_current_price.add((supplier_id, product_id))
+
+    for product in products:
         if product.current_qty_on_hand <= 0:
             exceptions.append(
                 SupplyChainException(
@@ -1176,7 +1247,7 @@ def get_exceptions(db: Session, *, store_id: int | None = None) -> list[SupplyCh
                 )
             )
         if product.default_supplier_id is not None:
-            supplier = db.get(Supplier, product.default_supplier_id)
+            supplier = suppliers_by_id.get(product.default_supplier_id)
             if supplier is not None and not supplier.is_active:
                 exceptions.append(
                     SupplyChainException(
@@ -1191,10 +1262,7 @@ def get_exceptions(db: Session, *, store_id: int | None = None) -> list[SupplyCh
                         ),
                     )
                 )
-            elif (
-                supplier is not None
-                and get_current_supplier_product(db, supplier.id, product.id) is None
-            ):
+            elif supplier is not None and (supplier.id, product.id) not in pairs_with_current_price:
                 exceptions.append(
                     SupplyChainException(
                         code="SUPPLIER_PRICE_MISSING",
