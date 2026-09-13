@@ -70,7 +70,12 @@ DEDUCTION_CALCULATION_METHODS = (
 )
 DEDUCTION_CATEGORIES = ("EMPLOYEE", "EMPLOYER_CONTRIBUTION")
 
-PAYROLL_PERIOD_STATUSES = ("DRAFT", "OPEN", "CALCULATED", "APPROVED", "POSTED")
+# CANCELLED added by a follow-up migration (see alembic/versions/
+# 2857faf007be_m10_payroll_periods_add_cancelled_status.py) — the design
+# doc's lifecycle diagram (Section 8) always included a cancel
+# transition (DRAFT/OPEN/CALCULATED/APPROVED -> CANCELLED, never from
+# POSTED) that the original migration's CHECK constraint omitted.
+PAYROLL_PERIOD_STATUSES = ("DRAFT", "OPEN", "CALCULATED", "APPROVED", "POSTED", "CANCELLED")
 # Mutable-after-calculation only via the dedicated lifecycle transitions
 # in app.modules.payroll.service (calculate/approve/post) — never a bare
 # UPDATE. POSTED is terminal; reversal is a separate PayrollReversal row,

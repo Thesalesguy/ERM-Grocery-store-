@@ -34,7 +34,8 @@ M6_HEAD_REVISION = "36173e29a9f0"  # M6: accounts payable, purchase invoices, su
 M7_HEAD_REVISION = "a4f2c8e91b6d"  # M7: advanced AP settlement, credit notes, payment allocation
 M8_HEAD_REVISION = "b7e3f1a29c5d"  # M8: stock counts, inter-store transfers, replenishment
 M9_HEAD_REVISION = "36ec624cf083"  # M9: supplier product catalog, replenishment plans
-M10_HEAD_REVISION = "be26de9d9459"  # M10: HR/workforce and payroll
+M10_SCHEMA_REVISION = "be26de9d9459"  # M10: HR/workforce and payroll (base schema)
+M10_HEAD_REVISION = "2857faf007be"  # M10: + payroll_periods CANCELLED status
 
 
 def _alembic_config() -> Config:
@@ -693,3 +694,45 @@ def test_m10_downgrade_succeeds_when_only_draft_payroll_period_exists(migrations
     command.downgrade(cfg, M9_HEAD_REVISION)
     assert _current_revision(migrations_db) == M9_HEAD_REVISION
     command.downgrade(cfg, "base")
+
+
+def test_m10_cancelled_status_downgrade_refuses_when_cancelled_period_exists(
+    migrations_db: str,
+) -> None:
+    """The follow-up migration adding CANCELLED to payroll_periods.status
+    must itself refuse to downgrade past the point where that value is a
+    valid CHECK-constraint member while a real CANCELLED row exists —
+    mirrors every other status-widening guard in this file."""
+    from sqlalchemy.exc import DBAPIError, InternalError
+
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M10_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            store_id = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, created_at) "
+                "VALUES ('T', 'UTC', true, now()) RETURNING id"
+            ).scalar_one()
+            conn.exec_driver_sql(
+                "INSERT INTO payroll_periods "
+                "(store_id, period_start, period_end, pay_date, status, created_at) "
+                f"VALUES ({store_id}, '2024-01-01', '2024-01-15', '2024-01-20', 'CANCELLED', now())"
+            )
+    finally:
+        engine.dispose()
+
+    try:
+        with pytest.raises((DBAPIError, InternalError)):
+            command.downgrade(cfg, M10_SCHEMA_REVISION)
+        assert _current_revision(migrations_db) == M10_HEAD_REVISION
+    finally:
+        engine = create_engine(migrations_db)
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql("DELETE FROM payroll_periods WHERE status = 'CANCELLED'")
+        finally:
+            engine.dispose()
+        command.downgrade(cfg, "base")
