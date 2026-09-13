@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from app.modules.inventory import service as inventory_service
 from app.modules.reports import service as reports_service
 from app.modules.transfers import service as transfer_service
-from app.modules.transfers.service import ShipLineInput, TransferLineInput
+from app.modules.transfers.service import ReceiveLineInput, ShipLineInput, TransferLineInput
 from tests.factories import make_product, make_store, make_user, unique_suffix
 
 
@@ -117,6 +117,22 @@ def test_in_transit_is_not_counted_at_either_store(db: Session) -> None:
     by_store = {r.key: r.quantity_on_hand for r in values}
     assert by_store[store_a.id] == Decimal("30")  # 50 - 20 shipped
     assert by_store.get(store_b.id, Decimal("0")) == Decimal("0")  # not yet received
+
+    transfer_service.receive_transfer(
+        db,
+        transfer_id=transfer.id,
+        received_date=date(2024, 1, 2),
+        lines=[ReceiveLineInput(transfer_line_id=line_id, quantity_received=Decimal("20"))],
+        client_transaction_id=f"recv-{unique_suffix()}",
+        caller_store_id=None,
+    )
+    db.commit()
+
+    # A fully-received transfer must vanish entirely, not linger as a
+    # zero-quantity row (shipped_quantity == received_quantity must be
+    # excluded, not just shipped_quantity < received_quantity).
+    after_receipt = reports_service.inventory_in_transit(db, store_ids=[store_a.id, store_b.id])
+    assert after_receipt == []
 
 
 def test_stock_count_variance_excludes_non_posted_counts(db: Session) -> None:

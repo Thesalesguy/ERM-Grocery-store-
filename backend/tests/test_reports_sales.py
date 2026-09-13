@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from app.modules.reports import service as reports_service
 from app.modules.sales import service as sales_service
 from app.modules.sales.service import PaymentInput, SaleLineInput, SaleReturnLineInput
-from tests.factories import make_product, make_store, make_user, unique_suffix
+from tests.factories import make_product, make_store, make_tax_rate, make_user, unique_suffix
 
 
 def _sale(
@@ -208,6 +208,79 @@ def test_zero_price_sale_still_counts_units_and_cogs(db: Session) -> None:
     assert summary.units_sold == Decimal("2")
     assert summary.transaction_count == 1
     assert summary.gross_profit == Decimal("-8.00")
+
+
+def test_discounted_line_reports_list_price_as_gross_and_the_discount_separately(
+    db: Session,
+) -> None:
+    """docs/M11_DESIGN.md Section 5.1: gross_sales = line_total +
+    discount_amount - tax_amount -- i.e. the UNDISCOUNTED list price
+    (quantity * unit_price), with the discount added back and reported
+    separately in `discounts` rather than baked into gross_sales. A
+    $10 line with a $2 discount and no tax must show gross_sales=$10.00
+    (not $8.00, the discounted line_total) and discounts=$2.00."""
+    store = make_store(db)
+    cashier = make_user(db, store)
+    product = make_product(
+        db, store, current_price=Decimal("10.00"), current_qty_on_hand=Decimal("100")
+    )
+    db.commit()
+    sales_service.finalize_sale(
+        db,
+        store_id=store.id,
+        cashier_id=cashier.id,
+        client_transaction_id=f"txn-{unique_suffix()}",
+        caller_store_id=None,
+        lines=[
+            SaleLineInput(
+                product_id=product.id, quantity=Decimal("1"), discount_amount=Decimal("2.00")
+            )
+        ],
+        payments=[PaymentInput(payment_method="CASH", amount=Decimal("8.00"))],
+    )
+    db.commit()
+
+    summary = reports_service.sales_summary(db, store_ids=[store.id])
+    assert summary.gross_sales == Decimal("10.00")
+    assert summary.discounts == Decimal("2.00")
+    assert summary.net_sales == Decimal("10.00")  # net of returns, not of discounts -- by design
+
+
+def test_taxed_line_excludes_tax_from_gross_sales_and_reports_it_separately(
+    db: Session,
+) -> None:
+    """docs/M11_DESIGN.md Section 5.1: gross_sales = line_total +
+    discount_amount - tax_amount -- tax is collected on behalf of the
+    tax authority, never counted as revenue (matches
+    ACCOUNT_TAX_PAYABLE's own treatment). A $100 line taxed at 10% (no
+    discount) must show gross_sales=$100.00 (not $110.00, the
+    tax-inclusive line_total) and tax=$10.00."""
+    store = make_store(db)
+    cashier = make_user(db, store)
+    tax_rate = make_tax_rate(db, rate_percent=Decimal("10.000"))
+    product = make_product(
+        db,
+        store,
+        current_price=Decimal("100.00"),
+        current_qty_on_hand=Decimal("10"),
+        tax_rate_id=tax_rate.id,
+    )
+    db.commit()
+    sales_service.finalize_sale(
+        db,
+        store_id=store.id,
+        cashier_id=cashier.id,
+        client_transaction_id=f"txn-{unique_suffix()}",
+        caller_store_id=None,
+        lines=[SaleLineInput(product_id=product.id, quantity=Decimal("1"))],
+        payments=[PaymentInput(payment_method="CASH", amount=Decimal("110.00"))],
+    )
+    db.commit()
+
+    summary = reports_service.sales_summary(db, store_ids=[store.id])
+    assert summary.gross_sales == Decimal("100.00")
+    assert summary.tax == Decimal("10.00")
+    assert summary.net_sales == Decimal("100.00")
 
 
 def test_empty_period_returns_none_not_zero_or_error_for_ratios(db: Session) -> None:
