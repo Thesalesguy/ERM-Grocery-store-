@@ -96,6 +96,59 @@ SUPPLY_CHAIN_READ = "supply_chain.read"
 SUPPLY_CHAIN_PLAN = "supply_chain.plan"
 SUPPLY_CHAIN_APPROVE = "supply_chain.approve"
 SUPPLY_CHAIN_EXECUTE = "supply_chain.execute"
+# M10 (docs/M10_DESIGN.md "RBAC"): hr.write covers Employee master data,
+# EmploymentStatusPeriod, and EmploymentAssignment (personnel
+# administration) — deliberately NOT CompensationPeriod. Setting an
+# employee's pay rate is kept as its own code, hr.compensation.write,
+# because it is meaningfully more sensitive than the rest of personnel
+# admin (it directly determines payroll amounts) and because the
+# approved HR Clerk scope (M10 design decision #3: "employee master
+# data, employment history, attendance, payroll preparation/read access
+# where appropriate") never mentions compensation — the two-code split
+# is what lets HR Clerk get hr.write without also getting the ability to
+# change anyone's pay.
+HR_READ = "hr.read"
+HR_WRITE = "hr.write"
+HR_COMPENSATION_WRITE = "hr.compensation.write"
+ATTENDANCE_READ = "attendance.read"
+ATTENDANCE_WRITE = "attendance.write"
+# Five tiers mirroring the AP/count/supply-chain write-then-progressively-
+# heavier-action pattern: read is plain viewing; calculate is the
+# mechanical, non-committing "preparation" step (M10 design decision #3's
+# own word) that produces a DRAFT PayrollEmployeeResult from
+# attendance+compensation inputs — no GL liability yet, same tier as
+# AP_WRITE/INVENTORY_COUNT_WRITE; approve is a supervisory checkpoint
+# confirming a store's calculated numbers are correct, still no GL entry;
+# post is the one action that creates a real, binding GL liability
+# (mirrors AP_POST/INVENTORY_COUNT_POST/SUPPLY_CHAIN_EXECUTE); reverse
+# undoes a posted period with a compensating entry (mirrors
+# ACCOUNTING_REVERSE).
+#
+# Manager RBAC decision (M10 design decision #2 required this be
+# justified, not assumed): Manager gets payroll.read/calculate/approve
+# but NOT payroll.post, unlike the AP/inventory-count/supply-chain
+# tables above where Manager holds the full write-through-commit chain.
+# The difference is conflict of interest, not workflow depth: an AP
+# invoice or a stock count is about a vendor or a shelf, something the
+# posting manager has no personal financial stake in. A payroll period
+# is compensation for the manager's own team — and, in a single-manager
+# store, plausibly the manager's own pay. Letting the same person
+# calculate, approve, AND commit their team's payroll to a real GL
+# liability collapses a segregation-of-duties boundary that exists in
+# every other module specifically because that boundary matters more,
+# not less, when the approver has a direct personal interest in the
+# amounts. Manager keeps payroll.approve (an operational check that a
+# store's numbers look right — it still requires a separate posting
+# authority to act on) and is the same role already trusted with
+# ACCOUNTING_REVERSE/AP_POST/AP_PAY elsewhere, so this is a targeted
+# withholding for payroll specifically, not a general distrust of the
+# role. payroll.post and payroll.reverse are Admin-only in this
+# milestone (decision #2: "Admin gets highest payroll authority").
+PAYROLL_READ = "payroll.read"
+PAYROLL_CALCULATE = "payroll.calculate"
+PAYROLL_APPROVE = "payroll.approve"
+PAYROLL_POST = "payroll.post"
+PAYROLL_REVERSE = "payroll.reverse"
 
 ALL_PERMISSIONS: dict[str, str] = {
     PRODUCTS_READ: "View products and barcodes",
@@ -137,6 +190,16 @@ ALL_PERMISSIONS: dict[str, str] = {
     SUPPLY_CHAIN_PLAN: "Generate replenishment recommendations and cancel a plan",
     SUPPLY_CHAIN_APPROVE: "Approve a replenishment recommendation",
     SUPPLY_CHAIN_EXECUTE: "Execute an approved plan into a real purchase order or transfer",
+    HR_READ: "View employee records, employment history, and assignments",
+    HR_WRITE: "Create/edit employees, employment status, and store/role assignments",
+    HR_COMPENSATION_WRITE: "Set or change an employee's compensation (pay rate, pay type)",
+    ATTENDANCE_READ: "View attendance records",
+    ATTENDANCE_WRITE: "Record and correct attendance (clock in/out, corrections)",
+    PAYROLL_READ: "View payroll periods and calculated results",
+    PAYROLL_CALCULATE: "Run/re-run payroll calculation for a period (no GL impact)",
+    PAYROLL_APPROVE: "Approve a calculated payroll period before posting",
+    PAYROLL_POST: "Post an approved payroll period, creating a real GL liability",
+    PAYROLL_REVERSE: "Reverse a posted payroll period with a compensating entry",
 }
 
 # --- Roles --------------------------------------------------------------
@@ -145,6 +208,13 @@ MANAGER = "Manager"
 CASHIER = "Cashier"
 INVENTORY_CLERK = "Inventory Clerk"
 AUDITOR = "Auditor"
+# M10 (docs/M10_DESIGN.md design decision #3): a minimal HR/workforce
+# role, scoped to exactly what that decision names — employee master
+# data, employment history, attendance, and payroll preparation/read —
+# and explicitly never accounting administration, journal reversal,
+# arbitrary store administration, or user administration. See
+# ROLE_PERMISSIONS below for the exact grant.
+HR_CLERK = "HR Clerk"
 
 ALL_ROLES: dict[str, str] = {
     ADMIN: "Full system access, including user management",
@@ -152,6 +222,10 @@ ALL_ROLES: dict[str, str] = {
     CASHIER: "Operates the POS and looks up products; no catalog/inventory write access",
     INVENTORY_CLERK: "Manages catalog, stock levels, and purchasing/receiving",
     AUDITOR: "Read-only access across the system, including the audit log",
+    HR_CLERK: (
+        "Manages employee records, employment history, and attendance; prepares payroll "
+        "for approval but cannot approve, post, or reverse it"
+    ),
 }
 
 # --- The matrix: role name -> permission codes it grants -----------------
@@ -190,6 +264,17 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         SUPPLY_CHAIN_PLAN,
         SUPPLY_CHAIN_APPROVE,
         SUPPLY_CHAIN_EXECUTE,
+        HR_READ,
+        HR_WRITE,
+        HR_COMPENSATION_WRITE,
+        ATTENDANCE_READ,
+        ATTENDANCE_WRITE,
+        PAYROLL_READ,
+        PAYROLL_CALCULATE,
+        PAYROLL_APPROVE,
+        # Deliberately NOT PAYROLL_POST or PAYROLL_REVERSE — see the
+        # permission constants' docstring above for the full
+        # conflict-of-interest justification (M10 design decision #2).
     ],
     CASHIER: [
         PRODUCTS_READ,
@@ -234,5 +319,20 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         SALES_RETURN_READ,
         AP_READ,
         SUPPLY_CHAIN_READ,
+        HR_READ,
+        ATTENDANCE_READ,
+        PAYROLL_READ,
+    ],
+    # M10 design decision #3's exact scope: employee master data,
+    # employment history, attendance, and payroll preparation/read.
+    # Never accounting.*, *.reverse, users.manage, or any other module's
+    # write/admin permission.
+    HR_CLERK: [
+        HR_READ,
+        HR_WRITE,
+        ATTENDANCE_READ,
+        ATTENDANCE_WRITE,
+        PAYROLL_READ,
+        PAYROLL_CALCULATE,
     ],
 }

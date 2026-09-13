@@ -26,11 +26,30 @@ from app.modules.auth.models import (  # noqa: F401
     User,
     UserRole,
 )
+from app.modules.hr.models import (  # noqa: F401
+    AttendanceRecord,
+    CompensationPeriod,
+    Department,
+    Employee,
+    EmploymentAssignment,
+    EmploymentStatusPeriod,
+    OvertimePolicy,
+    Position,
+)
 from app.modules.inventory.models import (  # noqa: F401
     InventoryMovement,
     StockAdjustment,
     StockCount,
     StockCountLine,
+)
+from app.modules.payroll.models import (  # noqa: F401
+    DeductionRate,
+    DeductionType,
+    PayrollDeductionLine,
+    PayrollEarningLine,
+    PayrollEmployeeResult,
+    PayrollPeriod,
+    PayrollReversal,
 )
 from app.modules.products.models import Product, ProductBarcode, ProductCategory  # noqa: F401
 from app.modules.purchasing.models import (  # noqa: F401

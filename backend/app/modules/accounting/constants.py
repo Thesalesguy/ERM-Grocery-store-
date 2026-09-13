@@ -60,6 +60,20 @@ ACCOUNT_PURCHASE_CLEARING = "2000"
 # dimension lives on JournalEntry.store_id rather than on Account.
 ACCOUNT_ACCOUNTS_PAYABLE = "2010"
 ACCOUNT_TAX_PAYABLE = "2100"
+# M10 (docs/M10_DESIGN.md Section 10 "Payroll accounting integration"):
+# four payroll liability accounts, mirroring how AP separates the
+# control account (ACCOUNT_ACCOUNTS_PAYABLE) from the amount actually
+# owed to suppliers — here, net pay owed to employees is its own
+# liability (ACCOUNT_PAYROLL_PAYABLE), kept separate from amounts
+# withheld/owed to third parties (statutory authorities, benefit
+# providers) and from the employer's own contribution obligation, since
+# each is relieved by a different future event and mixing them would
+# make "how much do we owe employees right now" unanswerable from the
+# GL alone.
+ACCOUNT_PAYROLL_PAYABLE = "2200"
+ACCOUNT_STATUTORY_WITHHOLDING_PAYABLE = "2210"
+ACCOUNT_BENEFIT_DEDUCTION_PAYABLE = "2220"
+ACCOUNT_EMPLOYER_CONTRIBUTION_PAYABLE = "2230"
 
 # --- REVENUE ---------------------------------------------------------------
 ACCOUNT_SALES_REVENUE = "4000"
@@ -101,6 +115,15 @@ ACCOUNT_PURCHASE_TAX_EXPENSE = "5200"
 # stated reduction on the supplier's own document, not an unexplained
 # difference between the invoiced unit price and the receipt cost.
 ACCOUNT_PURCHASE_DISCOUNTS = "5150"
+# M10: a dedicated 6xxx range for payroll/labor expense, distinct from
+# 5xxx COGS-adjacent expense — gross wages recognized when payroll is
+# posted (Dr side), and the employer's own contribution expense
+# (retirement match, employer-paid insurance share, etc.) recognized
+# alongside it, mirroring the Dr/Cr symmetry with
+# ACCOUNT_EMPLOYER_CONTRIBUTION_PAYABLE above (the EXPENSE is recognized
+# now; the LIABILITY to actually remit it is separate).
+ACCOUNT_WAGE_SALARY_EXPENSE = "6000"
+ACCOUNT_EMPLOYER_CONTRIBUTION_EXPENSE = "6100"
 
 # A payment method on a Sale (app.modules.sales.models.PAYMENT_METHODS)
 # always maps to exactly one clearing/cash account — never a generic
@@ -278,5 +301,47 @@ SYSTEM_ACCOUNTS: list[tuple[str, str, str, str, str]] = [
         "EXPENSE",
         "DEBIT",
         "Stock found missing relative to the recorded on-hand quantity (negative adjustment).",
+    ),
+    (
+        ACCOUNT_PAYROLL_PAYABLE,
+        "Payroll Payable",
+        "LIABILITY",
+        "CREDIT",
+        "Net pay owed to employees for a POSTED payroll period, relieved when paid.",
+    ),
+    (
+        ACCOUNT_STATUTORY_WITHHOLDING_PAYABLE,
+        "Statutory Withholding Payable",
+        "LIABILITY",
+        "CREDIT",
+        "Amounts withheld from employee pay for future remittance to a statutory authority.",
+    ),
+    (
+        ACCOUNT_BENEFIT_DEDUCTION_PAYABLE,
+        "Benefit / Other Deduction Payable",
+        "LIABILITY",
+        "CREDIT",
+        "Amounts withheld from employee pay for a non-statutory deduction (benefits, etc.).",
+    ),
+    (
+        ACCOUNT_EMPLOYER_CONTRIBUTION_PAYABLE,
+        "Employer Contribution Payable",
+        "LIABILITY",
+        "CREDIT",
+        "Employer-side contribution amounts owed, mirroring Employer Contribution Expense.",
+    ),
+    (
+        ACCOUNT_WAGE_SALARY_EXPENSE,
+        "Wage & Salary Expense",
+        "EXPENSE",
+        "DEBIT",
+        "Gross pay expense recognized when a payroll period is posted.",
+    ),
+    (
+        ACCOUNT_EMPLOYER_CONTRIBUTION_EXPENSE,
+        "Employer Contribution Expense",
+        "EXPENSE",
+        "DEBIT",
+        "Employer-side contribution expense recognized alongside gross pay.",
     ),
 ]

@@ -8,7 +8,15 @@ app.modules.auth.service — see the module docstring in __init__.py.
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, String, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base_class import Base, TimestampMixin
@@ -16,12 +24,31 @@ from app.db.base_class import Base, TimestampMixin
 
 class Store(TimestampMixin, Base):
     __tablename__ = "stores"
+    __table_args__ = (
+        CheckConstraint(
+            "attendance_day_boundary_hour >= 0 AND attendance_day_boundary_hour <= 23",
+            name="ck_stores_attendance_day_boundary_hour",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     address: Mapped[str | None] = mapped_column(String(500))
     timezone: Mapped[str] = mapped_column(String(64), nullable=False, default="UTC")
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # M10 (docs/M10_DESIGN.md Section 7, approved decision #6): the
+    # cross-midnight attendance work_date rule is store configuration,
+    # never an employee field. 0 (default) means work_date always equals
+    # the calendar date of clock_in_at converted to this store's own
+    # `timezone` — no shifting. A store that runs shifts past midnight
+    # (e.g. a 22:00-06:00 overnight shift) can set this to the local hour
+    # before which a clock-in still belongs to the PREVIOUS calendar
+    # date — e.g. 6 means a clock-in at 01:00 local time is attributed to
+    # yesterday's work_date, not today's. Always computed from
+    # `clock_in_at` (a timestamptz, UTC-stored per the project's
+    # established convention) converted into this store's own
+    # `timezone` — never the server's local clock.
+    attendance_day_boundary_hour: Mapped[int] = mapped_column(nullable=False, default=0)
 
     users: Mapped[list["User"]] = relationship(back_populates="store")
 

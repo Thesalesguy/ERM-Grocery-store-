@@ -34,6 +34,7 @@ M6_HEAD_REVISION = "36173e29a9f0"  # M6: accounts payable, purchase invoices, su
 M7_HEAD_REVISION = "a4f2c8e91b6d"  # M7: advanced AP settlement, credit notes, payment allocation
 M8_HEAD_REVISION = "b7e3f1a29c5d"  # M8: stock counts, inter-store transfers, replenishment
 M9_HEAD_REVISION = "36ec624cf083"  # M9: supplier product catalog, replenishment plans
+M10_HEAD_REVISION = "be26de9d9459"  # M10: HR/workforce and payroll
 
 
 def _alembic_config() -> Config:
@@ -121,19 +122,30 @@ def test_full_upgrade_downgrade_upgrade_cycle(migrations_db: str) -> None:
     # inter_store_transfer_receipts, inter_store_transfer_receipt_items.
     assert _table_count(migrations_db) == 44
 
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, M9_HEAD_REVISION)
     # M9 adds two tables: supplier_products, replenishment_plans (the
     # products.target_stock_quantity/minimum_stock_quantity columns and
     # the purchase_orders/inter_store_transfers.replenishment_plan_id
     # back-links are columns, not tables).
     assert _table_count(migrations_db) == 46
 
+    command.upgrade(cfg, "head")
+    # M10 adds fifteen tables: departments, positions, employees,
+    # employment_status_periods, employment_assignments,
+    # compensation_periods, overtime_policies, attendance_records,
+    # deduction_types, deduction_rates, payroll_periods,
+    # payroll_employee_results, payroll_earning_lines,
+    # payroll_deduction_lines, payroll_reversals (stores.
+    # attendance_day_boundary_hour and the accounts/journal_entries
+    # widening are a column/rows/CHECK change, not tables).
+    assert _table_count(migrations_db) == 61
+
     command.downgrade(cfg, M0_REVISION)
     assert _table_count(migrations_db) == 8
 
     command.upgrade(cfg, "head")
-    assert _table_count(migrations_db) == 46
-    assert _current_revision(migrations_db) == M9_HEAD_REVISION
+    assert _table_count(migrations_db) == 61
+    assert _current_revision(migrations_db) == M10_HEAD_REVISION
 
 
 def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
@@ -148,8 +160,8 @@ def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
             permission_count = conn.exec_driver_sql("SELECT count(*) FROM permissions").scalar_one()
     finally:
         engine.dispose()
-    assert role_count == 5
-    assert permission_count == 34
+    assert role_count == 6
+    assert permission_count == 44
 
 
 def test_m7_downgrade_refuses_when_credit_note_data_exists(migrations_db: str) -> None:
@@ -296,7 +308,12 @@ def test_m9_downgrade_refuses_when_generated_po_exists(migrations_db: str) -> No
 
     cfg = _alembic_config()
     command.downgrade(cfg, "base")
-    command.upgrade(cfg, "head")
+    # Upgrade to exactly the M9 head (not "head") so the downgrade below is
+    # a single revision step — M10 added a later revision, and a multi-step
+    # downgrade batches into one transaction (a later milestone's own guard
+    # failure would roll back an earlier, otherwise-successful step too),
+    # so this test only means to exercise M9's own guard in isolation.
+    command.upgrade(cfg, M9_HEAD_REVISION)
 
     engine = create_engine(migrations_db)
     try:
@@ -564,3 +581,115 @@ def test_m0_m8_data_integrity_survives_m9_upgrade_downgrade_reupgrade(
         )
     finally:
         command.downgrade(cfg, "base")
+
+
+def test_m10_downgrade_refuses_when_employee_data_exists(migrations_db: str) -> None:
+    """M10's downgrade guard must fail LOUDLY, before any destructive
+    step, when a real employee row exists — there is no other
+    representation of a person's employment record anywhere else in the
+    schema (mirrors the M9 supplier_products precedent: unconditional,
+    not status-gated, because master data has no "not yet real" state)."""
+    from sqlalchemy.exc import DBAPIError, InternalError
+
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M10_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                "INSERT INTO employees (employee_number, legal_name, hire_date, created_at) "
+                "VALUES ('EMP-GUARD-M10', 'Guard Test', '2024-01-01', now())"
+            )
+    finally:
+        engine.dispose()
+
+    try:
+        with pytest.raises((DBAPIError, InternalError)):
+            command.downgrade(cfg, M9_HEAD_REVISION)
+
+        assert _current_revision(migrations_db) == M10_HEAD_REVISION
+        assert _table_count(migrations_db) == 61
+    finally:
+        engine = create_engine(migrations_db)
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "DELETE FROM employees WHERE employee_number = 'EMP-GUARD-M10'"
+                )
+        finally:
+            engine.dispose()
+        command.downgrade(cfg, "base")
+
+
+def test_m10_downgrade_refuses_when_non_draft_payroll_period_exists(migrations_db: str) -> None:
+    """A payroll_period past DRAFT (nothing calculated/decided yet) blocks
+    the downgrade even with zero employees — mirrors M9's RECOMMENDED-
+    status replenishment_plans exception in the opposite direction (here,
+    only the untouched DRAFT status is safe to discard)."""
+    from sqlalchemy.exc import DBAPIError, InternalError
+
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M10_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            store_id = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, created_at) "
+                "VALUES ('T', 'UTC', true, now()) RETURNING id"
+            ).scalar_one()
+            conn.exec_driver_sql(
+                "INSERT INTO payroll_periods "
+                "(store_id, period_start, period_end, pay_date, status, created_at) "
+                f"VALUES ({store_id}, '2024-01-01', '2024-01-15', '2024-01-20', 'OPEN', now())"
+            )
+    finally:
+        engine.dispose()
+
+    try:
+        with pytest.raises((DBAPIError, InternalError)):
+            command.downgrade(cfg, M9_HEAD_REVISION)
+
+        assert _current_revision(migrations_db) == M10_HEAD_REVISION
+    finally:
+        engine = create_engine(migrations_db)
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "DELETE FROM payroll_periods WHERE period_start = '2024-01-01' "
+                    "AND period_end = '2024-01-15'"
+                )
+        finally:
+            engine.dispose()
+        command.downgrade(cfg, "base")
+
+
+def test_m10_downgrade_succeeds_when_only_draft_payroll_period_exists(migrations_db: str) -> None:
+    """The one exception: a payroll_period still in DRAFT (never opened,
+    calculated, approved, or posted) is safe to discard, mirroring M9's
+    RECOMMENDED-status replenishment_plans exception."""
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M10_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            store_id = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, created_at) "
+                "VALUES ('T', 'UTC', true, now()) RETURNING id"
+            ).scalar_one()
+            conn.exec_driver_sql(
+                "INSERT INTO payroll_periods "
+                "(store_id, period_start, period_end, pay_date, status, created_at) "
+                f"VALUES ({store_id}, '2024-01-01', '2024-01-15', '2024-01-20', 'DRAFT', now())"
+            )
+    finally:
+        engine.dispose()
+
+    command.downgrade(cfg, M9_HEAD_REVISION)
+    assert _current_revision(migrations_db) == M9_HEAD_REVISION
+    command.downgrade(cfg, "base")

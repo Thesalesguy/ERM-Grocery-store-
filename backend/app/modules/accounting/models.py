@@ -100,6 +100,17 @@ AUTOMATED_SOURCE_TYPES = (
     # transfer's own shipped_quantity/received_quantity running totals.
     "INTER_STORE_TRANSFER_SHIP",
     "INTER_STORE_TRANSFER_RECEIVE",
+    # M10 (docs/M10_DESIGN.md Section 10): PAYROLL_POSTING is posted once
+    # per PayrollPeriod (never per employee — "one real financial event,
+    # one entry", the same rule SUPPLIER_PAYMENT follows even though it
+    # aggregates many allocations) by app.modules.payroll.service's
+    # posting transition. PAYROLL_REVERSAL exists so a posted period can
+    # be reversed by a dedicated function (never the generic
+    # reverse_journal_entry — same reasoning as every other automated
+    # type above: a bare journal reversal would not undo
+    # PayrollPeriod.status or the real pay obligation it represents).
+    "PAYROLL_POSTING",
+    "PAYROLL_REVERSAL",
 )
 SOURCE_TYPES = AUTOMATED_SOURCE_TYPES + ("MANUAL",)
 ENTRY_TYPES = ("STANDARD", "REVERSAL")
