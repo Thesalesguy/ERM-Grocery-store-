@@ -165,6 +165,17 @@ class PayrollPeriod(TimestampMixin, Base):
             "(status <> 'POSTED' AND journal_entry_id IS NULL)",
             name="ck_payroll_periods_posting_consistency",
         ),
+        # Added by a follow-up migration (alembic/versions/
+        # 1e832b76969e_m10_payroll_periods_add_calculation_.py) —
+        # discovered while building Phase 4's approve_payroll_period,
+        # which must be able to trust that a CALCULATED period always
+        # has calculated_at/calculated_by set.
+        CheckConstraint(
+            "(status IN ('CALCULATED', 'APPROVED', 'POSTED') AND calculated_by IS NOT NULL "
+            "AND calculated_at IS NOT NULL) OR "
+            "(status NOT IN ('CALCULATED', 'APPROVED', 'POSTED'))",
+            name="ck_payroll_periods_calculation_consistency",
+        ),
         Index("ix_payroll_periods_store_id", "store_id"),
         Index("ix_payroll_periods_status", "status"),
         Index("ix_payroll_periods_payroll_run_id", "payroll_run_id"),

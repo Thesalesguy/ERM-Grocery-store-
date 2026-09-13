@@ -35,7 +35,8 @@ M7_HEAD_REVISION = "a4f2c8e91b6d"  # M7: advanced AP settlement, credit notes, p
 M8_HEAD_REVISION = "b7e3f1a29c5d"  # M8: stock counts, inter-store transfers, replenishment
 M9_HEAD_REVISION = "36ec624cf083"  # M9: supplier product catalog, replenishment plans
 M10_SCHEMA_REVISION = "be26de9d9459"  # M10: HR/workforce and payroll (base schema)
-M10_HEAD_REVISION = "2857faf007be"  # M10: + payroll_periods CANCELLED status
+M10_CANCELLED_STATUS_REVISION = "2857faf007be"  # M10: + payroll_periods CANCELLED status
+M10_HEAD_REVISION = "1e832b76969e"  # M10: + calculation-consistency CHECK
 
 
 def _alembic_config() -> Config:
