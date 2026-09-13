@@ -285,6 +285,8 @@ class KpiDashboardRead(BaseModel):
     documented, traceable slice of the reports already defined above
     (docs/M11_DESIGN.md Section 8): nothing here is a new computation."""
 
+    model_config = ConfigDict(from_attributes=True)
+
     store_ids: list[int] | None
     period_start: date
     period_end: date
