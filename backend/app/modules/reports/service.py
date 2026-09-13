@@ -1182,15 +1182,22 @@ def stock_count_variance(db: Session, *, stock_count_id: int) -> list[StockCount
 
 
 @dataclass(frozen=True)
-class InTransitReconciliationRow:
-    gl_in_transit_balance: Decimal
-    operational_in_transit_value: Decimal
+class GlReconciliationRow:
+    """Generic (label, GL balance, operational value, discrepancy) shape
+    shared by every GL-vs-operational reconciliation this module adds
+    (in-transit inventory, payroll payable) — mirrors
+    accounting.service.inventory_reconciliation's own shape exactly.
+    Exposed, never silently corrected."""
+
+    label: str
+    gl_balance: Decimal
+    operational_value: Decimal
     discrepancy: Decimal
 
 
 def in_transit_reconciliation(
     db: Session, *, store_ids: list[int] | None = None
-) -> InTransitReconciliationRow:
+) -> GlReconciliationRow:
     """Section 8: ACCOUNT_INVENTORY_IN_TRANSIT GL balance vs. the
     operational Σ(shipped-received)*unit_cost_at_shipment above.
     Exposed, never silently corrected, exactly like
@@ -1204,9 +1211,10 @@ def in_transit_reconciliation(
         (r.value_in_transit for r in inventory_in_transit(db, store_ids=store_ids)),
         start=Decimal("0"),
     )
-    return InTransitReconciliationRow(
-        gl_in_transit_balance=gl_balance,
-        operational_in_transit_value=operational,
+    return GlReconciliationRow(
+        label="Inventory In Transit",
+        gl_balance=gl_balance,
+        operational_value=operational,
         discrepancy=gl_balance - operational,
     )
 
@@ -1481,3 +1489,210 @@ def purchase_price_variance_report(
         PurchasePriceVarianceRow(product_id=pid, total_variance=Decimal(variance))
         for pid, variance in db.execute(query)
     ]
+
+
+# --- Section 5.5 (docs/M11_DESIGN.md): labor & payroll analytics -----------
+#
+# Source: PayrollPeriod/PayrollEmployeeResult for POSTED periods ONLY --
+# a DRAFT/OPEN/CALCULATED/APPROVED period is not yet a final,
+# authoritative payroll outcome and is excluded from every financial
+# payroll metric (docs/M11_DESIGN.md Section 5.5/10). A separate,
+# clearly labeled "pending payroll" count is offered alongside, never
+# merged into the posted totals.
+
+
+@dataclass(frozen=True)
+class HeadcountRow:
+    store_id: int
+    active_employee_count: int
+
+
+def headcount_by_store(
+    db: Session, *, store_ids: list[int] | None, as_of: date | None = None
+) -> list[HeadcountRow]:
+    from app.modules.hr.models import EmploymentAssignment, EmploymentStatusPeriod
+
+    as_of = as_of or date.today()
+
+    def _current_filter(model: Any) -> Any:
+        return (model.effective_to.is_(None)) | (model.effective_to >= as_of)
+
+    query = (
+        select(
+            EmploymentAssignment.store_id,
+            func.count(func.distinct(EmploymentAssignment.employee_id)),
+        )
+        .select_from(EmploymentAssignment)
+        .join(
+            EmploymentStatusPeriod,
+            EmploymentStatusPeriod.employee_id == EmploymentAssignment.employee_id,
+        )
+        .where(
+            EmploymentAssignment.effective_from <= as_of,
+            _current_filter(EmploymentAssignment),
+            EmploymentStatusPeriod.effective_from <= as_of,
+            _current_filter(EmploymentStatusPeriod),
+            EmploymentStatusPeriod.status == "ACTIVE",
+        )
+        .group_by(EmploymentAssignment.store_id)
+    )
+    if store_ids is not None:
+        query = query.where(EmploymentAssignment.store_id.in_(store_ids))
+    return [
+        HeadcountRow(store_id=sid, active_employee_count=int(count))
+        for sid, count in db.execute(query)
+    ]
+
+
+@dataclass(frozen=True)
+class PayrollCostSummary:
+    store_ids: list[int] | None
+    period_start: date
+    period_end: date
+    gross_pay: Decimal
+    deductions: Decimal
+    net_pay: Decimal
+    employer_contributions: Decimal
+    labor_cost: Decimal  # gross_pay + employer_contributions -- see docstring below
+    regular_hours: Decimal
+    overtime_hours: Decimal
+    pending_period_count: int
+    statutory_disclaimer: str = (
+        "Deductions shown are the configurable amounts recorded in this system's "
+        "payroll engine. No statutory tax, social-security, or other "
+        "jurisdiction-specific formula is calculated or implied."
+    )
+
+
+def payroll_cost_summary(
+    db: Session,
+    *,
+    store_ids: list[int] | None,
+    period_start: date,
+    period_end: date,
+) -> PayrollCostSummary:
+    """`period_start`/`period_end` are PayrollPeriod's OWN period
+    boundaries (never `posted_at`) so this compares like-for-like
+    operating periods against sales (docs/M11_DESIGN.md Section 5.5).
+    `labor_cost` = gross pay + employer contributions ONLY -- exactly
+    and only what this payroll engine represents; it excludes any
+    statutory employer obligation not modeled in this system, and is
+    never presented as a complete real-world employer cost."""
+    from app.modules.payroll.models import (
+        PayrollDeductionLine,
+        PayrollEmployeeResult,
+        PayrollPeriod,
+    )
+
+    query = select(PayrollPeriod).where(
+        PayrollPeriod.status == "POSTED",
+        PayrollPeriod.period_start >= period_start,
+        PayrollPeriod.period_end <= period_end,
+    )
+    if store_ids is not None:
+        query = query.where(PayrollPeriod.store_id.in_(store_ids))
+    posted_periods = list(db.execute(query).scalars())
+    period_ids = [p.id for p in posted_periods]
+
+    gross_pay = sum((p.total_gross for p in posted_periods), start=Decimal("0"))
+    deductions = sum((p.total_deductions for p in posted_periods), start=Decimal("0"))
+    net_pay = sum((p.total_net_pay for p in posted_periods), start=Decimal("0"))
+
+    employer_contributions = Decimal("0")
+    regular_hours = Decimal("0")
+    overtime_hours = Decimal("0")
+    if period_ids:
+        hours_row = db.execute(
+            select(
+                func.coalesce(func.sum(PayrollEmployeeResult.regular_hours), 0),
+                func.coalesce(func.sum(PayrollEmployeeResult.overtime_hours), 0),
+            ).where(PayrollEmployeeResult.payroll_period_id.in_(period_ids))
+        ).one()
+        regular_hours, overtime_hours = Decimal(hours_row[0]), Decimal(hours_row[1])
+
+        employer_contributions = Decimal(
+            db.execute(
+                select(func.coalesce(func.sum(PayrollDeductionLine.amount), 0))
+                .select_from(PayrollDeductionLine)
+                .join(
+                    PayrollEmployeeResult,
+                    PayrollEmployeeResult.id == PayrollDeductionLine.payroll_employee_result_id,
+                )
+                .where(
+                    PayrollEmployeeResult.payroll_period_id.in_(period_ids),
+                    PayrollDeductionLine.is_employer_contribution.is_(True),
+                )
+            ).scalar_one()
+        )
+
+    pending_query = select(func.count(PayrollPeriod.id)).where(
+        PayrollPeriod.status.in_(("DRAFT", "OPEN", "CALCULATED", "APPROVED")),
+        PayrollPeriod.period_start >= period_start,
+        PayrollPeriod.period_end <= period_end,
+    )
+    if store_ids is not None:
+        pending_query = pending_query.where(PayrollPeriod.store_id.in_(store_ids))
+    pending_count = db.execute(pending_query).scalar_one()
+
+    return PayrollCostSummary(
+        store_ids=store_ids,
+        period_start=period_start,
+        period_end=period_end,
+        gross_pay=gross_pay,
+        deductions=deductions,
+        net_pay=net_pay,
+        employer_contributions=employer_contributions,
+        labor_cost=gross_pay + employer_contributions,
+        regular_hours=regular_hours,
+        overtime_hours=overtime_hours,
+        pending_period_count=int(pending_count),
+    )
+
+
+@dataclass(frozen=True)
+class LaborCostPercentRow:
+    labor_cost: Decimal
+    net_sales: Decimal
+    labor_cost_percent: Decimal | None
+
+
+def labor_cost_percent_of_sales(
+    db: Session, *, store_ids: list[int] | None, period_start: date, period_end: date
+) -> LaborCostPercentRow:
+    payroll = payroll_cost_summary(
+        db, store_ids=store_ids, period_start=period_start, period_end=period_end
+    )
+    sales = sales_summary(db, store_ids=store_ids, date_from=period_start, date_to=period_end)
+    return LaborCostPercentRow(
+        labor_cost=payroll.labor_cost,
+        net_sales=sales.net_sales,
+        labor_cost_percent=_safe_ratio(payroll.labor_cost * 100, sales.net_sales),
+    )
+
+
+def payroll_gl_reconciliation(
+    db: Session, *, store_ids: list[int] | None = None
+) -> GlReconciliationRow:
+    """Section 8: Σ PayrollPeriod.total_net_pay (POSTED) vs.
+    ACCOUNT_PAYROLL_PAYABLE net credit -- same exact-match, expose-not-
+    correct pattern as every other reconciliation in this module."""
+    from app.modules.accounting.constants import ACCOUNT_PAYROLL_PAYABLE
+    from app.modules.payroll.models import PayrollPeriod
+
+    rows = accounting_service.trial_balance(db, store_ids=store_ids)
+    gl_row = next((r for r in rows if r.account_code == ACCOUNT_PAYROLL_PAYABLE), None)
+    gl_balance = (gl_row.total_credit - gl_row.total_debit) if gl_row else Decimal("0")
+
+    query = select(func.coalesce(func.sum(PayrollPeriod.total_net_pay), 0)).where(
+        PayrollPeriod.status == "POSTED"
+    )
+    if store_ids is not None:
+        query = query.where(PayrollPeriod.store_id.in_(store_ids))
+    operational = Decimal(db.execute(query).scalar_one())
+
+    return GlReconciliationRow(
+        label="Payroll Payable",
+        gl_balance=gl_balance,
+        operational_value=operational,
+        discrepancy=gl_balance - operational,
+    )
