@@ -22,6 +22,7 @@ the route handler's session closes without ever calling db.commit().
 """
 
 import secrets
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_UP, Decimal
@@ -1186,9 +1187,22 @@ def trial_balance(
     db: Session,
     *,
     store_id: int | None = None,
+    store_ids: Sequence[int] | None = None,
     date_from: date | None = None,
     date_to: date | None = None,
 ) -> list[TrialBalanceRow]:
+    """`store_ids` (M11 addition, docs/M11_DESIGN.md Section 2): an
+    explicit list of stores, for company-wide reporting restricted to a
+    caller's authorized SUBSET of stores — `store_id` alone can only
+    express "exactly one store" or "every store" (`None`). Additive and
+    backward compatible: every existing caller passing only `store_id`
+    is completely unaffected; passing both is rejected rather than
+    silently picking one, since that combination has no caller today
+    and guessing would be worse than refusing."""
+    if store_id is not None and store_ids is not None:
+        raise ValidationAppError(
+            "Pass either store_id or store_ids, not both", error_code="INVALID_STORE_FILTER"
+        )
     query = (
         select(
             Account.code,
@@ -1204,7 +1218,9 @@ def trial_balance(
         .group_by(Account.id)
         .order_by(Account.code)
     )
-    query = _apply_entry_filters(query, store_id=store_id, date_from=date_from, date_to=date_to)
+    query = _apply_entry_filters(
+        query, store_id=store_id, store_ids=store_ids, date_from=date_from, date_to=date_to
+    )
     rows = db.execute(query).all()
     return [
         TrialBalanceRow(
@@ -1220,13 +1236,20 @@ def trial_balance(
 
 
 def _apply_entry_filters(
-    query: Any, *, store_id: int | None, date_from: date | None, date_to: date | None
+    query: Any,
+    *,
+    store_id: int | None,
+    store_ids: Sequence[int] | None = None,
+    date_from: date | None,
+    date_to: date | None,
 ) -> Any:
     # store_id/date filters apply to the JournalEntry side of the outer
     # join — for an account no matching entry touched, the join columns
     # are NULL and the filter would incorrectly drop the whole account
     # row, so each filter is OR'd with "no entry joined at all."
-    if store_id is not None:
+    if store_ids is not None:
+        query = query.where((JournalEntry.store_id.in_(store_ids)) | (JournalEntry.id.is_(None)))
+    elif store_id is not None:
         query = query.where((JournalEntry.store_id == store_id) | (JournalEntry.id.is_(None)))
     if date_from is not None:
         query = query.where((JournalEntry.posting_date >= date_from) | (JournalEntry.id.is_(None)))
@@ -1252,12 +1275,15 @@ def profit_and_loss(
     db: Session,
     *,
     store_id: int | None = None,
+    store_ids: Sequence[int] | None = None,
     date_from: date | None = None,
     date_to: date | None = None,
 ) -> ProfitAndLoss:
     rows = {
         row.account_code: row
-        for row in trial_balance(db, store_id=store_id, date_from=date_from, date_to=date_to)
+        for row in trial_balance(
+            db, store_id=store_id, store_ids=store_ids, date_from=date_from, date_to=date_to
+        )
     }
 
     def net_credit(code: str) -> Decimal:

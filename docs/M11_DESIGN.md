@@ -189,12 +189,41 @@ is `SaleReturn.created_at` (no `completed_at` field exists on
 `SaleReturn`; a return is created already final — there is no
 "OPEN return" state, confirmed by `SaleReturn`'s model docstring).
 
+**Verified against the actual running code, not the schema's aspirational
+CHECK constraint**: `app.modules.sales.service.void_sale` calls
+`create_sale_return` with `_is_void=True`, but that flag **only**
+changes the audit-log action string (`"VOID_COMPLETED"` vs.
+`"SALE_RETURN_COMPLETED"`) — it never sets `Sale.status` to `'VOIDED'`.
+A 100%-voided sale ends at `status='REFUNDED'`, **identical** to an
+ordinary full customer return, and `Sale.voided_by`/`voided_reason` are
+never populated by any current code path. `'VOIDED'` is a schema value
+with **no producer anywhere in this codebase today** — a pre-existing
+M1-M5 characteristic (confirmed by grep and by a failing test written
+against the originally-assumed behavior, then corrected), not something
+M11 may "fix," since that would mean changing M1-M5's own service code.
+
+This does not create a financial-safety gap: a void nets to **exactly
+zero** revenue through the same returns-netting math as an ordinary
+full return, so nothing is double-counted either way — the property
+that actually matters ("do not double-count returned or voided
+transactions") holds regardless of the unused status value. What it
+does mean is that `Sale.status` alone cannot distinguish "the cashier
+voided this same-day" from "the customer returned it three weeks
+later." The **only** reliable signal for that distinction is the audit
+trail `create_sale_return` itself writes
+(`audit_logs.action='VOID_COMPLETED'`, `entity_type='sale_return'`,
+`entity_id=SaleReturn.id` — indexed, append-only) — offered as a
+supplementary, clearly-labeled breakdown of the returns total (`void_count`/
+`void_amount`), never as a second, additive bucket (a void is a return,
+not returns-plus-something).
+
 | Metric | Formula | Treatment of edge cases |
 |---|---|---|
-| Gross sales | `SUM(SaleItem.line_total + SaleItem.discount_amount - SaleItem.tax_amount)` for `Sale.status IN ('COMPLETED','REFUNDED','PARTIALLY_REFUNDED')` | **`VOIDED` sales are excluded entirely** — a void is the operator's own "this never should have happened" correction (same code path as a 100%-return, but the `Sale.status` flip to `VOIDED` is the authoritative signal, not the presence of a `SaleReturn` row). `REFUNDED`/`PARTIALLY_REFUNDED` sales **do** count in gross — the original economics happened; the return is netted out separately below, not by excluding the sale |
+| Gross sales | `SUM(SaleItem.line_total + SaleItem.discount_amount - SaleItem.tax_amount)` for `Sale.status IN ('COMPLETED','REFUNDED','PARTIALLY_REFUNDED')` | Every non-`OPEN` sale that was ever finalized counts in gross, including one later fully voided/returned — the reversal is netted out below, never by excluding the sale itself (there is no reliable `Sale`-level signal to exclude a void by, per the note above) |
 | Discounts | `SUM(SaleItem.discount_amount)` over the same status filter | Header-level `Sale.discount_total` is the maintained rollup and must equal this; a reconciliation check (Section 8) proves it |
-| Returns | `SUM(SaleReturnItem.unit_price_refunded * quantity - discount_refunded + tax_refunded)` **joined through `SaleReturn.sale_id` to `Sale` and filtered to `Sale.status != 'VOIDED'`** | Excluding voided-sale returns is the load-bearing rule that prevents double-subtraction: a void's own "return" row is the void mechanism itself, not a customer return event, and its sale already contributes $0 to gross — see Mutation Test #1 (Section 17) |
-| Net sales | Gross sales − Returns | By construction, a fully-refunded sale nets to (approximately) zero, not negative, and a voided sale contributes exactly zero to both terms |
+| Returns | `SUM(SaleReturnItem.unit_price_refunded * quantity - discount_refunded + tax_refunded)` joined through `SaleReturn.sale_id` to `Sale`, **filtered to `Sale.status != 'VOIDED'`** (defensive — see below) | The `!= 'VOIDED'` filter is dead code against today's data (nothing ever sets that status) but is kept as a forward-compatible guard, cheaper to keep than to argue should be removed; the mutation test in Section 17 documents it as "not currently load-bearing" rather than claiming it protects something it does not |
+| Void breakdown | `void_count`/`void_amount`: same returns query, additionally joined to `audit_logs` on `action='VOID_COMPLETED' AND entity_type='sale_return' AND entity_id=SaleReturn.id` | Informational subset of Returns, not summed into any other total — reported so "how many of today's returns were actually voids" is answerable, honestly labeled as audit-trail-derived rather than a structured transactional field |
+| Net sales | Gross sales − Returns | By construction, a fully-refunded-or-voided sale nets to exactly zero, never negative from this alone |
 | Tax | `SUM(SaleItem.tax_amount)` (gross sales period) minus `SUM(SaleReturnItem.tax_refunded)` (non-void returns) | Tax is never included in "net sales" — sales tax is a collected-on-behalf-of liability, not revenue (matches `ACCOUNT_TAX_PAYABLE`'s own treatment) |
 | COGS | `SUM(SaleItem.quantity * SaleItem.unit_cost_at_sale)` for the same non-void statuses, minus `SUM(SaleReturnItem.quantity * SaleReturnItem.unit_cost_refunded)` for **`restock = true`** returns only | A non-restocked (damaged) return's inventory never came back, so its COGS is never reversed — this exactly matches the accounting posting rule in `sales/service.py::create_sale_return`, so operational COGS and GL COGS reconcile (Section 8) |
 | Gross profit | Net sales − COGS | |
