@@ -33,6 +33,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationAppError
+from app.modules.accounting import service as accounting_service
 from app.modules.audit import service as audit_service
 from app.modules.hr.models import (
     AttendanceRecord,
@@ -55,6 +56,7 @@ from app.modules.payroll.models import (
     PayrollEarningLine,
     PayrollEmployeeResult,
     PayrollPeriod,
+    PayrollReversal,
 )
 
 # Cancel is allowed from any state except POSTED (docs/M10_DESIGN.md
@@ -658,3 +660,156 @@ def list_payroll_employee_results(
         .scalars()
         .all()
     )
+
+
+# --- Posting and reversal (M10 Phase 6) --------------------------------------
+#
+# The actual GL posting logic lives in
+# app.modules.accounting.service.post_payroll_journal/
+# post_payroll_reversal_journal — this module only orchestrates the
+# payroll-side state transition around it, called INLINE before this
+# function's own final commit (the same "posting is atomic with the
+# operational event" rule every other domain in this codebase follows —
+# see accounting/service.py's own module docstring).
+
+
+def post_payroll_period(
+    db: Session,
+    *,
+    payroll_period_id: int,
+    actor_id: int | None,
+    caller_store_id: int | None,
+    client_transaction_id: str | None = None,
+) -> PayrollPeriod:
+    """APPROVED -> POSTED. Idempotent by state: calling this on an
+    already-POSTED period is a no-op returning the current row (mirrors
+    `post_purchase_invoice`) — the DB's own partial unique index on
+    (source_type='PAYROLL_POSTING', source_id=payroll_period_id) is the
+    ultimate backstop against a genuine double-post slipping through."""
+    period = _lock_payroll_period(db, payroll_period_id)
+    _enforce_store_access(caller_store_id, period.store_id, "payroll period")
+    if period.status == "POSTED":
+        return period
+    if period.status != "APPROVED":
+        raise ConflictError(
+            f"Payroll period {payroll_period_id} is {period.status}, not APPROVED",
+            error_code="INVALID_PERIOD_STATE",
+        )
+    if actor_id is None:
+        raise ValidationAppError(
+            "Posting requires an authenticated actor", error_code="ACTOR_REQUIRED"
+        )
+
+    results = list_payroll_employee_results(db, payroll_period_id=period.id)
+    if not results:
+        raise ConflictError(
+            f"Payroll period {payroll_period_id} has no calculated results to post",
+            error_code="NO_CALCULATED_RESULTS",
+        )
+
+    journal_entry = accounting_service.post_payroll_journal(
+        db, payroll_period=period, payroll_employee_results=results, posted_by=actor_id
+    )
+
+    period.status = "POSTED"
+    period.journal_entry_id = journal_entry.id
+    period.posted_by = actor_id
+    period.posted_at = datetime.now(UTC)
+    period.posting_client_transaction_id = client_transaction_id
+    for result in results:
+        result.status = "FINAL"
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ConflictError(
+            f"Payroll period {payroll_period_id} posting client_transaction_id was " "already used",
+            error_code="DUPLICATE_POSTING_REQUEST",
+        ) from exc
+
+    # M10 approved decision #5: identifiers and non-sensitive context
+    # only — never gross/net pay or any other monetary amount.
+    audit_service.log_event(
+        db,
+        user_id=actor_id,
+        action="PAYROLL_PERIOD_POSTED",
+        entity_type="payroll_period",
+        entity_id=period.id,
+        after={"journal_entry_id": journal_entry.id, "employee_count": len(results)},
+    )
+    db.commit()
+    db.refresh(period)
+    return period
+
+
+def reverse_payroll_period(
+    db: Session,
+    *,
+    payroll_period_id: int,
+    reason: str,
+    actor_id: int | None,
+    caller_store_id: int | None,
+) -> PayrollPeriod:
+    """POSTED-only. `PayrollPeriod.status` NEVER changes on reversal — it
+    stays POSTED forever (mirrors JournalEntry's own append-only
+    convention); "was this period reversed" is a derived fact answered
+    by whether a PayrollReversal row references it. Idempotent: a
+    period already reversed returns the current row without creating a
+    second reversal (the DB's own unique constraint on
+    payroll_reversals.payroll_period_id is the backstop)."""
+    if not reason or not reason.strip():
+        raise ValidationAppError(
+            "A reversal reason is required", error_code="REVERSAL_REASON_REQUIRED"
+        )
+    period = _lock_payroll_period(db, payroll_period_id)
+    _enforce_store_access(caller_store_id, period.store_id, "payroll period")
+    if period.status != "POSTED":
+        raise ConflictError(
+            f"Payroll period {payroll_period_id} is {period.status}, not POSTED",
+            error_code="INVALID_PERIOD_STATE",
+        )
+    if actor_id is None:
+        raise ValidationAppError(
+            "Reversal requires an authenticated actor", error_code="ACTOR_REQUIRED"
+        )
+
+    existing_reversal = db.execute(
+        select(PayrollReversal).where(PayrollReversal.payroll_period_id == period.id)
+    ).scalar_one_or_none()
+    if existing_reversal is not None:
+        return period
+
+    results = list_payroll_employee_results(db, payroll_period_id=period.id)
+    reversal_entry = accounting_service.post_payroll_reversal_journal(
+        db, payroll_period=period, payroll_employee_results=results, reversed_by=actor_id
+    )
+
+    db.add(
+        PayrollReversal(
+            payroll_period_id=period.id,
+            reversal_journal_entry_id=reversal_entry.id,
+            reason=reason,
+            reversed_by=actor_id,
+            reversed_at=datetime.now(UTC),
+        )
+    )
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ConflictError(
+            f"Payroll period {payroll_period_id} has already been reversed",
+            error_code="ALREADY_REVERSED",
+        ) from exc
+
+    audit_service.log_event(
+        db,
+        user_id=actor_id,
+        action="PAYROLL_PERIOD_REVERSED",
+        entity_type="payroll_period",
+        entity_id=period.id,
+        after={"reversal_journal_entry_id": reversal_entry.id, "reason": reason},
+    )
+    db.commit()
+    db.refresh(period)
+    return period

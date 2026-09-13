@@ -35,10 +35,13 @@ from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError, Va
 from app.modules.accounting.constants import (
     ACCOUNT_ACCOUNTS_PAYABLE,
     ACCOUNT_COGS,
+    ACCOUNT_EMPLOYER_CONTRIBUTION_EXPENSE,
+    ACCOUNT_EMPLOYER_CONTRIBUTION_PAYABLE,
     ACCOUNT_INVENTORY,
     ACCOUNT_INVENTORY_ADJUSTMENT_GAIN,
     ACCOUNT_INVENTORY_IN_TRANSIT,
     ACCOUNT_INVENTORY_SHRINKAGE_EXPENSE,
+    ACCOUNT_PAYROLL_PAYABLE,
     ACCOUNT_PURCHASE_CLEARING,
     ACCOUNT_PURCHASE_DISCOUNTS,
     ACCOUNT_PURCHASE_PRICE_VARIANCE,
@@ -46,8 +49,12 @@ from app.modules.accounting.constants import (
     ACCOUNT_SALES_DISCOUNTS,
     ACCOUNT_SALES_REVENUE,
     ACCOUNT_TAX_PAYABLE,
+    ACCOUNT_WAGE_SALARY_EXPENSE,
     PAYMENT_METHOD_ACCOUNT_CODE,
     SUPPLIER_PAYMENT_METHOD_ACCOUNT_CODE,
+)
+from app.modules.accounting.constants import (
+    ACCOUNT_BENEFIT_DEDUCTION_PAYABLE as _ACCOUNT_EMPLOYEE_DEDUCTION_PAYABLE,
 )
 from app.modules.accounting.models import (
     AUTOMATED_SOURCE_TYPES,
@@ -64,6 +71,7 @@ if TYPE_CHECKING:
     # never executes these imports.
     from app.modules.ap.models import PurchaseInvoice, SupplierCreditNote, SupplierPayment
     from app.modules.inventory.models import StockAdjustment
+    from app.modules.payroll.models import PayrollEmployeeResult, PayrollPeriod
     from app.modules.purchasing.models import GoodsReceipt, PurchaseReturn
     from app.modules.sales.models import Sale, SaleReturn
     from app.modules.sales.service import PaymentInput, _ComputedLine
@@ -811,6 +819,161 @@ def post_transfer_receipt_journal(
         source_id=transfer_receipt.id,
         memo=memo,
         created_by=created_by,
+        lines=lines,
+    )
+
+
+# --- Payroll (M10) -------------------------------------------------------
+
+
+def _payroll_journal_lines(
+    *,
+    total_gross: Decimal,
+    total_employee_deductions: Decimal,
+    total_employer_contributions: Decimal,
+    total_net_pay: Decimal,
+    memo: str,
+    reverse: bool = False,
+) -> list[_LineSpec]:
+    """docs/M10_DESIGN.md Section 10's account plan:
+
+        Dr  Wage & Salary Expense           Σ gross_pay
+        Dr  Employer Contribution Expense   Σ employer contribution lines
+        Cr  Payroll Payable                 Σ net_pay
+        Cr  (Employee) Deduction Payable    Σ employee deduction lines
+        Cr  Employer Contribution Payable   Σ employer contribution lines
+
+    Balances by construction: net_pay = gross_pay - employee_deductions,
+    so Cr(net_pay) + Cr(employee_deductions) = gross_pay = Dr(gross_pay),
+    and the employer-contribution pair is a self-balancing expense/
+    liability recognized alongside it — the SAME "algebraic proof"
+    discipline as every other _*_journal_lines helper in this module.
+
+    Reuses `ACCOUNT_BENEFIT_DEDUCTION_PAYABLE` (seeded in the M10
+    migration as one of two liability accounts — see that migration's
+    docstring) for ALL employee-side deductions today, since M10 invents
+    no statutory tax formula and therefore has no genuine STATUTORY-vs-
+    BENEFIT distinction to post differently; `ACCOUNT_STATUTORY_WITHHOLDING_PAYABLE`
+    stays seeded but unposted, reserved for a future jurisdiction
+    integration exactly as named in M10_DESIGN.md's "explicitly not
+    built" section — mirrors how `ACCOUNT_PURCHASE_CLEARING` existed
+    before M6 gave it a real downstream.
+
+    `reverse=True` swaps every debit/credit — used only by
+    `post_payroll_reversal_journal`, recomputing from the SAME stored
+    totals rather than reading back JournalLine rows, so the reversal
+    can never accidentally diverge from what was actually posted."""
+    debit, credit = (_credit, _debit) if reverse else (_debit, _credit)
+    lines: list[_LineSpec] = []
+    if total_gross > 0:
+        lines.append(debit(ACCOUNT_WAGE_SALARY_EXPENSE, total_gross, description=memo))
+    if total_employer_contributions > 0:
+        lines.append(
+            debit(
+                ACCOUNT_EMPLOYER_CONTRIBUTION_EXPENSE,
+                total_employer_contributions,
+                description=memo,
+            )
+        )
+    if total_net_pay > 0:
+        lines.append(credit(ACCOUNT_PAYROLL_PAYABLE, total_net_pay, description=memo))
+    if total_employee_deductions > 0:
+        lines.append(
+            credit(_ACCOUNT_EMPLOYEE_DEDUCTION_PAYABLE, total_employee_deductions, description=memo)
+        )
+    if total_employer_contributions > 0:
+        lines.append(
+            credit(
+                ACCOUNT_EMPLOYER_CONTRIBUTION_PAYABLE,
+                total_employer_contributions,
+                description=memo,
+            )
+        )
+    return lines
+
+
+def post_payroll_journal(
+    db: Session,
+    *,
+    payroll_period: "PayrollPeriod",
+    payroll_employee_results: "list[PayrollEmployeeResult]",
+    posted_by: int | None,
+) -> JournalEntry:
+    """One journal entry per PayrollPeriod, never one per employee
+    (mirrors post_supplier_payment_journal's "one real financial event,
+    one entry" rule even though it aggregates many allocations).
+    `source_id = payroll_period.id` — the existing partial unique index
+    on (source_type, source_id) for STANDARD entries is, for free, the
+    DB-level "this period can never be posted twice" guarantee."""
+    total_gross = sum((r.gross_pay for r in payroll_employee_results), Decimal("0"))
+    total_deductions = sum((r.total_deductions for r in payroll_employee_results), Decimal("0"))
+    total_employer_contributions = sum(
+        (r.total_employer_contributions for r in payroll_employee_results), Decimal("0")
+    )
+    total_net_pay = sum((r.net_pay for r in payroll_employee_results), Decimal("0"))
+
+    memo = (
+        f"Payroll period {payroll_period.id} "
+        f"({payroll_period.period_start}..{payroll_period.period_end})"
+    )
+    lines = _payroll_journal_lines(
+        total_gross=total_gross,
+        total_employee_deductions=total_deductions,
+        total_employer_contributions=total_employer_contributions,
+        total_net_pay=total_net_pay,
+        memo=memo,
+    )
+    return _post_journal(
+        db,
+        store_id=payroll_period.store_id,
+        posting_date=payroll_period.pay_date,
+        source_type="PAYROLL_POSTING",
+        source_id=payroll_period.id,
+        memo=memo,
+        created_by=posted_by,
+        lines=lines,
+    )
+
+
+def post_payroll_reversal_journal(
+    db: Session,
+    *,
+    payroll_period: "PayrollPeriod",
+    payroll_employee_results: "list[PayrollEmployeeResult]",
+    reversed_by: int | None,
+) -> JournalEntry:
+    """The dedicated payroll reversal — NEVER through
+    `reverse_journal_entry`'s generic mechanism (PAYROLL_POSTING is an
+    AUTOMATED_SOURCE_TYPES member specifically so that generic path stays
+    blocked for it, identical reasoning to every other automated type:
+    a bare journal reversal would not undo `PayrollPeriod.status` or the
+    real pay obligation it represents). Posts a NEW STANDARD entry
+    (source_type='PAYROLL_REVERSAL') with every line of the original
+    posting exactly mirrored via `_payroll_journal_lines(..., reverse=True)`."""
+    total_gross = sum((r.gross_pay for r in payroll_employee_results), Decimal("0"))
+    total_deductions = sum((r.total_deductions for r in payroll_employee_results), Decimal("0"))
+    total_employer_contributions = sum(
+        (r.total_employer_contributions for r in payroll_employee_results), Decimal("0")
+    )
+    total_net_pay = sum((r.net_pay for r in payroll_employee_results), Decimal("0"))
+
+    memo = f"Reversal of payroll period {payroll_period.id}"
+    lines = _payroll_journal_lines(
+        total_gross=total_gross,
+        total_employee_deductions=total_deductions,
+        total_employer_contributions=total_employer_contributions,
+        total_net_pay=total_net_pay,
+        memo=memo,
+        reverse=True,
+    )
+    return _post_journal(
+        db,
+        store_id=payroll_period.store_id,
+        posting_date=datetime.now(UTC).date(),
+        source_type="PAYROLL_REVERSAL",
+        source_id=payroll_period.id,
+        memo=memo,
+        created_by=reversed_by,
         lines=lines,
     )
 
