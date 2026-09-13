@@ -513,45 +513,41 @@ brief.
   aggregation queries — no N+1 (a report over 50 stores issues one
   query with `GROUP BY store_id`, not 50 queries).
 - New indexes added where a report's filter/group-by isn't already
-  covered by an existing index (audited in Section "Migration
-  strategy" below — most needed indexes already exist, e.g.
-  `ix_sales_store_created`).
-- **One materialized view, justified**: `daily_sales_summary`
-  (`store_id, sale_date, gross_sales, discounts, returns, net_sales,
-  tax, cogs, gross_profit, transaction_count, units_sold`), grouped by
-  store and calendar date. Justification: the sales trend-by-day report
-  (Phase 3) and the KPI dashboard (Phase 8) both need day-granularity
-  history over potentially long ranges (a year or more) on every page
-  load, and recomputing that from raw `SaleItem`/`SaleReturnItem` rows
-  for a long range on every dashboard view is the one place this
-  milestone's own performance testing (Session J) is expected to show a
-  real cost. It is a **derived, reproducible, read-only artifact**:
-  - Refreshed by `REFRESH MATERIALIZED VIEW CONCURRENTLY
-    daily_sales_summary`, triggered by a lightweight FastAPI
-    `BackgroundTasks` call **after** `finalize_sale`/`create_sale_return`
-    commit (never before — never inside the same transaction as the
-    operational write, so a refresh failure can never roll back a real
-    sale), refreshing only the **affected `(store_id, sale_date)` row(s)**
-    via a scoped `DELETE ... ; INSERT ... SELECT` inside the view's
-    refresh function rather than a full-view rebuild, keeping the
-    refresh cost proportional to one day's data, not the whole
-    history.
-  - **Cannot silently diverge**: every trend/KPI endpoint that reads
-    this view also exposes a `reconcile=true` query parameter that
-    instead computes the identical live aggregation directly from
-    `SaleItem`/`SaleReturnItem` for the requested range and returns
-    both figures plus their delta — the exact reconciliation-check
-    pattern already established for `inventory_reconciliation()`. A
-    scheduled or manually-triggered full `REFRESH MATERIALIZED VIEW
-    daily_sales_summary` (non-concurrent, full rebuild) is also
-    provided as an operator escape hatch if the incremental refresh
-    is ever suspected of drifting — never a reason to trust the view
-    blindly.
-  - No other report in this milestone uses a materialized view or any
-    other snapshot/cache table — every other report is Section 1's
-    live aggregation, because none of them showed the same
-    "long-range, every-page-load" access pattern that justifies the
-    added complexity here.
+  covered by an existing index (Section 15 below).
+- **One real N+1 found and fixed during Phase 11 implementation**:
+  `inventory_turnover` originally looked up each product's opening/
+  closing inventory valuation with two separate queries per product,
+  inside a Python loop over the catalog. Rewritten to two batched
+  `DISTINCT ON` queries (one for opening, one for closing) regardless
+  of catalog size. `tests/test_reports_performance.py` proves this by
+  counting actual SQL statements sent to Postgres and asserting the
+  count stays constant as product/transaction count grows 10x — a
+  regression test that would fail immediately if a per-row query loop
+  ever came back, not just "it ran fast enough this time."
+- **The `daily_sales_summary` materialized view considered above and
+  ultimately NOT built**: this section originally proposed a
+  materialized view for the sales-trend/KPI-dashboard access pattern
+  (long date ranges, hit on every dashboard load), justified in advance
+  as "the one place performance testing is expected to show a real
+  cost." Phase 11's actual testing (query-count and correctness, not a
+  large-scale production-volume benchmark) found the live aggregation
+  already answers in a small, fixed number of queries once the N+1
+  above was fixed, with no other query-count or missing-index problem
+  surfacing anywhere in the reports module. Building the view without
+  a demonstrated need would have been exactly the "premature
+  data-warehouse complexity" this milestone's own Phase 1 charter
+  warns against, and would have introduced everything a materialized
+  view requires — refresh triggering, a `reconcile=true` consistency
+  check, a migration, a new object to keep synchronized with the truth
+  it derives from — to solve a problem that had not actually appeared.
+  **This is a documented, deferred decision, not an oversight**: if a
+  future load test against realistic production data volume (this
+  milestone's test data is at most a few dozen rows per scenario, not
+  years of multi-store history) shows the live sales-trend aggregation
+  is too slow, the view design above remains available to build then,
+  with its own migration and reconciliation check at that time.
+- No report in this milestone uses a materialized view or any other
+  snapshot/cache table — every report is Section 1's live aggregation.
 
 ## 12. Authorization / store isolation
 
@@ -564,6 +560,40 @@ function's own filtering can't leak past an already-correct
 resolution, and (mirroring the M10 mutation-testing precedent) each
 report's authorization is tested at **both** the route layer and the
 service layer independently, per Phase 10's explicit requirement.
+
+### 12.1 Concurrency isolation (found during Phase 12 testing)
+
+A second, distinct correctness property surfaced only once real
+concurrent-write testing began (`tests/test_reports_concurrency.py`):
+several report functions (e.g. `payroll_cost_summary`) issue more than
+one independent `SELECT` statement per call. Under this project's
+default `READ COMMITTED` isolation, each statement takes its own fresh
+snapshot — so a write committing in the gap between two of those
+statements can produce a **torn read**: a payroll period observed as
+neither "pending" (its status-based query ran after the commit) nor
+contributing to `gross_pay` (a query from the same call, logically
+"the same report," effectively saw a different snapshot). This was not
+a hypothetical risk found by inspection; it was an actual failing
+assertion (`test_payroll_posting_during_payroll_report`) before the
+fix below.
+
+The fix relies entirely on PostgreSQL's own isolation levels, never
+app-level locking (read-only analytics has nothing to lock): every
+report request is bumped to `REPEATABLE READ` for the life of that one
+request, at the single point every report route already shares —
+`app.api.v1.endpoints.reports._report_db`, a thin wrapper around the
+existing `get_db` dependency. This gives every statement a single
+report issues (however many, across however many service functions,
+e.g. `cash_payment_method_summary` calling both
+`sales_by_payment_method` and `accounting_service.trial_balance`) one
+consistent snapshot, closing the torn-read window without introducing
+any new locking primitive. It degrades gracefully rather than raising
+when a session already has a transaction in progress (this test
+suite's own `db`/`client` fixtures, which wrap each test in one outer
+transaction before any endpoint code runs, and have no concurrent
+writer to race against in the first place — never a production
+scenario, since `get_db` always hands a fresh, transaction-free
+session to a real request).
 
 ## 13. Handling of reversed/voided/returned transactions
 
@@ -609,32 +639,32 @@ never as an ad hoc `CREATE INDEX` outside migration history.
 
 ## 16. Migration strategy
 
-M11 requires one migration:
+M11 required exactly one migration (`32e51bcda102`, revising M10 head
+`1e832b76969e`):
 
-1. Two new indexes (above).
-2. The `daily_sales_summary` materialized view (Section 11) plus its
-   scoped refresh function.
+1. Two new indexes (Section 15): `ix_sales_store_completed` on `sales`
+   and `ix_payroll_periods_store_status` on `payroll_periods`.
+2. Nothing else. Section 11's originally-proposed `daily_sales_summary`
+   materialized view was **not built** (Section 11 explains why:
+   Phase 11 testing found no query-count or missing-index problem it
+   would have solved), so this migration carries no new table, view,
+   function, or column of any kind.
 3. **No changes to any existing table's columns, constraints, or
-   privileges** — no new columns on `sales`/`products`/etc., and
-   critically, **no change to any existing append-only privilege
-   grant**. The materialized view itself is populated by a
-   `SECURITY DEFINER`-free plain SQL function running as the migration
-   owner/schema role at refresh time (not `erp_app` directly avoiding
-   any need to grant new write privileges to the restricted runtime
-   role beyond what a normal `REFRESH MATERIALIZED VIEW` already
-   requires, which PostgreSQL grants to the view's owner regardless of
-   `erp_app`'s table-level restrictions — never bypassing or weakening
-   the existing `journal_entries`/`inventory_movements`/etc. immutability
-   grants).
-4. Downgrade: drops the view, its refresh function, and the two new
-   indexes — **fully non-destructive to any existing table's data**,
-   since the view is entirely derived and the indexes carry no data of
-   their own. No downgrade guard is needed (nothing irreplaceable is
-   ever created by this migration), unlike M8/M9/M10's guards, which
-   exist because those milestones' downgrades would otherwise drop
-   tables holding irreplaceable transactional data. Verified per
-   Phase 14's exact test list (fresh, M10→M11, M11→M10, populated
-   upgrade/downgrade/re-upgrade).
+   privileges** — no new columns on `sales`/`products`/etc., and no
+   change to any existing append-only privilege grant. An index change
+   alone never requires a privilege change.
+4. Downgrade: drops the two indexes — **fully non-destructive to any
+   existing table's data**, since an index carries no data of its own.
+   No downgrade guard is needed (nothing irreplaceable is ever created
+   by this migration), unlike M8/M9/M10's guards, which exist because
+   those milestones' downgrades would otherwise drop tables holding
+   irreplaceable transactional data. Verified per Phase 14's exact test
+   list (fresh DB full M0→M11 chain, M10→M11 upgrade, M11→M10
+   downgrade, populated upgrade/downgrade/re-upgrade against real
+   seeded business data) — see
+   `tests/test_migrations.py::test_m11_indexes_created_on_upgrade_and_removed_on_downgrade`
+   and
+   `test_m11_upgrade_downgrade_reupgrade_preserves_populated_m10_business_data`.
 
 ## 17. Testing strategy
 
@@ -665,18 +695,32 @@ audit (`docs/M11_HARDENING_AUDIT.md`, produced after implementation).
    only" role does not exist today and is not created by M11.
 4. **Store-timezone-naive date filtering outside HR** — matches the
    pre-existing, documented M2 gap; M11 does not fix or paper over it.
-5. **`daily_sales_summary` is the only report backed by a
-   snapshot/materialized artifact**; every other report is always
-   computed live, so it can never be "stale" in the way a cached report
-   can — the tradeoff is query cost at very large date ranges, which
-   Section 12/Phase 11's performance testing measures and documents
-   rather than papering over with an untested cache.
+5. **Every report is computed live — no report is backed by a
+   snapshot/materialized artifact** (Section 11 explains the
+   `daily_sales_summary` view considered and deliberately not built).
+   No report can ever be "stale" in the way a cached report can; the
+   tradeoff is query cost at very large date ranges over a very large
+   dataset, which Phase 11's testing proved does not scale per-row
+   (query count is fixed regardless of catalog/transaction volume) but
+   did not include a large-scale production-volume latency benchmark —
+   if real-world scale ever shows this live-aggregation approach is too
+   slow for the sales-trend/KPI access pattern specifically, the
+   materialized-view design in Section 11 remains available to build
+   then, with its own migration and reconciliation check at that time.
 6. **Purchase price variance reporting only covers invoices that have
    actually posted** — an outstanding, unposted invoice's eventual
    variance is not predictable from this report.
 7. **Supplier delivery performance is a simple average lead time**, not
    a weighted or statistically adjusted score — deliberately, per this
    milestone's instruction against "AI-like" unexplained scores.
+8. **No frontend UI was built for M11.** This milestone delivers the
+   `/api/v1/reports/*` REST layer only, matching the task brief's
+   backend-first framing (analytics/reporting layer over the
+   authoritative transactional system) and this project's own
+   established pattern of an API milestone preceding its UI (compare
+   M4's accounting API, which shipped without a UI until a later
+   milestone). A management-dashboard frontend consuming these
+   endpoints remains a natural, separate follow-up.
 
 ---
 
