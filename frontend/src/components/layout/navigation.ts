@@ -23,6 +23,8 @@ export const NAV_ITEMS: NavItem[] = [
   { label: 'Sales', path: '/sales', permission: 'sales.read' },
   { label: 'Accounts Payable', path: '/accounts-payable', permission: 'ap.read' },
   { label: 'Accounting', path: '/accounting', permission: 'accounting.read' },
+  { label: 'HR', path: '/hr', permission: 'hr.read' },
+  { label: 'Payroll', path: '/payroll', permission: 'payroll.read' },
   { label: 'Reports', path: '/reports', permission: 'reports.read' },
   { label: 'Users', path: '/users', permission: 'users.manage' },
   { label: 'Settings', path: '/settings' },

@@ -4,8 +4,10 @@ import { ProtectedRoute, RequirePermission } from './auth/ProtectedRoute'
 import { AccountingPage } from './pages/AccountingPage'
 import { AccountsPayablePage } from './pages/AccountsPayablePage'
 import { DashboardPage } from './pages/DashboardPage'
+import { HrPage } from './pages/HrPage'
 import { InventoryPage } from './pages/InventoryPage'
 import { LoginPage } from './pages/LoginPage'
+import { PayrollPage } from './pages/PayrollPage'
 import { PosPage } from './pages/PosPage'
 import { ProductsPage } from './pages/ProductsPage'
 import { PurchasingPage } from './pages/PurchasingPage'
@@ -127,6 +129,22 @@ function App() {
             element={
               <RequirePermission permission="users.manage">
                 <UsersPage />
+              </RequirePermission>
+            }
+          />
+          <Route
+            path="hr"
+            element={
+              <RequirePermission permission="hr.read">
+                <HrPage />
+              </RequirePermission>
+            }
+          />
+          <Route
+            path="payroll"
+            element={
+              <RequirePermission permission="payroll.read">
+                <PayrollPage />
               </RequirePermission>
             }
           />
