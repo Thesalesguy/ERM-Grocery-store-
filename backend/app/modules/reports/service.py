@@ -1209,3 +1209,275 @@ def in_transit_reconciliation(
         operational_in_transit_value=operational,
         discrepancy=gl_balance - operational,
     )
+
+
+# --- Section 5.4 (docs/M11_DESIGN.md): purchasing & supplier analytics -----
+
+
+@dataclass(frozen=True)
+class PurchaseSpendRow:
+    key: int
+    label: str
+    quantity_received: Decimal
+    spend: Decimal
+
+
+def purchase_spend_by_supplier(
+    db: Session,
+    *,
+    store_ids: list[int] | None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> list[PurchaseSpendRow]:
+    """Actual received cost (GoodsReceiptItem.unit_cost), not the PO's
+    estimated unit_cost — docs/M11_DESIGN.md Section 5.4."""
+    from app.modules.purchasing.models import (
+        GoodsReceipt,
+        GoodsReceiptItem,
+        PurchaseOrder,
+        Supplier,
+    )
+
+    query = (
+        select(
+            PurchaseOrder.supplier_id,
+            Supplier.name,
+            func.coalesce(func.sum(GoodsReceiptItem.quantity_received), 0),
+            func.coalesce(
+                func.sum(GoodsReceiptItem.quantity_received * GoodsReceiptItem.unit_cost), 0
+            ),
+        )
+        .select_from(GoodsReceiptItem)
+        .join(GoodsReceipt, GoodsReceipt.id == GoodsReceiptItem.goods_receipt_id)
+        .join(PurchaseOrder, PurchaseOrder.id == GoodsReceipt.purchase_order_id)
+        .join(Supplier, Supplier.id == PurchaseOrder.supplier_id)
+        .group_by(PurchaseOrder.supplier_id, Supplier.name)
+    )
+    if store_ids is not None:
+        query = query.where(GoodsReceipt.store_id.in_(store_ids))
+    if date_from is not None:
+        query = query.where(GoodsReceipt.received_date >= date_from)
+    if date_to is not None:
+        query = query.where(GoodsReceipt.received_date <= date_to)
+    return [
+        PurchaseSpendRow(key=sid, label=name, quantity_received=Decimal(qty), spend=Decimal(spend))
+        for sid, name, qty, spend in db.execute(query)
+    ]
+
+
+def purchase_spend_by_store(
+    db: Session,
+    *,
+    store_ids: list[int] | None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> list[PurchaseSpendRow]:
+    from app.modules.purchasing.models import GoodsReceipt, GoodsReceiptItem
+
+    query = (
+        select(
+            GoodsReceipt.store_id,
+            func.coalesce(func.sum(GoodsReceiptItem.quantity_received), 0),
+            func.coalesce(
+                func.sum(GoodsReceiptItem.quantity_received * GoodsReceiptItem.unit_cost), 0
+            ),
+        )
+        .select_from(GoodsReceiptItem)
+        .join(GoodsReceipt, GoodsReceipt.id == GoodsReceiptItem.goods_receipt_id)
+        .group_by(GoodsReceipt.store_id)
+    )
+    if store_ids is not None:
+        query = query.where(GoodsReceipt.store_id.in_(store_ids))
+    if date_from is not None:
+        query = query.where(GoodsReceipt.received_date >= date_from)
+    if date_to is not None:
+        query = query.where(GoodsReceipt.received_date <= date_to)
+    return [
+        PurchaseSpendRow(
+            key=sid, label=str(sid), quantity_received=Decimal(qty), spend=Decimal(spend)
+        )
+        for sid, qty, spend in db.execute(query)
+    ]
+
+
+def purchase_spend_by_product(
+    db: Session,
+    *,
+    store_ids: list[int] | None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> list[PurchaseSpendRow]:
+    from app.modules.products.models import Product
+    from app.modules.purchasing.models import (
+        GoodsReceipt,
+        GoodsReceiptItem,
+        PurchaseOrderItem,
+    )
+
+    query = (
+        select(
+            PurchaseOrderItem.product_id,
+            Product.name,
+            func.coalesce(func.sum(GoodsReceiptItem.quantity_received), 0),
+            func.coalesce(
+                func.sum(GoodsReceiptItem.quantity_received * GoodsReceiptItem.unit_cost), 0
+            ),
+        )
+        .select_from(GoodsReceiptItem)
+        .join(GoodsReceipt, GoodsReceipt.id == GoodsReceiptItem.goods_receipt_id)
+        .join(PurchaseOrderItem, PurchaseOrderItem.id == GoodsReceiptItem.purchase_order_item_id)
+        .join(Product, Product.id == PurchaseOrderItem.product_id)
+        .group_by(PurchaseOrderItem.product_id, Product.name)
+    )
+    if store_ids is not None:
+        query = query.where(GoodsReceipt.store_id.in_(store_ids))
+    if date_from is not None:
+        query = query.where(GoodsReceipt.received_date >= date_from)
+    if date_to is not None:
+        query = query.where(GoodsReceipt.received_date <= date_to)
+    return [
+        PurchaseSpendRow(key=pid, label=name, quantity_received=Decimal(qty), spend=Decimal(spend))
+        for pid, name, qty, spend in db.execute(query)
+    ]
+
+
+@dataclass(frozen=True)
+class PoFulfillmentRow:
+    purchase_order_id: int
+    purchase_number: str
+    status: str
+    quantity_ordered: Decimal
+    quantity_received: Decimal
+    quantity_outstanding: Decimal
+
+
+def po_fulfillment(db: Session, *, store_ids: list[int] | None) -> list[PoFulfillmentRow]:
+    """CANCELLED orders are excluded entirely -- an outstanding quantity
+    on a cancelled order was never going to arrive and must not appear
+    as a real open commitment (docs/M11_DESIGN.md Section 5.4)."""
+    from app.modules.purchasing.models import PurchaseOrder, PurchaseOrderItem
+
+    query = (
+        select(
+            PurchaseOrder.id,
+            PurchaseOrder.purchase_number,
+            PurchaseOrder.status,
+            func.coalesce(func.sum(PurchaseOrderItem.quantity_ordered), 0),
+            func.coalesce(func.sum(PurchaseOrderItem.quantity_received), 0),
+        )
+        .select_from(PurchaseOrder)
+        .join(PurchaseOrderItem, PurchaseOrderItem.purchase_order_id == PurchaseOrder.id)
+        .where(PurchaseOrder.status != "CANCELLED")
+        .group_by(PurchaseOrder.id, PurchaseOrder.purchase_number, PurchaseOrder.status)
+    )
+    if store_ids is not None:
+        query = query.where(PurchaseOrder.store_id.in_(store_ids))
+    return [
+        PoFulfillmentRow(
+            purchase_order_id=pid,
+            purchase_number=number,
+            status=status,
+            quantity_ordered=Decimal(ordered),
+            quantity_received=Decimal(received),
+            quantity_outstanding=Decimal(ordered) - Decimal(received),
+        )
+        for pid, number, status, ordered, received in db.execute(query)
+    ]
+
+
+@dataclass(frozen=True)
+class SupplierDeliveryPerformanceRow:
+    supplier_id: int
+    supplier_name: str
+    receipt_count: int
+    average_lead_time_days: Decimal | None
+
+
+def supplier_delivery_performance(
+    db: Session, *, store_ids: list[int] | None
+) -> list[SupplierDeliveryPerformanceRow]:
+    """A simple average lead time (order_date -> received_date),
+    deliberately not a weighted or scored rating — docs/M11_DESIGN.md
+    Section 5.4/18: explainable, directly traceable to two dates on two
+    real records, never an unexplained "AI-like" score."""
+    from app.modules.purchasing.models import GoodsReceipt, PurchaseOrder, Supplier
+
+    query = (
+        select(
+            PurchaseOrder.supplier_id,
+            Supplier.name,
+            GoodsReceipt.received_date,
+            PurchaseOrder.order_date,
+        )
+        .select_from(GoodsReceipt)
+        .join(PurchaseOrder, PurchaseOrder.id == GoodsReceipt.purchase_order_id)
+        .join(Supplier, Supplier.id == PurchaseOrder.supplier_id)
+    )
+    if store_ids is not None:
+        query = query.where(GoodsReceipt.store_id.in_(store_ids))
+
+    by_supplier: dict[int, tuple[str, list[int]]] = {}
+    for supplier_id, name, received_date, order_date in db.execute(query):
+        lead_days = (received_date - order_date).days
+        label, days_list = by_supplier.setdefault(supplier_id, (name, []))
+        days_list.append(lead_days)
+
+    return [
+        SupplierDeliveryPerformanceRow(
+            supplier_id=supplier_id,
+            supplier_name=label,
+            receipt_count=len(days_list),
+            average_lead_time_days=(
+                Decimal(sum(days_list)) / Decimal(len(days_list)) if days_list else None
+            ),
+        )
+        for supplier_id, (label, days_list) in by_supplier.items()
+    ]
+
+
+@dataclass(frozen=True)
+class PurchasePriceVarianceRow:
+    product_id: int | None
+    total_variance: Decimal  # positive = unfavorable (invoiced more than received cost)
+
+
+def purchase_price_variance_report(
+    db: Session,
+    *,
+    store_ids: list[int] | None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> list[PurchasePriceVarianceRow]:
+    """Reuses the already-posted ACCOUNT_PURCHASE_PRICE_VARIANCE journal
+    lines (ap/service.py, at invoice-posting time) as its source -- never
+    an independent recomputation of "invoiced price vs. receipt cost"
+    outside of what accounting already posted (docs/M11_DESIGN.md
+    Section 5.4)."""
+    from app.modules.accounting.constants import ACCOUNT_PURCHASE_PRICE_VARIANCE
+    from app.modules.accounting.models import JournalEntry, JournalLine
+
+    accounts = accounting_service.list_accounts(db)
+    ppv_account = next((a for a in accounts if a.code == ACCOUNT_PURCHASE_PRICE_VARIANCE), None)
+    if ppv_account is None:
+        return []
+
+    query = (
+        select(
+            JournalLine.product_id,
+            func.coalesce(func.sum(JournalLine.debit - JournalLine.credit), 0),
+        )
+        .select_from(JournalLine)
+        .join(JournalEntry, JournalEntry.id == JournalLine.journal_entry_id)
+        .where(JournalLine.account_id == ppv_account.id)
+        .group_by(JournalLine.product_id)
+    )
+    if store_ids is not None:
+        query = query.where(JournalEntry.store_id.in_(store_ids))
+    if date_from is not None:
+        query = query.where(JournalEntry.posting_date >= date_from)
+    if date_to is not None:
+        query = query.where(JournalEntry.posting_date <= date_to)
+    return [
+        PurchasePriceVarianceRow(product_id=pid, total_variance=Decimal(variance))
+        for pid, variance in db.execute(query)
+    ]
