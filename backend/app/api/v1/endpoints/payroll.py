@@ -17,7 +17,7 @@ from app.modules.auth.permissions import (
     PAYROLL_READ,
     PAYROLL_REVERSE,
 )
-from app.modules.auth.service import CurrentUser, require_permission
+from app.modules.auth.service import CurrentUser, enforce_store_access, require_permission
 from app.modules.payroll import service
 from app.modules.payroll.schemas import (
     PayrollEmployeeResultRead,
@@ -45,6 +45,7 @@ def create_payroll_period(
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_calculate_permission),
 ) -> PayrollPeriodRead:
+    enforce_store_access(current_user, payload.store_id)
     row = service.create_payroll_period(
         db,
         PayrollPeriodInput(

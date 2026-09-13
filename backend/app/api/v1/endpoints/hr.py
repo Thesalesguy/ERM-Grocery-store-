@@ -24,7 +24,7 @@ from app.modules.auth.permissions import (
     HR_READ,
     HR_WRITE,
 )
-from app.modules.auth.service import CurrentUser, require_permission
+from app.modules.auth.service import CurrentUser, enforce_store_access, require_permission
 from app.modules.hr import service
 from app.modules.hr.schemas import (
     AttendanceCorrectionInput,
@@ -120,6 +120,7 @@ def hire_employee(
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_write_permission),
 ) -> EmployeeRead:
+    enforce_store_access(current_user, payload.store_id)
     row = service.hire_employee(
         db,
         EmployeeHireInput(
