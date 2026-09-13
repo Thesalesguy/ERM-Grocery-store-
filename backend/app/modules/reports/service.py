@@ -751,3 +751,461 @@ def profit_and_loss_comparative(
         db, store_ids=store_ids, date_from=prior_date_from, date_to=prior_date_to
     )
     return ComparativePeriod(current=current, prior=prior)
+
+
+# --- Section 5.3 (docs/M11_DESIGN.md): inventory analytics ------------------
+
+
+@dataclass(frozen=True)
+class InventoryValueRow:
+    key: int
+    label: str
+    quantity_on_hand: Decimal
+    value: Decimal
+
+
+def inventory_value_by_store(
+    db: Session, *, store_ids: list[int] | None
+) -> list[InventoryValueRow]:
+    from app.modules.products.models import Product
+
+    query = select(
+        Product.store_id,
+        func.coalesce(func.sum(Product.current_qty_on_hand), 0),
+        func.coalesce(func.sum(Product.current_qty_on_hand * Product.current_cost), 0),
+    ).group_by(Product.store_id)
+    if store_ids is not None:
+        query = query.where(Product.store_id.in_(store_ids))
+    return [
+        InventoryValueRow(
+            key=store_id, label=str(store_id), quantity_on_hand=Decimal(qty), value=Decimal(val)
+        )
+        for store_id, qty, val in db.execute(query)
+    ]
+
+
+def inventory_value_by_category(
+    db: Session, *, store_ids: list[int] | None
+) -> list[InventoryValueRow]:
+    from app.modules.products.models import Product, ProductCategory
+
+    query = (
+        select(
+            Product.category_id,
+            func.coalesce(ProductCategory.name, "Uncategorized"),
+            func.coalesce(func.sum(Product.current_qty_on_hand), 0),
+            func.coalesce(func.sum(Product.current_qty_on_hand * Product.current_cost), 0),
+        )
+        .select_from(Product)
+        .join(ProductCategory, ProductCategory.id == Product.category_id, isouter=True)
+        .group_by(Product.category_id, ProductCategory.name)
+    )
+    if store_ids is not None:
+        query = query.where(Product.store_id.in_(store_ids))
+    return [
+        InventoryValueRow(
+            key=category_id if category_id is not None else 0,
+            label=name,
+            quantity_on_hand=Decimal(qty),
+            value=Decimal(val),
+        )
+        for category_id, name, qty, val in db.execute(query)
+    ]
+
+
+@dataclass(frozen=True)
+class MovementSummaryRow:
+    movement_type: str
+    quantity: Decimal
+    movement_count: int
+
+
+def inventory_movement_summary(
+    db: Session,
+    *,
+    store_ids: list[int] | None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> list[MovementSummaryRow]:
+    from app.modules.inventory.models import InventoryMovement
+
+    start, end = _day_range_bounds(date_from, date_to)
+    query = select(
+        InventoryMovement.movement_type,
+        func.coalesce(func.sum(InventoryMovement.quantity_delta), 0),
+        func.count(InventoryMovement.id),
+    ).group_by(InventoryMovement.movement_type)
+    if store_ids is not None:
+        query = query.where(InventoryMovement.store_id.in_(store_ids))
+    if start is not None:
+        query = query.where(InventoryMovement.created_at >= start)
+    if end is not None:
+        query = query.where(InventoryMovement.created_at < end)
+    return [
+        MovementSummaryRow(movement_type=mtype, quantity=Decimal(qty), movement_count=int(count))
+        for mtype, qty, count in db.execute(query)
+    ]
+
+
+@dataclass(frozen=True)
+class ShrinkageRow:
+    store_id: int
+    reason_code: str
+    quantity: (
+        Decimal  # always <= 0 (stock found MISSING); a positive adjustment is a gain, not shrinkage
+    )
+    adjustment_count: int
+
+
+def shrinkage_summary(
+    db: Session,
+    *,
+    store_ids: list[int] | None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> list[ShrinkageRow]:
+    """Shrinkage = adjustments with a NEGATIVE quantity_delta only (stock
+    found missing) — a positive adjustment is a GAIN
+    (ACCOUNT_INVENTORY_ADJUSTMENT_GAIN), never counted as shrinkage
+    (ACCOUNT_INVENTORY_SHRINKAGE_EXPENSE). Mixing the two signs into one
+    number would hide real loss behind unrelated found-stock gains."""
+    from app.modules.inventory.models import StockAdjustment
+
+    start, end = _day_range_bounds(date_from, date_to)
+    query = (
+        select(
+            StockAdjustment.store_id,
+            StockAdjustment.reason_code,
+            func.coalesce(func.sum(StockAdjustment.quantity_delta), 0),
+            func.count(StockAdjustment.id),
+        )
+        .where(StockAdjustment.quantity_delta < 0)
+        .group_by(StockAdjustment.store_id, StockAdjustment.reason_code)
+    )
+    if store_ids is not None:
+        query = query.where(StockAdjustment.store_id.in_(store_ids))
+    if start is not None:
+        query = query.where(StockAdjustment.created_at >= start)
+    if end is not None:
+        query = query.where(StockAdjustment.created_at < end)
+    return [
+        ShrinkageRow(
+            store_id=sid, reason_code=reason, quantity=Decimal(qty), adjustment_count=int(count)
+        )
+        for sid, reason, qty, count in db.execute(query)
+    ]
+
+
+@dataclass(frozen=True)
+class TurnoverRow:
+    product_id: int
+    product_name: str
+    cogs: Decimal
+    average_inventory_value: Decimal | None
+    turnover: Decimal | None
+    days_on_hand: Decimal | None
+
+
+def inventory_turnover(
+    db: Session,
+    *,
+    store_ids: list[int] | None,
+    date_from: date,
+    date_to: date,
+) -> list[TurnoverRow]:
+    """turnover = COGS for the period / average inventory value (opening
+    + closing, from InventoryMovement.resulting_quantity_on_hand and the
+    unit cost recorded at those two movements, / 2). None (never 0 or an
+    exception) when average inventory is zero — docs/M11_DESIGN.md
+    Section 5.3's explicit undefined-not-zero rule."""
+    from app.modules.inventory.models import InventoryMovement
+    from app.modules.products.models import Product
+
+    _validate_date_range(date_from, date_to)
+    start, end = _day_range_bounds(date_from, date_to)
+
+    cogs_query = (
+        select(
+            SaleItem.product_id,
+            Product.name,
+            func.coalesce(func.sum(SaleItem.quantity * SaleItem.unit_cost_at_sale), 0),
+        )
+        .select_from(SaleItem)
+        .join(Sale, Sale.id == SaleItem.sale_id)
+        .join(Product, Product.id == SaleItem.product_id)
+        .where(Sale.status.in_(_GROSS_SALE_STATUSES))
+        .group_by(SaleItem.product_id, Product.name)
+    )
+    cogs_query = _apply_sale_scope(cogs_query, store_ids=store_ids, start=start, end=end)
+    cogs_by_product = {row[0]: (row[1], Decimal(row[2])) for row in db.execute(cogs_query)}
+
+    def _inventory_value_as_of(as_of: datetime, product_id: int) -> Decimal | None:
+        row = db.execute(
+            select(
+                InventoryMovement.resulting_quantity_on_hand,
+                InventoryMovement.unit_cost_at_movement,
+            )
+            .where(InventoryMovement.product_id == product_id, InventoryMovement.created_at < as_of)
+            .order_by(InventoryMovement.created_at.desc(), InventoryMovement.id.desc())
+            .limit(1)
+        ).first()
+        if row is None:
+            return None
+        return Decimal(row[0]) * Decimal(row[1])
+
+    results = []
+    for product_id, (name, cogs) in cogs_by_product.items():
+        opening = _inventory_value_as_of(start or datetime.min, product_id) or Decimal("0")
+        closing = _inventory_value_as_of(end or datetime.max, product_id) or Decimal("0")
+        average = (opening + closing) / 2
+        turnover = _safe_ratio(cogs, average)
+        days_on_hand = _safe_ratio(Decimal("365"), turnover) if turnover is not None else None
+        results.append(
+            TurnoverRow(
+                product_id=product_id,
+                product_name=name,
+                cogs=cogs,
+                average_inventory_value=average if average != 0 else None,
+                turnover=turnover,
+                days_on_hand=days_on_hand,
+            )
+        )
+    return results
+
+
+@dataclass(frozen=True)
+class SlowMovingRow:
+    product_id: int
+    product_name: str
+    store_id: int
+    quantity_on_hand: Decimal
+    units_sold_in_window: Decimal
+
+
+def slow_moving_products(
+    db: Session,
+    *,
+    store_ids: list[int] | None,
+    window_days: int = 90,
+    threshold_units: Decimal = Decimal("1"),
+    as_of: date | None = None,
+) -> list[SlowMovingRow]:
+    """Deterministic rule, not a scored estimate (docs/M11_DESIGN.md
+    Section 5.3): current stock > 0 and fewer than `threshold_units`
+    SALE-type movements in the trailing `window_days`."""
+    from app.modules.inventory.models import InventoryMovement
+    from app.modules.products.models import Product
+
+    as_of = as_of or date.today()
+    window_start = datetime.combine(as_of, datetime.min.time()) - timedelta(days=window_days)
+
+    sold_query = (
+        select(InventoryMovement.product_id, func.sum(-InventoryMovement.quantity_delta))
+        .where(
+            InventoryMovement.movement_type == "SALE", InventoryMovement.created_at >= window_start
+        )
+        .group_by(InventoryMovement.product_id)
+    )
+    if store_ids is not None:
+        sold_query = sold_query.where(InventoryMovement.store_id.in_(store_ids))
+    sold_by_product = {row[0]: Decimal(row[1]) for row in db.execute(sold_query)}
+
+    stock_query = select(Product).where(
+        Product.current_qty_on_hand > 0, Product.is_active.is_(True)
+    )
+    if store_ids is not None:
+        stock_query = stock_query.where(Product.store_id.in_(store_ids))
+
+    results = []
+    for product in db.execute(stock_query).scalars():
+        sold = sold_by_product.get(product.id, Decimal("0"))
+        if sold < threshold_units:
+            results.append(
+                SlowMovingRow(
+                    product_id=product.id,
+                    product_name=product.name,
+                    store_id=product.store_id,
+                    quantity_on_hand=product.current_qty_on_hand,
+                    units_sold_in_window=sold,
+                )
+            )
+    return results
+
+
+@dataclass(frozen=True)
+class StockoutRow:
+    product_id: int
+    product_name: str
+    store_id: int
+
+
+def stockouts(db: Session, *, store_ids: list[int] | None) -> list[StockoutRow]:
+    from app.modules.products.models import Product
+
+    query = select(Product).where(Product.current_qty_on_hand == 0, Product.is_active.is_(True))
+    if store_ids is not None:
+        query = query.where(Product.store_id.in_(store_ids))
+    return [
+        StockoutRow(product_id=p.id, product_name=p.name, store_id=p.store_id)
+        for p in db.execute(query).scalars()
+    ]
+
+
+@dataclass(frozen=True)
+class NegativeStockRow:
+    product_id: int
+    product_name: str
+    store_id: int
+    quantity_on_hand: Decimal
+
+
+def negative_stock_products(db: Session, *, store_ids: list[int] | None) -> list[NegativeStockRow]:
+    """Only possible where Product.allow_negative_stock=true (a DB CHECK
+    forbids it otherwise) — surfaced as its own exception list since a
+    negative on-hand quantity is an operational anomaly worth seeing even
+    where explicitly permitted."""
+    from app.modules.products.models import Product
+
+    query = select(Product).where(Product.current_qty_on_hand < 0)
+    if store_ids is not None:
+        query = query.where(Product.store_id.in_(store_ids))
+    return [
+        NegativeStockRow(
+            product_id=p.id,
+            product_name=p.name,
+            store_id=p.store_id,
+            quantity_on_hand=p.current_qty_on_hand,
+        )
+        for p in db.execute(query).scalars()
+    ]
+
+
+@dataclass(frozen=True)
+class InTransitRow:
+    transfer_id: int
+    from_store_id: int
+    to_store_id: int
+    source_product_id: int
+    destination_product_id: int
+    quantity_in_transit: Decimal
+    value_in_transit: Decimal
+
+
+def inventory_in_transit(db: Session, *, store_ids: list[int] | None) -> list[InTransitRow]:
+    """shipped_quantity - received_quantity per line, valued at
+    unit_cost_at_shipment (frozen at ship time) -- matches
+    ACCOUNT_INVENTORY_IN_TRANSIT's own valuation exactly. In-transit
+    stock is counted at neither the source nor destination store's
+    on-hand quantity (docs/M11_DESIGN.md Section 5.3) -- this is its own,
+    separate bucket."""
+    from app.modules.transfers.models import InterStoreTransfer, InterStoreTransferLine
+
+    query = (
+        select(
+            InterStoreTransferLine.transfer_id,
+            InterStoreTransfer.from_store_id,
+            InterStoreTransfer.to_store_id,
+            InterStoreTransferLine.source_product_id,
+            InterStoreTransferLine.destination_product_id,
+            InterStoreTransferLine.shipped_quantity - InterStoreTransferLine.received_quantity,
+            InterStoreTransferLine.unit_cost_at_shipment,
+        )
+        .join(InterStoreTransfer, InterStoreTransfer.id == InterStoreTransferLine.transfer_id)
+        .where(
+            InterStoreTransferLine.shipped_quantity > InterStoreTransferLine.received_quantity,
+            InterStoreTransfer.status != "CANCELLED",
+        )
+    )
+    if store_ids is not None:
+        query = query.where(
+            (InterStoreTransfer.from_store_id.in_(store_ids))
+            | (InterStoreTransfer.to_store_id.in_(store_ids))
+        )
+    results = []
+    for tid, from_sid, to_sid, src_pid, dst_pid, qty, cost in db.execute(query):
+        qty = Decimal(qty)
+        cost = Decimal(cost) if cost is not None else Decimal("0")
+        results.append(
+            InTransitRow(
+                transfer_id=tid,
+                from_store_id=from_sid,
+                to_store_id=to_sid,
+                source_product_id=src_pid,
+                destination_product_id=dst_pid,
+                quantity_in_transit=qty,
+                value_in_transit=qty * cost,
+            )
+        )
+    return results
+
+
+@dataclass(frozen=True)
+class StockCountVarianceRow:
+    stock_count_id: int
+    product_id: int
+    expected_quantity: Decimal
+    counted_quantity: Decimal
+    variance: Decimal
+
+
+def stock_count_variance(db: Session, *, stock_count_id: int) -> list[StockCountVarianceRow]:
+    """Only a POSTED count has produced a real adjustment/GL effect
+    (docs/M11_DESIGN.md Section 5.3/9) -- a DRAFT/OPEN/COUNTED/REVIEWED
+    count is excluded entirely, and a line with counted_quantity IS NULL
+    (not yet counted) is excluded from variance, never treated as a
+    variance of -expected_quantity."""
+    from app.modules.inventory.models import StockCount, StockCountLine
+
+    count = db.get(StockCount, stock_count_id)
+    if count is None or count.status != "POSTED":
+        return []
+    rows = db.execute(
+        select(StockCountLine).where(
+            StockCountLine.stock_count_id == stock_count_id,
+            StockCountLine.counted_quantity.is_not(None),
+        )
+    ).scalars()
+    results = []
+    for line in rows:
+        assert line.counted_quantity is not None  # guaranteed by the query filter above
+        expected = line.expected_quantity or Decimal("0")
+        results.append(
+            StockCountVarianceRow(
+                stock_count_id=stock_count_id,
+                product_id=line.product_id,
+                expected_quantity=expected,
+                counted_quantity=line.counted_quantity,
+                variance=line.counted_quantity - expected,
+            )
+        )
+    return results
+
+
+@dataclass(frozen=True)
+class InTransitReconciliationRow:
+    gl_in_transit_balance: Decimal
+    operational_in_transit_value: Decimal
+    discrepancy: Decimal
+
+
+def in_transit_reconciliation(
+    db: Session, *, store_ids: list[int] | None = None
+) -> InTransitReconciliationRow:
+    """Section 8: ACCOUNT_INVENTORY_IN_TRANSIT GL balance vs. the
+    operational Σ(shipped-received)*unit_cost_at_shipment above.
+    Exposed, never silently corrected, exactly like
+    accounting.service.inventory_reconciliation."""
+    from app.modules.accounting.constants import ACCOUNT_INVENTORY_IN_TRANSIT
+
+    rows = accounting_service.trial_balance(db, store_ids=store_ids)
+    gl_row = next((r for r in rows if r.account_code == ACCOUNT_INVENTORY_IN_TRANSIT), None)
+    gl_balance = (gl_row.total_debit - gl_row.total_credit) if gl_row else Decimal("0")
+    operational = sum(
+        (r.value_in_transit for r in inventory_in_transit(db, store_ids=store_ids)),
+        start=Decimal("0"),
+    )
+    return InTransitReconciliationRow(
+        gl_in_transit_balance=gl_balance,
+        operational_in_transit_value=operational,
+        discrepancy=gl_balance - operational,
+    )
