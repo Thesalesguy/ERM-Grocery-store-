@@ -1195,27 +1195,26 @@ class GlReconciliationRow:
     discrepancy: Decimal
 
 
-def in_transit_reconciliation(
-    db: Session, *, store_ids: list[int] | None = None
-) -> GlReconciliationRow:
-    """Section 8: ACCOUNT_INVENTORY_IN_TRANSIT GL balance vs. the
-    operational Σ(shipped-received)*unit_cost_at_shipment above.
-    Exposed, never silently corrected, exactly like
-    accounting.service.inventory_reconciliation."""
-    from app.modules.accounting.constants import ACCOUNT_INVENTORY_IN_TRANSIT
+def in_transit_reconciliation(db: Session) -> GlReconciliationRow:
+    """Section 8: wraps the EXISTING
+    transfers.service.inventory_in_transit_reconciliation (M8) — found
+    during Phase 8 review to already implement exactly this GL-vs-
+    operational comparison. Reused verbatim rather than duplicated (this
+    module's own inventory_in_transit() breakdown above is genuinely new
+    — a per-line drill-down the M8 function doesn't provide — but the
+    aggregate reconciliation itself must not be recomputed a second way).
+    Deliberately no store_ids parameter: M8's own design decision is
+    that this account represents value IN TRANSIT BETWEEN stores, not
+    within one, so it is reported company-wide only, matching the
+    original function's own documented reasoning."""
+    from app.modules.transfers import service as transfers_service
 
-    rows = accounting_service.trial_balance(db, store_ids=store_ids)
-    gl_row = next((r for r in rows if r.account_code == ACCOUNT_INVENTORY_IN_TRANSIT), None)
-    gl_balance = (gl_row.total_debit - gl_row.total_credit) if gl_row else Decimal("0")
-    operational = sum(
-        (r.value_in_transit for r in inventory_in_transit(db, store_ids=store_ids)),
-        start=Decimal("0"),
-    )
+    result = transfers_service.inventory_in_transit_reconciliation(db)
     return GlReconciliationRow(
         label="Inventory In Transit",
-        gl_balance=gl_balance,
-        operational_value=operational,
-        discrepancy=gl_balance - operational,
+        gl_balance=result.gl_in_transit_balance,
+        operational_value=result.outstanding_in_transit_total,
+        discrepancy=result.discrepancy,
     )
 
 
@@ -1695,4 +1694,90 @@ def payroll_gl_reconciliation(
         gl_balance=gl_balance,
         operational_value=operational,
         discrepancy=gl_balance - operational,
+    )
+
+
+# --- Section 8 (docs/M11_DESIGN.md): KPI dashboard --------------------------
+
+
+@dataclass(frozen=True)
+class KpiDashboard:
+    """One coherent management dashboard. Every field is a documented,
+    traceable slice of a report already defined above in this module —
+    nothing here is a new, independent computation, and every formula is
+    named in its own comment below."""
+
+    store_ids: list[int] | None
+    period_start: date
+    period_end: date
+    net_sales: Decimal
+    gross_margin_percent: Decimal | None
+    cogs_percent_of_net_sales: Decimal | None
+    average_transaction_value: Decimal | None
+    inventory_value: Decimal
+    inventory_turnover_note: str
+    stockout_count: int
+    shrinkage_units: Decimal
+    ap_outstanding: Decimal
+    ap_overdue: Decimal
+    purchase_spend: Decimal
+    labor_cost: Decimal
+    labor_cost_percent: Decimal | None
+    pending_payroll_periods: int
+
+
+def kpi_dashboard(
+    db: Session, *, store_ids: list[int] | None, period_start: date, period_end: date
+) -> KpiDashboard:
+    from app.modules.ap import service as ap_service
+
+    sales = sales_summary(db, store_ids=store_ids, date_from=period_start, date_to=period_end)
+    inventory_rows = inventory_value_by_store(db, store_ids=store_ids)
+    inventory_value = sum((r.value for r in inventory_rows), start=Decimal("0"))
+    stockout_count = len(stockouts(db, store_ids=store_ids))
+    shrinkage_rows = shrinkage_summary(
+        db, store_ids=store_ids, date_from=period_start, date_to=period_end
+    )
+    # quantity is stored negative (stock found missing) -- shrinkage_units
+    # is reported as a positive magnitude for dashboard display.
+    shrinkage_units = -sum((r.quantity for r in shrinkage_rows), start=Decimal("0"))
+
+    aging_rows = ap_service.ap_aging(db, store_ids=store_ids, as_of=period_end)
+    ap_outstanding = sum((r.total for r in aging_rows), start=Decimal("0"))
+    ap_overdue = sum(
+        (r.days_1_30 + r.days_31_60 + r.days_61_90 + r.days_over_90 for r in aging_rows),
+        start=Decimal("0"),
+    )
+
+    spend_rows = purchase_spend_by_store(
+        db, store_ids=store_ids, date_from=period_start, date_to=period_end
+    )
+    purchase_spend = sum((r.spend for r in spend_rows), start=Decimal("0"))
+
+    payroll = payroll_cost_summary(
+        db, store_ids=store_ids, period_start=period_start, period_end=period_end
+    )
+
+    return KpiDashboard(
+        store_ids=store_ids,
+        period_start=period_start,
+        period_end=period_end,
+        net_sales=sales.net_sales,
+        gross_margin_percent=sales.gross_margin_percent,
+        cogs_percent_of_net_sales=_safe_ratio(sales.cogs * 100, sales.net_sales),
+        average_transaction_value=sales.average_transaction_value,
+        inventory_value=inventory_value,
+        inventory_turnover_note=(
+            "See /reports/inventory/turnover for a per-product breakdown "
+            "(turnover is undefined at the company level without an "
+            "opening/closing valuation snapshot for every product in scope)."
+        ),
+        stockout_count=stockout_count,
+        shrinkage_units=shrinkage_units,
+        ap_outstanding=ap_outstanding,
+        ap_overdue=ap_overdue,
+        purchase_spend=purchase_spend,
+        labor_cost=payroll.labor_cost,
+        labor_cost_percent=_safe_ratio(payroll.labor_cost * 100, sales.net_sales),
+        pending_payroll_periods=payroll.pending_period_count,
     )

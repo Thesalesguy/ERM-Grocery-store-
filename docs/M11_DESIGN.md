@@ -474,7 +474,7 @@ must produce identical totals (tested in Session G).
 | Tax | Operational tax (5.1) vs. `ACCOUNT_TAX_PAYABLE` net credit | Exact |
 | COGS | Operational COGS (5.1) vs. `ACCOUNT_COGS` net debit | Exact |
 | Inventory value | `Σ(current_qty_on_hand × current_cost)` vs. `ACCOUNT_INVENTORY` GL balance | Reuses the **existing** `inventory_reconciliation()` — exact to the ledger quantum `Decimal('0.000001')`, exposed, never silently corrected (existing behavior, unchanged) |
-| In-transit | `Σ(shipped_quantity − received_quantity) × unit_cost_at_shipment` vs. `ACCOUNT_INVENTORY_IN_TRANSIT` GL balance | New reconciliation, same exact-match expectation, same "expose, don't correct" rule |
+| In-transit | `Σ(shipped_quantity − received_quantity) × unit_cost_at_shipment` vs. `ACCOUNT_INVENTORY_IN_TRANSIT` GL balance | **Correction found during implementation**: this reconciliation already existed — `transfers.service.inventory_in_transit_reconciliation` (M8). M11 wraps it verbatim rather than recomputing it (a duplicate was written first, caught by checking the OpenAPI schema for an already-registered `/transfers/reports/...` path, and replaced). Deliberately company-wide only, no store filter — matching M8's own documented reasoning that this account represents value *between* stores, not within one |
 | AP | Operational open-invoice balance vs. `ACCOUNT_ACCOUNTS_PAYABLE` | Reuses the **existing** `ap_reconciliation()` |
 | Purchase Clearing | Reuses the **existing** `purchase_clearing_reconciliation()` | Existing tolerance, unchanged |
 | Payroll | `PayrollPeriod.total_net_pay` (posted) vs. `ACCOUNT_PAYROLL_PAYABLE` net credit | Exact, new — mirrors the inventory/AP pattern exactly |

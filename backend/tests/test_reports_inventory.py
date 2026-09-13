@@ -138,3 +138,46 @@ def test_stock_count_variance_excludes_non_posted_counts(db: Session) -> None:
     # a variance computed from unposted/incomplete data.
     rows = reports_service.stock_count_variance(db, stock_count_id=count.id)
     assert rows == []
+
+
+def test_in_transit_reconciliation_reuses_the_existing_m8_function(db: Session) -> None:
+    """docs/M11_DESIGN.md Section 8: this must call
+    transfers.service.inventory_in_transit_reconciliation directly, never
+    recompute the same comparison independently."""
+    from app.modules.transfers import service as transfers_service
+
+    store_a = make_store(db)
+    store_b = make_store(db)
+    source = make_product(
+        db, store_a, sku="SKU-REC", current_qty_on_hand=Decimal("50"), current_cost=Decimal("9.00")
+    )
+    make_product(db, store_b, sku="SKU-REC")
+    db.commit()
+
+    from app.modules.transfers.service import ShipLineInput, TransferLineInput
+
+    transfer = transfer_service.create_transfer(
+        db,
+        from_store_id=store_a.id,
+        to_store_id=store_b.id,
+        requested_date=date(2024, 1, 1),
+        lines=[TransferLineInput(source_product_id=source.id, requested_quantity=Decimal("10"))],
+        caller_store_id=None,
+    )
+    db.commit()
+    transfer_service.ship_transfer(
+        db,
+        transfer_id=transfer.id,
+        lines=[
+            ShipLineInput(transfer_line_id=transfer.lines[0].id, quantity_to_ship=Decimal("10"))
+        ],
+        client_transaction_id=f"ship-{unique_suffix()}",
+        caller_store_id=None,
+    )
+    db.commit()
+
+    expected = transfers_service.inventory_in_transit_reconciliation(db)
+    result = reports_service.in_transit_reconciliation(db)
+    assert result.gl_balance == expected.gl_in_transit_balance
+    assert result.operational_value == expected.outstanding_in_transit_total
+    assert result.discrepancy == expected.discrepancy
