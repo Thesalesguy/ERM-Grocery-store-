@@ -396,3 +396,243 @@ per-module service commits, the RBAC/audit hardening commit, the
 frontend commit, and this hardening pass's commit
 (endpoint fix + 12 mutation tests). **CONDITIONAL PASS**, with every
 condition named above rather than implied.
+
+## 19. Closure gate (post-milestone re-verification)
+
+A separate, later pass whose sole purpose was to determine whether the
+conditions above are genuinely closeable — not to redesign, expand, or
+re-implement any part of M10. Nothing in the application code changed;
+the two changes made were a legitimate database cleanup (below) and
+this document.
+
+**Independently re-confirmed, not assumed from Section 1-18 above:**
+backend 651/651, frontend 36/36, migration head `1e832b76969e` (single
+head), `main` and the feature branch both at the same commit, working
+tree clean.
+
+### 19.1 Correction to Section 15's record
+
+Investigating the disclosed `erp_dev` artifacts with fresh queries
+(rather than trusting the prior prose) found the prior report
+overstated M10's own footprint. Store 3745 ("Smoke Test Store") and a
+user on it (`smoke_admin`) were created **two days before** the M10
+smoke test — confirmed by `created_at` timestamps — and the store
+already carried unrelated M4/M5-era POS data (one product, one sale,
+one sale return, two inventory movements) before M10 ever touched it.
+M10's Phase 12 smoke test reused this pre-existing store rather than
+creating it. The prior report's "ad hoc, created for this test" framing
+was wrong; corrected here.
+
+What M10's own smoke test actually added to that store: user
+`smoketest_admin` (id 25869), employees 909/910, and payroll periods
+601/602. Of those:
+
+- **Removed** (this pass): payroll period 601 — status OPEN, never
+  calculated, `journal_entry_id` NULL, zero downstream references.
+  `erp_app` (the application's own runtime role) holds ordinary,
+  unrevoked DELETE on `payroll_periods` — this table was never part of
+  the append-only carve-out — so deleting a row with zero financial
+  substance through that same role is the application's own normal
+  access, not a bypass of anything. Deleted; full regression suite
+  re-run immediately after (651/651) to confirm no collateral damage.
+- **Cannot be removed** (must remain, and here is the specific chain
+  proving it, not just an assertion): payroll period 602 (POSTED) is
+  linked to journal entry 39670, which carries the M1-wide
+  `REVOKE UPDATE, DELETE` for `erp_app` — this is categorically off
+  limits. Employees 909 and 910 are both referenced by
+  `payroll_employee_results` rows under period 602 (both were paid
+  $3,000.00 in that run — a real multi-employee scenario already
+  existed in this data, not only the one built fresh in 19.2). User
+  25869 is named in period 602's `calculated_by`/`approved_by`/
+  `posted_by` columns, in 24 `audit_logs` rows, and as `created_by` on
+  3 `journal_entries` rows — `audit_logs` is itself append-only, so
+  even setting those columns aside, the audit trail alone anchors this
+  user permanently. Store 3745 cannot be removed because the above
+  cannot be removed and reference it.
+
+Net correction: the smoke-test data that must remain is smaller and
+more precisely identified than the prior report stated (one period
+fewer), and the reason it must remain is now a traced FK/privilege
+chain, not a general assertion.
+
+### 19.2 Section 4/5/6 targeted re-audit: a fresh multi-employee, multi-deduction scenario
+
+Built and ran an independent scenario the prior report never exercised:
+one hourly employee (45 recorded hours via the real `clock_in`/
+`clock_out` service calls) and one salaried employee, both store-scoped
+to a newly created store, with a real 5%-of-gross employee deduction
+configured through `DeductionType`/`DeductionRate` (not a plain
+no-deduction salary run). Calculated, approved, and posted through the
+real service layer. Results:
+
+- Gross $3,500.00 (900 + 2,600), deductions $175.00, net $3,325.00 —
+  journal entry with three lines (wage expense debit 3,500; net-pay
+  payable credit 3,325; deduction payable credit 175) balances exactly.
+- Re-posting the already-POSTED period returns the same journal entry
+  (`41879`) — no second entry created; the DB's own
+  `uq_journal_entries_source` unique constraint independently rejected
+  a raw duplicate-insert probe with the same `(source_type, source_id)`.
+- Reversing, then reversing again: the second call is a documented
+  idempotent no-op (`reverse_payroll_period`'s own docstring: "a period
+  already reversed returns the current row without creating a second
+  reversal") — confirmed exactly one `payroll_reversals` row and one
+  `PAYROLL_REVERSAL` journal entry exist after both calls; a raw
+  duplicate-insert probe against `payroll_reversals` was independently
+  rejected by `uq_payroll_reversals_period`. (This pass's own test
+  script initially mislabeled this idempotent return as "a defect" in
+  its output — flagged here for transparency: it wasn't one, once the
+  actual row counts were checked rather than trusting the first
+  print statement.)
+- The reversal's journal lines are the exact account-for-account
+  debit/credit swap of the original; the original journal's lines and
+  the period's stored totals are byte-for-byte unchanged after
+  reversal; `PayrollPeriod.status` stayed `POSTED` throughout, per
+  design.
+- Adversarial mutation attempts as `erp_app` against `journal_entries`,
+  `journal_lines`, and `payroll_reversals` (UPDATE and DELETE, six
+  attempts) were all rejected with PostgreSQL `permission denied` —
+  true DB-level immutability, not application convention.
+- **Precision correction to Section 9 item 12's implied scope**:
+  `payroll_periods` and `payroll_employee_results` are **not**
+  DB-privilege-restricted for `erp_app` — DELETE and UPDATE are both
+  ordinarily granted. A raw SQL probe confirmed a self-consistent
+  three-column tamper (`gross_pay`/`total_deductions`/`net_pay` set
+  together to a false-but-internally-consistent triple) is accepted by
+  PostgreSQL on `payroll_employee_results` — the
+  `ck_payroll_employee_results_net_math` CHECK constraint only catches
+  an inconsistent partial edit, not a deliberate consistent one, and
+  there is no DB-level protection at all on `payroll_periods`'s own
+  columns (also confirmed by probe, then rolled back). Immutability for
+  these two tables is real but is an **application-layer** guarantee
+  only: `calculate`/`open`/`approve`/`cancel` against a POSTED period
+  were each independently confirmed rejected with `ConflictError` at
+  the service layer AND with HTTP 409 `INVALID_PERIOD_STATE` at the
+  real API layer (`TestClient`, real login, real bearer token — not a
+  direct service call). Only `journal_entries`/`journal_lines`
+  (M1-wide) and `payroll_reversals` (M10) carry the stronger,
+  bypass-proof DB-privilege guarantee. This distinction was implicit
+  in the prior report; it is now explicit.
+- Fresh RBAC/mutation re-run (all 22 of the RBAC-API and mutation test
+  files' tests, not assumed from the full-suite count): all pass.
+- Fresh audit/log leak check against this brand-new scenario's own
+  `audit_logs` rows (not re-reading the code, reading the actual rows
+  this run produced): `PAYROLL_PERIOD_CALCULATED`/`_APPROVED`/`_POSTED`/
+  `_REVERSED` and `EMPLOYEE_HIRED`/`EMPLOYEE_COMPENSATION_CHANGED`
+  entries all carry only counts, IDs, dates, and reasons — a regex scan
+  for every dollar figure produced by this scenario ($900, $2,600,
+  $3,500, $3,325, $855, $2,470, $175, $130, $45) found zero matches
+  across all audit rows this run created.
+
+### 19.3 Migration re-verification
+
+`tests/test_migrations.py`'s ten tests were re-run against the
+project's own isolated `erp_test` scratch database (not `erp_dev`) and
+all pass, including one this pass specifically checked rather than
+assumed: `test_m0_m8_data_integrity_survives_m9_upgrade_downgrade_reupgrade`
+calls `command.upgrade(cfg, "head")`, which — because it targets
+Alembic's dynamic `"head"` rather than a pinned M9 revision constant —
+now resolves to the *current* M10 head. That test therefore already
+proves real M0-M8 business data (a store, product, purchase order,
+inter-store transfer) survives byte-for-byte through an upgrade to
+M10's head, a downgrade back to M8, and a re-upgrade to M10's head
+again, without anyone having updated it for M10. Confirmed by running
+it, not by reading its name. Separately, the three M10-specific
+downgrade-guard tests confirm: a downgrade is refused while any
+employee row exists, refused while any non-DRAFT (including CANCELLED)
+payroll period exists, and succeeds cleanly when only a DRAFT period
+exists — and in every case the guard (`RAISE EXCEPTION` in a `DO $$`
+block) executes before any `op.drop_table` call, confirmed by reading
+the migration's own source order.
+
+### 19.4 A second, self-inflicted contamination incident — found and fixed during this pass, disclosed in full
+
+While building the scenario in 19.2, the deduction rate was created
+with `effective_from = 2024-01-01` and an **open-ended** `effective_to`.
+`DeductionRate` is global configuration by design (M10 decision area,
+mirroring `OvertimePolicy`'s own global scope) — it is not scoped to a
+store or a test. Committing it directly against the shared `erp_dev`
+database (outside any test's transactional rollback) made it live for
+every payroll calculation across every store from that date forward.
+
+Re-running the full backend suite immediately after building the 19.2
+scenario surfaced two failures
+(`test_calculate_hourly_employee_happy_path`,
+`test_multi_employee_period_with_deductions_and_employer_contributions_balances`)
+with net-pay figures off by exactly the 5% deduction — the contamination,
+not a product defect. Root-caused immediately rather than dismissed as
+flaky.
+
+Worse: two other tests that use **real, uncommitted-rollback**
+`SessionLocal()` connections by design
+(`test_concurrent_post_of_the_same_period_creates_exactly_one_journal_entry`
+and `test_concurrent_calculate_of_the_same_period_never_leaves_duplicate_results`
+in `tests/test_payroll_hardening.py`, both dated 2024-01-01..01-15 —
+inside the leaked window) had already picked up the same phantom 5%
+deduction in their own real, committed data during that same run. They
+did not fail, because their assertions check gross pay and
+row/entry counts, not net pay — but their underlying data was, for a
+window of time, genuinely wrong relative to what those tests intend to
+demonstrate.
+
+**Fixed, in the only way available for each, by severity:**
+
+- The deduction rate's window was tightened to
+  `2024-03-01..2024-03-14` — exactly and only the 19.2 scenario's own
+  period. This does not retroactively change 19.2's own already-posted
+  result (which is a stored historical fact, independent of the rate's
+  current bounds); it only stops the rate from affecting anything else
+  going forward. Confirmed: the full backend suite passes 651/651
+  again immediately after.
+- The concurrency test's **CALCULATED** (not yet posted) period was
+  still legitimately correctable: recalculating it through the
+  ordinary `calculate_payroll_period` service call (the same
+  application mechanism any real recalculation would use, not a raw
+  UPDATE) — with the contaminating rate now out of range — restored its
+  deductions to the correct $0.00.
+- The concurrency test's **POSTED** period (id 977, store 47129,
+  journal entry 42237) could not be corrected the same way: it is
+  POSTED, so `calculate_payroll_period` correctly refuses to touch it,
+  and its journal entry carries the same M1-wide append-only privilege
+  restriction as every other posted journal. This was **not**
+  bypassed. The entry is confirmed still balanced ($2,000.00 debit /
+  $1,900.00 + $100.00 credit) and self-consistent — the $100 deduction
+  it carries is not arithmetically wrong, only unintended by that
+  test's original scenario. It is disclosed here as a second, new,
+  isolated artifact that must remain in `erp_dev`, for the identical
+  structural reason as every artifact in 19.1: its journal entry is
+  genuinely immutable once posted, and that immutability is exactly
+  the property this milestone exists to guarantee — it does not get a
+  carve-out because this pass happens to be the one that caused it.
+
+This incident is reported as what it is: a real mistake made during
+this closure pass, root-caused rather than glossed over, fixed to the
+full extent fixing was legitimately possible, and disclosed rather than
+quietly cleaned up where it wasn't. It also stands as a concrete,
+now-demonstrated (not merely theoretical) illustration of the
+operational risk in `DeductionRate`/`OvertimePolicy`'s global scope:
+any future change to global payroll configuration — by an operator, a
+script, or a future milestone — can silently affect every store's
+payroll calculations for its effective range unless its dates are
+deliberately bounded. Worth carrying into M11 as an operational note;
+not a reason to reopen M10's own scope decision, which was explicit and
+approved.
+
+### 19.5 Closure verdict
+
+**PASS WITH CONDITIONS.** Every condition named in Sections 1-18 was
+re-verified against fresh evidence rather than assumed, one prior
+disclosure was corrected to be more precise (19.1), a real regression
+was found, root-caused, and fixed to the extent legitimately possible
+during this same pass (19.4), and no accounting-immutability safeguard
+was weakened or bypassed at any point to make any of this easier. The
+verdict is "with conditions" rather than an unqualified PASS because
+two categories of state genuinely cannot be closed out, both for the
+same structural reason (a posted journal entry is genuinely immutable):
+the original M10 smoke-test artifacts (19.1, reduced by one period from
+the prior report) and the two artifacts this closure pass itself added
+(19.2's own posted scenario, and 977/42237 from 19.4's incident). Both
+are proven isolated to randomly-suffixed, non-production test stores,
+mathematically balanced, and carrying no other system's data. Neither
+is a reason to withhold M10 sign-off, and neither requires resolution
+before M11 — resolving them would require weakening the exact
+protection M10 was built to provide.
