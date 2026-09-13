@@ -144,6 +144,23 @@ ATTENDANCE_WRITE = "attendance.write"
 # withholding for payroll specifically, not a general distrust of the
 # role. payroll.post and payroll.reverse are Admin-only in this
 # milestone (decision #2: "Admin gets highest payroll authority").
+# RBAC boundary note (found during the Phase 11 adversarial review):
+# payroll.read grants visibility into a PayrollPeriod's totals and every
+# PayrollEmployeeResult's computed gross_pay/net_pay/pay_rate — the same
+# class of information hr.compensation.write otherwise gates. HR Clerk
+# holds payroll.read (per M10 design decision #3's "payroll preparation/
+# read access") but not hr.compensation.write, so it can see a period's
+# CALCULATED results without being able to see or change an employee's
+# ongoing CompensationPeriod.rate configuration. This is deliberate, not
+# an oversight: rate-setting is a standing, editable master-data
+# authority with effect on every future period, while a calculated
+# period's results are the specific, already-computed output HR Clerk
+# needs to verify before requesting approval — the same "preparation"
+# task the role exists for. If a future milestone decides payroll
+# results need finer-grained masking (e.g. hiding net_pay from a
+# preparer while still showing hours), that is a new, narrower
+# permission to add — not a reason to withhold payroll.read from HR
+# Clerk today.
 PAYROLL_READ = "payroll.read"
 PAYROLL_CALCULATE = "payroll.calculate"
 PAYROLL_APPROVE = "payroll.approve"

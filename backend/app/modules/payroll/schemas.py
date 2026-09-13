@@ -40,3 +40,57 @@ class PayrollPeriodRead(BaseModel):
 
 class PayrollPeriodCancelInput(BaseModel):
     reason: str
+
+
+class PayrollPeriodCalculateInput(BaseModel):
+    client_transaction_id: str | None = Field(default=None, max_length=100)
+
+
+class PayrollPeriodPostInput(BaseModel):
+    client_transaction_id: str | None = Field(default=None, max_length=100)
+
+
+class PayrollPeriodReverseInput(BaseModel):
+    reason: str
+
+
+class PayrollEarningLineRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    earning_type: str
+    hours: Decimal | None
+    rate: Decimal | None
+    amount: Decimal
+    description: str | None
+
+
+class PayrollDeductionLineRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    deduction_type_id: int
+    is_employer_contribution: bool
+    amount: Decimal
+    description: str | None
+
+
+class PayrollEmployeeResultRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    payroll_period_id: int
+    employee_id: int
+    status: str
+    store_id: int
+    department_id: int | None
+    position_id: int | None
+    pay_type: str
+    pay_rate: Decimal
+    currency: str
+    regular_hours: Decimal
+    overtime_hours: Decimal
+    gross_pay: Decimal
+    total_deductions: Decimal
+    total_employer_contributions: Decimal
+    net_pay: Decimal

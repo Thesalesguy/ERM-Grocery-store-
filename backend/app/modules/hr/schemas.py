@@ -8,7 +8,7 @@ through the API), but nothing here feeds it into `audit_service.log_event`
 (see service.py's own compensation functions for that boundary).
 """
 
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -135,3 +135,36 @@ class EmployeeDetail(BaseModel):
     current_status: EmploymentStatusPeriodRead | None
     current_assignment: EmploymentAssignmentRead | None
     current_compensation: CompensationPeriodRead | None
+
+
+class ClockInInput(BaseModel):
+    employee_id: int
+    store_id: int
+    clock_in_at: datetime
+    source: str = "MANUAL"
+
+
+class ClockOutInput(BaseModel):
+    clock_out_at: datetime
+
+
+class AttendanceCorrectionInput(BaseModel):
+    new_clock_in_at: datetime
+    new_clock_out_at: datetime | None = None
+    reason: str
+
+
+class AttendanceRecordRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    employee_id: int
+    store_id: int
+    work_date: date
+    clock_in_at: datetime
+    clock_out_at: datetime | None
+    source: str
+    status: str
+    correction_of_id: int | None
+    correction_reason: str | None
+    corrected_by: int | None
