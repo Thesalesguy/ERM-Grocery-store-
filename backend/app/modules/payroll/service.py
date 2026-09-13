@@ -26,15 +26,36 @@ before either commits.
 
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationAppError
 from app.modules.audit import service as audit_service
-from app.modules.hr.models import AttendanceRecord
-from app.modules.payroll.models import PayrollPeriod
+from app.modules.hr.models import (
+    AttendanceRecord,
+    CompensationPeriod,
+    EmploymentAssignment,
+    OvertimePolicy,
+)
+from app.modules.payroll.calculation import (
+    CompensationInput,
+    CompensationSegment,
+    DeductionConfigInput,
+    MissingCompensationCoverageError,
+    OvertimePolicyInput,
+    calculate_employee_pay,
+)
+from app.modules.payroll.models import (
+    DeductionRate,
+    DeductionType,
+    PayrollDeductionLine,
+    PayrollEarningLine,
+    PayrollEmployeeResult,
+    PayrollPeriod,
+)
 
 # Cancel is allowed from any state except POSTED (docs/M10_DESIGN.md
 # Section 8's diagram) — CANCELLED itself and POSTED are both terminal.
@@ -292,3 +313,348 @@ def cancel_payroll_period(
     db.commit()
     db.refresh(period)
     return period
+
+
+# --- Calculation (M10 Phase 5) -----------------------------------------------
+#
+# The pure calculation itself lives in app.modules.payroll.calculation —
+# everything below is the INPUTS-gathering and RESULTS-persisting layer
+# around it (M10_DESIGN.md Section 9's three-way split). `calculate`/
+# `recalculate` are the same function: a period already CALCULATED is
+# recalculated by deleting and reinserting its derived rows wholesale
+# (never a row-by-row patch), exactly per the design.
+
+_CALCULABLE_STATUSES = ("OPEN", "CALCULATED")
+
+
+def _employees_assigned_to_store_during(
+    db: Session, store_id: int, period_start: date, period_end: date
+) -> list[int]:
+    """Every employee with an EmploymentAssignment at this store
+    overlapping the period — regardless of their CURRENT status
+    (M10_DESIGN.md Section 4: a period may still reference attendance/
+    compensation from when the employee was ACTIVE even after they
+    later become TERMINATED)."""
+    rows = db.execute(
+        select(EmploymentAssignment.employee_id)
+        .where(
+            EmploymentAssignment.store_id == store_id,
+            EmploymentAssignment.effective_from <= period_end,
+            or_(
+                EmploymentAssignment.effective_to.is_(None),
+                EmploymentAssignment.effective_to >= period_start,
+            ),
+        )
+        .distinct()
+    ).scalars()
+    return list(rows)
+
+
+def _resolve_compensation_segments(
+    db: Session, employee_id: int, period_start: date, period_end: date
+) -> list[tuple[date, date, CompensationPeriod]]:
+    rows = db.execute(
+        select(CompensationPeriod)
+        .where(
+            CompensationPeriod.employee_id == employee_id,
+            CompensationPeriod.effective_from <= period_end,
+            or_(
+                CompensationPeriod.effective_to.is_(None),
+                CompensationPeriod.effective_to >= period_start,
+            ),
+        )
+        .order_by(CompensationPeriod.effective_from)
+    ).scalars()
+    segments = []
+    for comp in rows:
+        seg_start = max(comp.effective_from, period_start)
+        seg_end = (
+            min(comp.effective_to, period_end) if comp.effective_to is not None else period_end
+        )
+        segments.append((seg_start, seg_end, comp))
+    return segments
+
+
+def _sum_attendance_hours(
+    db: Session, employee_id: int, store_id: int, seg_start: date, seg_end: date
+) -> Decimal:
+    rows = db.execute(
+        select(AttendanceRecord.clock_in_at, AttendanceRecord.clock_out_at).where(
+            AttendanceRecord.employee_id == employee_id,
+            AttendanceRecord.store_id == store_id,
+            AttendanceRecord.work_date >= seg_start,
+            AttendanceRecord.work_date <= seg_end,
+            AttendanceRecord.status == "CLOSED",
+        )
+    ).all()
+    # timedelta.total_seconds() returns a float — feeding that into
+    # Decimal() would import binary floating-point imprecision into a
+    # financial calculation (e.g. Decimal(0.1) != Decimal("0.1")).
+    # timedelta.days/.seconds/.microseconds are exact integers, so the
+    # total is computed as an exact integer count of microseconds first.
+    total_microseconds = 0
+    for clock_in_at, clock_out_at in rows:
+        delta = clock_out_at - clock_in_at
+        total_microseconds += (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
+    return Decimal(total_microseconds) / Decimal(3_600_000_000)
+
+
+def _resolve_overtime_policy(db: Session, as_of: date) -> OvertimePolicy | None:
+    """The one GLOBAL overtime policy (M10 approved decision #7)
+    effective as of the period's END date — a deterministic, documented
+    choice (not left ambiguous) for the case where a policy changes
+    mid-period."""
+    return db.execute(
+        select(OvertimePolicy).where(
+            OvertimePolicy.effective_from <= as_of,
+            or_(OvertimePolicy.effective_to.is_(None), OvertimePolicy.effective_to >= as_of),
+        )
+    ).scalar_one_or_none()
+
+
+def _resolve_deduction_configs(db: Session, as_of: date) -> list[DeductionConfigInput]:
+    """All DeductionRate rows effective as of the period's end date,
+    joined with their DeductionType for category (M10 approved decision
+    #8: generic, effective-dated, JSONB-parameterized configuration —
+    no statutory formula hardcoded here)."""
+    rows = db.execute(
+        select(DeductionRate, DeductionType)
+        .join(DeductionType, DeductionRate.deduction_type_id == DeductionType.id)
+        .where(
+            DeductionRate.effective_from <= as_of,
+            or_(DeductionRate.effective_to.is_(None), DeductionRate.effective_to >= as_of),
+            DeductionType.is_active.is_(True),
+        )
+    ).all()
+    return [
+        DeductionConfigInput(
+            deduction_type_id=deduction_type.id,
+            is_employer_contribution=deduction_type.category == "EMPLOYER_CONTRIBUTION",
+            calculation_method=rate.calculation_method,
+            parameters=rate.parameters,
+        )
+        for rate, deduction_type in rows
+    ]
+
+
+def _resolve_assignment_as_of(
+    db: Session, employee_id: int, as_of: date
+) -> EmploymentAssignment | None:
+    return db.execute(
+        select(EmploymentAssignment).where(
+            EmploymentAssignment.employee_id == employee_id,
+            EmploymentAssignment.effective_from <= as_of,
+            or_(
+                EmploymentAssignment.effective_to.is_(None),
+                EmploymentAssignment.effective_to >= as_of,
+            ),
+        )
+    ).scalar_one_or_none()
+
+
+def calculate_payroll_period(
+    db: Session,
+    *,
+    payroll_period_id: int,
+    actor_id: int | None,
+    caller_store_id: int | None,
+    client_transaction_id: str | None = None,
+) -> PayrollPeriod:
+    """OPEN -> CALCULATED, or CALCULATED -> CALCULATED (recalculate).
+    Deletes and reinserts every PayrollEmployeeResult/*Line row for this
+    period wholesale — never a row-by-row patch (M10_DESIGN.md Section
+    9's explicit "clean, unambiguous supersession" requirement).
+
+    Idempotency: `_lock_payroll_period`'s row lock is the PRIMARY
+    concurrency defense (two concurrent calculate calls for the SAME
+    period fully serialize — the second sees the first's committed
+    result before doing any work of its own). `client_transaction_id`
+    is stored for Phase 10's explicit-key idempotency layer to build on;
+    this phase does not yet check it for duplicate-request detection."""
+    if actor_id is None:
+        raise ValidationAppError(
+            "Calculation requires an authenticated actor", error_code="ACTOR_REQUIRED"
+        )
+    period = _lock_payroll_period(db, payroll_period_id)
+    _enforce_store_access(caller_store_id, period.store_id, "payroll period")
+    if period.status not in _CALCULABLE_STATUSES:
+        raise ConflictError(
+            f"Payroll period {payroll_period_id} is {period.status} and cannot be "
+            "(re)calculated",
+            error_code="INVALID_PERIOD_STATE",
+        )
+
+    existing_result_ids = list(
+        db.execute(
+            select(PayrollEmployeeResult.id).where(
+                PayrollEmployeeResult.payroll_period_id == period.id
+            )
+        ).scalars()
+    )
+    if existing_result_ids:
+        db.execute(
+            delete(PayrollEarningLine).where(
+                PayrollEarningLine.payroll_employee_result_id.in_(existing_result_ids)
+            )
+        )
+        db.execute(
+            delete(PayrollDeductionLine).where(
+                PayrollDeductionLine.payroll_employee_result_id.in_(existing_result_ids)
+            )
+        )
+        db.execute(
+            delete(PayrollEmployeeResult).where(PayrollEmployeeResult.id.in_(existing_result_ids))
+        )
+        db.flush()
+
+    overtime_policy_row = _resolve_overtime_policy(db, period.period_end)
+    overtime_policy_input = (
+        OvertimePolicyInput(
+            threshold_hours_per_period=overtime_policy_row.threshold_hours_per_period,
+            multiplier=overtime_policy_row.multiplier,
+        )
+        if overtime_policy_row is not None
+        else None
+    )
+    deduction_configs = _resolve_deduction_configs(db, period.period_end)
+
+    employee_ids = _employees_assigned_to_store_during(
+        db, period.store_id, period.period_start, period.period_end
+    )
+
+    total_gross = Decimal("0")
+    total_deductions = Decimal("0")
+    total_employer_contributions = Decimal("0")
+    total_net_pay = Decimal("0")
+
+    for employee_id in employee_ids:
+        raw_segments = _resolve_compensation_segments(
+            db, employee_id, period.period_start, period.period_end
+        )
+        engine_segments = []
+        attendance_hours: dict[int, Decimal] = {}
+        for index, (seg_start, seg_end, comp) in enumerate(raw_segments):
+            engine_segments.append(
+                CompensationSegment(
+                    start=seg_start,
+                    end=seg_end,
+                    compensation=CompensationInput(
+                        pay_type=comp.pay_type,
+                        rate=comp.rate,
+                        overtime_eligible=comp.overtime_eligible,
+                    ),
+                )
+            )
+            attendance_hours[index] = _sum_attendance_hours(
+                db, employee_id, period.store_id, seg_start, seg_end
+            )
+
+        try:
+            calc_result = calculate_employee_pay(
+                compensation_segments=engine_segments,
+                period_start=period.period_start,
+                period_end=period.period_end,
+                attendance_hours_by_segment_index=attendance_hours,
+                overtime_policy=overtime_policy_input,
+                deduction_configs=deduction_configs,
+            )
+        except MissingCompensationCoverageError as exc:
+            raise ConflictError(
+                f"Employee {employee_id} has incomplete compensation coverage for this "
+                f"period: {exc}",
+                error_code="MISSING_COMPENSATION_COVERAGE",
+            ) from exc
+
+        last_comp = raw_segments[-1][2]
+        assignment = _resolve_assignment_as_of(db, employee_id, period.period_end)
+
+        result = PayrollEmployeeResult(
+            payroll_period_id=period.id,
+            employee_id=employee_id,
+            status="DRAFT",
+            store_id=period.store_id,
+            department_id=assignment.department_id if assignment is not None else None,
+            position_id=assignment.position_id if assignment is not None else None,
+            pay_type=last_comp.pay_type,
+            pay_rate=last_comp.rate,
+            currency=last_comp.currency,
+            regular_hours=calc_result.regular_hours,
+            overtime_hours=calc_result.overtime_hours,
+            gross_pay=calc_result.gross_pay,
+            total_deductions=calc_result.total_deductions,
+            total_employer_contributions=calc_result.total_employer_contributions,
+            net_pay=calc_result.net_pay,
+        )
+        db.add(result)
+        db.flush()
+
+        for earning_line in calc_result.earning_lines:
+            db.add(
+                PayrollEarningLine(
+                    payroll_employee_result_id=result.id,
+                    earning_type=earning_line.earning_type,
+                    hours=earning_line.hours,
+                    rate=earning_line.rate,
+                    amount=earning_line.amount,
+                    description=earning_line.description,
+                )
+            )
+        for deduction_line in calc_result.deduction_lines:
+            db.add(
+                PayrollDeductionLine(
+                    payroll_employee_result_id=result.id,
+                    deduction_type_id=deduction_line.deduction_type_id,
+                    is_employer_contribution=deduction_line.is_employer_contribution,
+                    amount=deduction_line.amount,
+                    description=deduction_line.description,
+                )
+            )
+
+        total_gross += calc_result.gross_pay
+        total_deductions += calc_result.total_deductions
+        total_employer_contributions += calc_result.total_employer_contributions
+        total_net_pay += calc_result.net_pay
+
+    period.status = "CALCULATED"
+    period.calculated_by = actor_id
+    period.calculated_at = datetime.now(UTC)
+    period.calculation_client_transaction_id = client_transaction_id
+    period.total_gross = total_gross
+    period.total_deductions = total_deductions
+    period.total_employer_contributions = total_employer_contributions
+    period.total_net_pay = total_net_pay
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ConflictError(
+            f"Payroll period {payroll_period_id} calculation client_transaction_id "
+            "was already used",
+            error_code="DUPLICATE_CALCULATION_REQUEST",
+        ) from exc
+
+    audit_service.log_event(
+        db,
+        user_id=actor_id,
+        action="PAYROLL_PERIOD_CALCULATED",
+        entity_type="payroll_period",
+        entity_id=period.id,
+        after={"employee_count": len(employee_ids)},
+    )
+    db.commit()
+    db.refresh(period)
+    return period
+
+
+def list_payroll_employee_results(
+    db: Session, *, payroll_period_id: int
+) -> list[PayrollEmployeeResult]:
+    return list(
+        db.execute(
+            select(PayrollEmployeeResult)
+            .where(PayrollEmployeeResult.payroll_period_id == payroll_period_id)
+            .order_by(PayrollEmployeeResult.employee_id)
+        )
+        .scalars()
+        .all()
+    )
