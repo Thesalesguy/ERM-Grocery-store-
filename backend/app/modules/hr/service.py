@@ -23,8 +23,9 @@ records that a change happened, never what the new number is.
 """
 
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -32,8 +33,11 @@ from sqlalchemy.orm import Session
 
 from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationAppError
 from app.modules.audit import service as audit_service
+from app.modules.auth.models import Store
 from app.modules.hr.models import (
+    ATTENDANCE_SOURCES,
     EMPLOYMENT_STATUSES,
+    AttendanceRecord,
     CompensationPeriod,
     Department,
     Employee,
@@ -41,6 +45,12 @@ from app.modules.hr.models import (
     EmploymentStatusPeriod,
     Position,
 )
+
+# Only these two statuses may clock in (M10_DESIGN.md Section 4): a
+# SUSPENDED or TERMINATED employee is rejected, mirroring how a
+# cancelled/inactive resource is rejected everywhere else in this
+# codebase.
+_CLOCKABLE_STATUSES = ("ACTIVE", "ON_LEAVE")
 
 # M10_DESIGN.md Section 4's state machine. TERMINATED -> ACTIVE is a
 # rehire (a new EmploymentStatusPeriod, same Employee.id/employee_number).
@@ -555,3 +565,263 @@ def change_compensation(
     db.commit()
     db.refresh(new_period)
     return new_period
+
+
+# --- Attendance --------------------------------------------------------------
+#
+# Cross-midnight work_date rule (M10 approved decision #6): store
+# configuration, never an employee field. `resolve_work_date` converts a
+# UTC `clock_in_at` into the STORE's own declared IANA timezone
+# (`Store.timezone` — a deterministic conversion given a fixed tzdata
+# version, never the ambiguous server-process-local clock this codebase
+# has always avoided — see app.modules.sales.service._resolve_tax's own
+# "UTC-everywhere is at least deterministic" note) and shifts back one
+# calendar day when the local clock-in hour is before the store's
+# configured `attendance_day_boundary_hour`. The default, 0, means "no
+# shifting" — work_date always equals the local calendar date.
+
+
+def resolve_work_date(clock_in_at: datetime, store_timezone: str, day_boundary_hour: int) -> date:
+    try:
+        local_dt = clock_in_at.astimezone(ZoneInfo(store_timezone))
+    except ZoneInfoNotFoundError as exc:
+        raise ValidationAppError(
+            f"Store timezone {store_timezone!r} is not a recognized IANA timezone",
+            error_code="INVALID_STORE_TIMEZONE",
+        ) from exc
+    if local_dt.hour < day_boundary_hour:
+        return (local_dt - timedelta(days=1)).date()
+    return local_dt.date()
+
+
+def _get_store(db: Session, store_id: int) -> Store:
+    store = db.get(Store, store_id)
+    if store is None:
+        raise NotFoundError(f"Store {store_id} not found")
+    return store
+
+
+def clock_in(
+    db: Session,
+    *,
+    employee_id: int,
+    store_id: int,
+    clock_in_at: datetime,
+    source: str = "CLOCK",
+    actor_id: int | None,
+    caller_store_id: int | None,
+) -> AttendanceRecord:
+    """`store_id` need not equal the employee's CURRENT assignment store
+    (M10_DESIGN.md Section 12: "someone genuinely working two stores in
+    one day clocks in/out twice, once per store" — cross-store coverage
+    is a legitimate scenario, not an error). This deliberately means a
+    store-scoped caller may clock in ANY employee_id at their own store,
+    with no check that the employee has ever worked there before —
+    flagged here as a known, tracked scope boundary for Phase 11's
+    holistic RBAC/multi-store audit to resolve (e.g. requiring the
+    employee's CURRENT OR a recent assignment to reference this store),
+    rather than a narrower rule invented ad hoc in this phase that might
+    conflict with that audit's conclusion."""
+    if source not in ATTENDANCE_SOURCES:
+        raise ValidationAppError(
+            f"Invalid attendance source {source!r}", error_code="INVALID_SOURCE"
+        )
+    _enforce_store_access(caller_store_id, store_id, "attendance record")
+    store = _get_store(db, store_id)
+
+    status = get_current_status(db, employee_id)
+    if status is None or status.status not in _CLOCKABLE_STATUSES:
+        current_label = status.status if status is not None else "no employment record"
+        raise ConflictError(
+            f"Employee {employee_id} cannot clock in — current status is {current_label}",
+            error_code="EMPLOYEE_NOT_CLOCKABLE",
+        )
+
+    work_date = resolve_work_date(clock_in_at, store.timezone, store.attendance_day_boundary_hour)
+
+    record = AttendanceRecord(
+        employee_id=employee_id,
+        store_id=store_id,
+        work_date=work_date,
+        clock_in_at=clock_in_at,
+        clock_out_at=None,
+        source=source,
+        status="OPEN",
+    )
+    db.add(record)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ConflictError(
+            f"Employee {employee_id} already has an open or overlapping attendance record",
+            error_code="OVERLAPPING_ATTENDANCE",
+        ) from exc
+
+    audit_service.log_event(
+        db,
+        user_id=actor_id,
+        action="ATTENDANCE_CLOCKED_IN",
+        entity_type="attendance_record",
+        entity_id=record.id,
+        after={"employee_id": employee_id, "store_id": store_id, "work_date": work_date},
+    )
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def clock_out(
+    db: Session,
+    *,
+    attendance_record_id: int,
+    clock_out_at: datetime,
+    actor_id: int | None,
+    caller_store_id: int | None,
+) -> AttendanceRecord:
+    record = db.execute(
+        select(AttendanceRecord)
+        .where(AttendanceRecord.id == attendance_record_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if record is None:
+        raise NotFoundError(f"Attendance record {attendance_record_id} not found")
+    _enforce_store_access(caller_store_id, record.store_id, "attendance record")
+    if record.status != "OPEN":
+        raise ConflictError(
+            f"Attendance record {attendance_record_id} is not open (status={record.status})",
+            error_code="ATTENDANCE_NOT_OPEN",
+        )
+    if clock_out_at <= record.clock_in_at:
+        raise ValidationAppError(
+            "clock_out_at must be after clock_in_at", error_code="INVALID_CLOCK_OUT"
+        )
+
+    record.clock_out_at = clock_out_at
+    record.status = "CLOSED"
+    db.flush()
+
+    audit_service.log_event(
+        db,
+        user_id=actor_id,
+        action="ATTENDANCE_CLOCKED_OUT",
+        entity_type="attendance_record",
+        entity_id=record.id,
+        after={"employee_id": record.employee_id, "store_id": record.store_id},
+    )
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def correct_attendance(
+    db: Session,
+    *,
+    attendance_record_id: int,
+    new_clock_in_at: datetime,
+    new_clock_out_at: datetime | None,
+    reason: str,
+    actor_id: int | None,
+    caller_store_id: int | None,
+) -> AttendanceRecord:
+    """Voids the original record and inserts a replacement referencing
+    it — never an in-place edit of the original clock time (module
+    docstring / M10_DESIGN.md Section 7: both the original and the
+    correction remain permanently visible, mirroring M8's stock-count
+    recount pattern)."""
+    if not reason or not reason.strip():
+        raise ValidationAppError(
+            "A correction reason is required", error_code="CORRECTION_REASON_REQUIRED"
+        )
+    original = db.execute(
+        select(AttendanceRecord)
+        .where(AttendanceRecord.id == attendance_record_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if original is None:
+        raise NotFoundError(f"Attendance record {attendance_record_id} not found")
+    _enforce_store_access(caller_store_id, original.store_id, "attendance record")
+    if original.status == "VOIDED":
+        raise ConflictError(
+            f"Attendance record {attendance_record_id} has already been corrected",
+            error_code="ALREADY_CORRECTED",
+        )
+    if new_clock_out_at is not None and new_clock_out_at <= new_clock_in_at:
+        raise ValidationAppError(
+            "new_clock_out_at must be after new_clock_in_at", error_code="INVALID_CLOCK_OUT"
+        )
+
+    store = _get_store(db, original.store_id)
+    work_date = resolve_work_date(
+        new_clock_in_at, store.timezone, store.attendance_day_boundary_hour
+    )
+
+    original.status = "VOIDED"
+    db.flush()
+
+    correction = AttendanceRecord(
+        employee_id=original.employee_id,
+        store_id=original.store_id,
+        work_date=work_date,
+        clock_in_at=new_clock_in_at,
+        clock_out_at=new_clock_out_at,
+        source=original.source,
+        status="CLOSED" if new_clock_out_at is not None else "OPEN",
+        correction_of_id=original.id,
+        correction_reason=reason,
+        corrected_by=actor_id,
+    )
+    db.add(correction)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ConflictError(
+            "The corrected time overlaps another attendance record for this employee",
+            error_code="OVERLAPPING_ATTENDANCE",
+        ) from exc
+
+    audit_service.log_event(
+        db,
+        user_id=actor_id,
+        action="ATTENDANCE_CORRECTED",
+        entity_type="attendance_record",
+        entity_id=correction.id,
+        before={"original_attendance_record_id": original.id},
+        after={"employee_id": original.employee_id, "work_date": work_date},
+    )
+    db.commit()
+    db.refresh(correction)
+    return correction
+
+
+def get_attendance_record(db: Session, attendance_record_id: int) -> AttendanceRecord:
+    record = db.get(AttendanceRecord, attendance_record_id)
+    if record is None:
+        raise NotFoundError(f"Attendance record {attendance_record_id} not found")
+    return record
+
+
+def list_attendance_records(
+    db: Session,
+    *,
+    employee_id: int | None = None,
+    caller_store_id: int | None = None,
+    work_date_from: date | None = None,
+    work_date_to: date | None = None,
+    include_voided: bool = False,
+) -> list[AttendanceRecord]:
+    query = select(AttendanceRecord).order_by(
+        AttendanceRecord.work_date, AttendanceRecord.clock_in_at
+    )
+    if employee_id is not None:
+        query = query.where(AttendanceRecord.employee_id == employee_id)
+    if caller_store_id is not None:
+        query = query.where(AttendanceRecord.store_id == caller_store_id)
+    if work_date_from is not None:
+        query = query.where(AttendanceRecord.work_date >= work_date_from)
+    if work_date_to is not None:
+        query = query.where(AttendanceRecord.work_date <= work_date_to)
+    if not include_voided:
+        query = query.where(AttendanceRecord.status != "VOIDED")
+    return list(db.execute(query).scalars().all())
