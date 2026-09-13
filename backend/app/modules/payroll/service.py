@@ -467,16 +467,33 @@ def calculate_payroll_period(
     period wholesale — never a row-by-row patch (M10_DESIGN.md Section
     9's explicit "clean, unambiguous supersession" requirement).
 
-    Idempotency: `_lock_payroll_period`'s row lock is the PRIMARY
-    concurrency defense (two concurrent calculate calls for the SAME
-    period fully serialize — the second sees the first's committed
-    result before doing any work of its own). `client_transaction_id`
-    is stored for Phase 10's explicit-key idempotency layer to build on;
-    this phase does not yet check it for duplicate-request detection."""
+    Idempotency (M10_DESIGN.md Section 8, two layers):
+    1. Explicit-key fast path (this check): a retried call carrying the
+       SAME `client_transaction_id` as the period's last calculation
+       returns the existing state without recomputing — mirrors
+       `receive_goods`'s own client_transaction_id fast path exactly,
+       so a network-retried "calculate" request can't silently redo
+       work (or worse, produce different numbers from fresher
+       attendance data) when the original call actually already
+       succeeded.
+    2. `_lock_payroll_period`'s row lock is the concurrency backstop for
+       the race the key alone can't cover: two DIFFERENT concurrent
+       calculate calls (no shared client_transaction_id) for the SAME
+       period fully serialize — the second sees the first's committed
+       result before doing any work of its own."""
     if actor_id is None:
         raise ValidationAppError(
             "Calculation requires an authenticated actor", error_code="ACTOR_REQUIRED"
         )
+    if client_transaction_id is not None:
+        existing = db.execute(
+            select(PayrollPeriod).where(
+                PayrollPeriod.id == payroll_period_id,
+                PayrollPeriod.calculation_client_transaction_id == client_transaction_id,
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return existing
     period = _lock_payroll_period(db, payroll_period_id)
     _enforce_store_access(caller_store_id, period.store_id, "payroll period")
     if period.status not in _CALCULABLE_STATUSES:
@@ -685,7 +702,22 @@ def post_payroll_period(
     already-POSTED period is a no-op returning the current row (mirrors
     `post_purchase_invoice`) — the DB's own partial unique index on
     (source_type='PAYROLL_POSTING', source_id=payroll_period_id) is the
-    ultimate backstop against a genuine double-post slipping through."""
+    ultimate backstop against a genuine double-post slipping through.
+    The `client_transaction_id` fast path below (mirroring
+    `calculate_payroll_period`'s) is a pure optimization here, not a
+    correctness requirement — state-based idempotency alone already
+    returns the same row regardless of transaction id — but is checked
+    first anyway so a retried request avoids waiting on the row lock at
+    all when the original call already completed."""
+    if client_transaction_id is not None:
+        existing = db.execute(
+            select(PayrollPeriod).where(
+                PayrollPeriod.id == payroll_period_id,
+                PayrollPeriod.posting_client_transaction_id == client_transaction_id,
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return existing
     period = _lock_payroll_period(db, payroll_period_id)
     _enforce_store_access(caller_store_id, period.store_id, "payroll period")
     if period.status == "POSTED":
