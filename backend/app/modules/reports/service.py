@@ -939,24 +939,42 @@ def inventory_turnover(
     cogs_query = _apply_sale_scope(cogs_query, store_ids=store_ids, start=start, end=end)
     cogs_by_product = {row[0]: (row[1], Decimal(row[2])) for row in db.execute(cogs_query)}
 
-    def _inventory_value_as_of(as_of: datetime, product_id: int) -> Decimal | None:
-        row = db.execute(
+    def _inventory_values_as_of(as_of: datetime, product_ids: list[int]) -> dict[int, Decimal]:
+        """Batched last-movement-before-`as_of` valuation for every product
+        in one query (docs/M11_DESIGN.md Section 11): a per-product query
+        in a Python loop here would be a textbook N+1 that degrades
+        linearly with catalog size. PostgreSQL's DISTINCT ON picks exactly
+        one (the most recent) row per product_id in a single index-backed
+        scan."""
+        if not product_ids:
+            return {}
+        rows = db.execute(
             select(
+                InventoryMovement.product_id,
                 InventoryMovement.resulting_quantity_on_hand,
                 InventoryMovement.unit_cost_at_movement,
             )
-            .where(InventoryMovement.product_id == product_id, InventoryMovement.created_at < as_of)
-            .order_by(InventoryMovement.created_at.desc(), InventoryMovement.id.desc())
-            .limit(1)
-        ).first()
-        if row is None:
-            return None
-        return Decimal(row[0]) * Decimal(row[1])
+            .distinct(InventoryMovement.product_id)
+            .where(
+                InventoryMovement.product_id.in_(product_ids),
+                InventoryMovement.created_at < as_of,
+            )
+            .order_by(
+                InventoryMovement.product_id,
+                InventoryMovement.created_at.desc(),
+                InventoryMovement.id.desc(),
+            )
+        )
+        return {pid: Decimal(qty) * Decimal(cost) for pid, qty, cost in rows}
+
+    product_ids = list(cogs_by_product)
+    opening_values = _inventory_values_as_of(start or datetime.min, product_ids)
+    closing_values = _inventory_values_as_of(end or datetime.max, product_ids)
 
     results = []
     for product_id, (name, cogs) in cogs_by_product.items():
-        opening = _inventory_value_as_of(start or datetime.min, product_id) or Decimal("0")
-        closing = _inventory_value_as_of(end or datetime.max, product_id) or Decimal("0")
+        opening = opening_values.get(product_id, Decimal("0"))
+        closing = closing_values.get(product_id, Decimal("0"))
         average = (opening + closing) / 2
         turnover = _safe_ratio(cogs, average)
         days_on_hand = _safe_ratio(Decimal("365"), turnover) if turnover is not None else None

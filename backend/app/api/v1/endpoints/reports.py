@@ -14,6 +14,7 @@ the underlying raw data in each domain.
 from datetime import date
 
 from fastapi import APIRouter, Depends, Query
+from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
@@ -42,6 +43,50 @@ def _resolve(current_user: CurrentUser, store_id: list[int] | None) -> list[int]
     return reports_service.resolve_authorized_store_ids(current_user, store_id)
 
 
+def _report_db(db: Session = Depends(get_db)) -> Session:
+    """A single report request commonly issues several independent
+    SELECT statements (sometimes across more than one service module —
+    e.g. cash_payment_method_summary calls both sales_by_payment_method
+    and accounting_service.trial_balance). Under the default READ
+    COMMITTED isolation, each statement takes its own fresh snapshot, so
+    a write committing midway through a multi-statement report can
+    produce a torn, internally-inconsistent result.
+
+    This is not hypothetical: tests/test_reports_concurrency.py's
+    test_payroll_posting_during_payroll_report caught exactly this — a
+    payroll report reading between the two statements of
+    payroll_cost_summary while post_payroll_period's single commit
+    landed in between could observe the period as neither "pending"
+    (its status query ran after the commit) nor contributing to
+    gross_pay (its posted-totals query, from the SAME snapshot as any
+    query before it in this transaction, would not — except the two
+    statements were in fact using two different implicit snapshots).
+
+    The fix relies entirely on PostgreSQL's own isolation levels (never
+    app-level locking, which read-only analytics has nothing to hang a
+    lock off of): bumping the whole request's connection to REPEATABLE
+    READ before its first query gives every statement in this report
+    the same one consistent snapshot for the life of the request —
+    docs/M11_DESIGN.md Section 12's documented concurrency semantics.
+
+    A real request's `db` (get_db, a fresh SessionLocal() with no
+    transaction started yet) always allows this. It is only refused when
+    the session already has a transaction in progress — that happens in
+    this test suite's own `db` fixture (tests/conftest.py wraps every
+    test in one outer transaction/SAVEPOINT before any endpoint code
+    runs) and nowhere in production. That fixture gives each test a
+    single, private, non-concurrent connection, so there is no
+    concurrent writer to race against in the first place — falling back
+    to the session's existing isolation level there is safe, not a gap
+    this needs to close."""
+    if not db.in_transaction():
+        try:
+            db.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+        except InvalidRequestError:
+            pass
+    return db
+
+
 # --- Sales & profitability (Phase 3) ----------------------------------------
 
 
@@ -50,7 +95,7 @@ def get_sales_summary(
     store_id: list[int] | None = Query(None),
     date_from: date | None = None,
     date_to: date | None = None,
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_reports_permission),
 ) -> report_schemas.SalesSummaryRead:
     resolved = _resolve(current_user, store_id)
@@ -66,7 +111,7 @@ def get_sales_breakdown(
     store_id: list[int] | None = Query(None),
     date_from: date | None = None,
     date_to: date | None = None,
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_reports_permission),
 ) -> list[report_schemas.SalesByDimensionRowRead]:
     resolved = _resolve(current_user, store_id)
@@ -82,7 +127,7 @@ def get_sales_by_payment_method(
     store_id: list[int] | None = Query(None),
     date_from: date | None = None,
     date_to: date | None = None,
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_reports_permission),
 ) -> list[report_schemas.PaymentMethodRowRead]:
     resolved = _resolve(current_user, store_id)
@@ -97,7 +142,7 @@ def get_sales_trend(
     date_from: date,
     date_to: date,
     store_id: list[int] | None = Query(None),
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_reports_permission),
 ) -> list[report_schemas.SalesTrendPointRead]:
     resolved = _resolve(current_user, store_id)
@@ -115,7 +160,7 @@ def get_financial_trial_balance(
     store_id: list[int] | None = Query(None),
     date_from: date | None = None,
     date_to: date | None = None,
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_accounting_permission),
 ) -> list[report_schemas.TrialBalanceRowRead]:
     resolved = _resolve(current_user, store_id)
@@ -130,7 +175,7 @@ def get_financial_profit_loss(
     store_id: list[int] | None = Query(None),
     date_from: date | None = None,
     date_to: date | None = None,
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_accounting_permission),
 ) -> report_schemas.ProfitAndLossRead:
     resolved = _resolve(current_user, store_id)
@@ -149,7 +194,7 @@ def get_financial_profit_loss_comparative(
     prior_date_from: date,
     prior_date_to: date,
     store_id: list[int] | None = Query(None),
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_accounting_permission),
 ) -> report_schemas.ProfitAndLossComparativeRead:
     resolved = _resolve(current_user, store_id)
@@ -173,7 +218,7 @@ def get_financial_account_summary(
     store_id: list[int] | None = Query(None),
     date_from: date | None = None,
     date_to: date | None = None,
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_accounting_permission),
 ) -> report_schemas.AccountTypeSummaryRead:
     resolved = _resolve(current_user, store_id)
@@ -192,7 +237,7 @@ def get_financial_account_summary(
 def get_financial_balance_sheet(
     store_id: list[int] | None = Query(None),
     as_of: date | None = None,
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_accounting_permission),
 ) -> report_schemas.BalanceSheetSummaryRead:
     resolved = _resolve(current_user, store_id)
@@ -217,7 +262,7 @@ def get_financial_cash_summary(
     store_id: list[int] | None = Query(None),
     date_from: date | None = None,
     date_to: date | None = None,
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_accounting_permission),
 ) -> list[report_schemas.PaymentMethodReconciliationRowRead]:
     resolved = _resolve(current_user, store_id)
@@ -234,7 +279,7 @@ def get_financial_cash_summary(
 def get_inventory_value(
     group_by: str = Query("store", pattern="^(store|category)$"),
     store_id: list[int] | None = Query(None),
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_inventory_permission),
 ) -> list[report_schemas.InventoryValueRowRead]:
     resolved = _resolve(current_user, store_id)
@@ -252,7 +297,7 @@ def get_inventory_movements(
     store_id: list[int] | None = Query(None),
     date_from: date | None = None,
     date_to: date | None = None,
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_inventory_permission),
 ) -> list[report_schemas.MovementSummaryRowRead]:
     resolved = _resolve(current_user, store_id)
@@ -267,7 +312,7 @@ def get_inventory_shrinkage(
     store_id: list[int] | None = Query(None),
     date_from: date | None = None,
     date_to: date | None = None,
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_inventory_permission),
 ) -> list[report_schemas.ShrinkageRowRead]:
     resolved = _resolve(current_user, store_id)
@@ -282,7 +327,7 @@ def get_inventory_turnover(
     date_from: date,
     date_to: date,
     store_id: list[int] | None = Query(None),
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_inventory_permission),
 ) -> list[report_schemas.TurnoverRowRead]:
     resolved = _resolve(current_user, store_id)
@@ -296,7 +341,7 @@ def get_inventory_turnover(
 def get_inventory_slow_moving(
     store_id: list[int] | None = Query(None),
     window_days: int = 90,
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_inventory_permission),
 ) -> list[report_schemas.SlowMovingRowRead]:
     resolved = _resolve(current_user, store_id)
@@ -307,7 +352,7 @@ def get_inventory_slow_moving(
 @router.get("/inventory/stockouts", response_model=list[report_schemas.StockoutRowRead])
 def get_inventory_stockouts(
     store_id: list[int] | None = Query(None),
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_inventory_permission),
 ) -> list[report_schemas.StockoutRowRead]:
     resolved = _resolve(current_user, store_id)
@@ -318,7 +363,7 @@ def get_inventory_stockouts(
 @router.get("/inventory/negative-stock", response_model=list[report_schemas.NegativeStockRowRead])
 def get_inventory_negative_stock(
     store_id: list[int] | None = Query(None),
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_inventory_permission),
 ) -> list[report_schemas.NegativeStockRowRead]:
     resolved = _resolve(current_user, store_id)
@@ -329,7 +374,7 @@ def get_inventory_negative_stock(
 @router.get("/inventory/in-transit", response_model=list[report_schemas.InTransitRowRead])
 def get_inventory_in_transit(
     store_id: list[int] | None = Query(None),
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_inventory_permission),
 ) -> list[report_schemas.InTransitRowRead]:
     resolved = _resolve(current_user, store_id)
@@ -341,7 +386,7 @@ def get_inventory_in_transit(
     "/inventory/in-transit-reconciliation", response_model=report_schemas.GlReconciliationRowRead
 )
 def get_inventory_in_transit_reconciliation(
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_inventory_permission),
 ) -> report_schemas.GlReconciliationRowRead:
     # Deliberately no store filter: matches the existing M8 endpoint
@@ -358,7 +403,7 @@ def get_inventory_in_transit_reconciliation(
 )
 def get_stock_count_variance(
     stock_count_id: int,
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_inventory_permission),
 ) -> list[report_schemas.StockCountVarianceRowRead]:
     from app.core.exceptions import ForbiddenError
@@ -388,7 +433,7 @@ def get_purchasing_spend(
     store_id: list[int] | None = Query(None),
     date_from: date | None = None,
     date_to: date | None = None,
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_purchasing_permission),
 ) -> list[report_schemas.PurchaseSpendRowRead]:
     resolved = _resolve(current_user, store_id)
@@ -404,7 +449,7 @@ def get_purchasing_spend(
 @router.get("/purchasing/po-fulfillment", response_model=list[report_schemas.PoFulfillmentRowRead])
 def get_purchasing_po_fulfillment(
     store_id: list[int] | None = Query(None),
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_purchasing_permission),
 ) -> list[report_schemas.PoFulfillmentRowRead]:
     resolved = _resolve(current_user, store_id)
@@ -418,7 +463,7 @@ def get_purchasing_po_fulfillment(
 )
 def get_purchasing_delivery_performance(
     store_id: list[int] | None = Query(None),
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_purchasing_permission),
 ) -> list[report_schemas.SupplierDeliveryPerformanceRowRead]:
     resolved = _resolve(current_user, store_id)
@@ -433,7 +478,7 @@ def get_purchasing_price_variance(
     store_id: list[int] | None = Query(None),
     date_from: date | None = None,
     date_to: date | None = None,
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_purchasing_permission),
 ) -> list[report_schemas.PurchasePriceVarianceRowRead]:
     resolved = _resolve(current_user, store_id)
@@ -450,7 +495,7 @@ def get_purchasing_price_variance(
 def get_payroll_headcount(
     store_id: list[int] | None = Query(None),
     as_of: date | None = None,
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_payroll_permission),
 ) -> list[report_schemas.HeadcountRowRead]:
     resolved = _resolve(current_user, store_id)
@@ -463,7 +508,7 @@ def get_payroll_cost_summary(
     period_start: date,
     period_end: date,
     store_id: list[int] | None = Query(None),
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_payroll_permission),
 ) -> report_schemas.PayrollCostSummaryRead:
     resolved = _resolve(current_user, store_id)
@@ -478,7 +523,7 @@ def get_payroll_labor_cost_percent(
     period_start: date,
     period_end: date,
     store_id: list[int] | None = Query(None),
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_payroll_permission),
 ) -> report_schemas.LaborCostPercentRowRead:
     resolved = _resolve(current_user, store_id)
@@ -491,7 +536,7 @@ def get_payroll_labor_cost_percent(
 @router.get("/payroll/reconciliation", response_model=report_schemas.GlReconciliationRowRead)
 def get_payroll_reconciliation(
     store_id: list[int] | None = Query(None),
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_payroll_permission),
 ) -> report_schemas.GlReconciliationRowRead:
     resolved = _resolve(current_user, store_id)
@@ -507,7 +552,7 @@ def get_kpi_dashboard(
     period_start: date,
     period_end: date,
     store_id: list[int] | None = Query(None),
-    db: Session = Depends(get_db),
+    db: Session = Depends(_report_db),
     current_user: CurrentUser = Depends(_reports_permission),
 ) -> report_schemas.KpiDashboardRead:
     resolved = _resolve(current_user, store_id)

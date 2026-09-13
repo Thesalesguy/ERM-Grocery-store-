@@ -37,6 +37,7 @@ M9_HEAD_REVISION = "36ec624cf083"  # M9: supplier product catalog, replenishment
 M10_SCHEMA_REVISION = "be26de9d9459"  # M10: HR/workforce and payroll (base schema)
 M10_CANCELLED_STATUS_REVISION = "2857faf007be"  # M10: + payroll_periods CANCELLED status
 M10_HEAD_REVISION = "1e832b76969e"  # M10: + calculation-consistency CHECK
+M11_HEAD_REVISION = "32e51bcda102"  # M11: + reports performance indexes
 
 
 def _alembic_config() -> Config:
@@ -146,8 +147,11 @@ def test_full_upgrade_downgrade_upgrade_cycle(migrations_db: str) -> None:
     assert _table_count(migrations_db) == 8
 
     command.upgrade(cfg, "head")
+    # M11 adds two indexes (ix_sales_store_completed,
+    # ix_payroll_periods_store_status), not tables -- table count is
+    # unchanged from M10's 61.
     assert _table_count(migrations_db) == 61
-    assert _current_revision(migrations_db) == M10_HEAD_REVISION
+    assert _current_revision(migrations_db) == M11_HEAD_REVISION
 
 
 def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
