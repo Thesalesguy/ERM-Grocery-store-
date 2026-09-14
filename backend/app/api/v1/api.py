@@ -11,6 +11,7 @@ from fastapi import APIRouter
 from app.api.v1.endpoints import (
     accounting,
     ap,
+    audit,
     auth,
     hr,
     inventory,
@@ -36,3 +37,4 @@ api_router.include_router(replenishment.router)
 api_router.include_router(hr.router)
 api_router.include_router(payroll.router)
 api_router.include_router(reports.router)
+api_router.include_router(audit.router)
