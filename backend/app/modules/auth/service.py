@@ -157,10 +157,23 @@ def refresh_access_token(
     unknown or expired token (never issued, or aged out) gets the same
     generic 401 as before — nothing here changes what an attacker
     observes in the response, only what the server does about it.
+
+    `.with_for_update()` (M12 Phase 6 hardening audit — previously an
+    undetected defect, closed here): without a row lock, two requests
+    presenting the SAME not-yet-revoked token concurrently (a legitimate
+    client racing an attacker's stolen copy, or a double-submit) both read
+    `revoked_at IS NULL` before either commits, and both proceed to mark
+    it revoked and mint a brand-new refresh token — handing out two valid
+    sessions from one single-use token with reuse-detection never firing,
+    since neither request ever observed the row as already revoked. The
+    lock forces the second transaction to block until the first commits,
+    then re-read the now-revoked row and correctly take the reuse-detected
+    branch below, exactly as if the second request had arrived a moment
+    later instead of at the same instant.
     """
     token_hash = hash_refresh_token(raw_refresh_token)
     row = db.execute(
-        select(RefreshToken).where(RefreshToken.token_hash == token_hash)
+        select(RefreshToken).where(RefreshToken.token_hash == token_hash).with_for_update()
     ).scalar_one_or_none()
     now = datetime.now(UTC)
 
