@@ -7,8 +7,22 @@ for local development.
 
 from functools import lru_cache
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Values that are fine for local development but must never reach a
+# production boot — kept as an explicit set (not just "is it the
+# literal default") so a production deploy that merely SHORTENED the
+# key to something equally guessable still gets caught by the length
+# check below, and so this set can grow if another known-insecure value
+# is ever discovered without changing the check's shape.
+_KNOWN_INSECURE_SECRET_KEYS = {
+    "dev-only-insecure-secret-key-change-me",
+    "changeme",
+    "secret",
+}
+_MIN_PRODUCTION_SECRET_KEY_LENGTH = 32
+_DATABASE_PLACEHOLDER_MARKER = "CHANGE_ME_IN_PRODUCTION"
 
 
 class Settings(BaseSettings):
@@ -65,6 +79,50 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.ENVIRONMENT == "production"
+
+    @model_validator(mode="after")
+    def _forbid_insecure_production_config(self) -> "Settings":
+        """M12 Phase 2: fail closed. A `production` boot with a dev-shaped
+        secret, a placeholder database password, or a wildcard CORS origin
+        must crash immediately at startup (Settings() construction, before
+        the app can serve a single request) rather than run insecurely.
+        `development`/`staging` are deliberately exempt — the whole point
+        is that switching ENVIRONMENT is what makes these checks bite, not
+        that the checks apply unconditionally (which would just make local
+        dev unusable)."""
+        if not self.is_production:
+            return self
+
+        if (
+            self.SECRET_KEY in _KNOWN_INSECURE_SECRET_KEYS
+            or len(self.SECRET_KEY) < _MIN_PRODUCTION_SECRET_KEY_LENGTH
+        ):
+            raise ValueError(
+                "SECRET_KEY must be a long, random value "
+                f"(>= {_MIN_PRODUCTION_SECRET_KEY_LENGTH} characters, not a known "
+                "development default) before starting in production"
+            )
+        if _DATABASE_PLACEHOLDER_MARKER in self.DATABASE_URL:
+            raise ValueError(
+                "DATABASE_URL still contains the bootstrap placeholder password "
+                f"({_DATABASE_PLACEHOLDER_MARKER!r}); rotate erp_app's password "
+                "(see backend/scripts/bootstrap_db_roles.sql) before starting in "
+                "production"
+            )
+        if self.MIGRATIONS_DATABASE_URL and _DATABASE_PLACEHOLDER_MARKER in (
+            self.MIGRATIONS_DATABASE_URL
+        ):
+            raise ValueError(
+                "MIGRATIONS_DATABASE_URL still contains the bootstrap placeholder "
+                "password; rotate it before starting in production"
+            )
+        if "*" in self.cors_origins_list:
+            raise ValueError(
+                "CORS_ORIGINS must not be a wildcard in production (also "
+                "incompatible with allow_credentials=True); list explicit "
+                "frontend origins"
+            )
+        return self
 
 
 @lru_cache
