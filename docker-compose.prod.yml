@@ -1,0 +1,106 @@
+# M13: production overlay — layered on top of docker-compose.yml, never
+# replacing it (docs/M12_DESIGN.md Section 2's own design, built here).
+# Usage — note the EXPLICIT service list, deliberately omitting the
+# base file's "frontend" service (the Vite dev server): Compose has no
+# clean way to delete a service an overlay doesn't want, so production
+# names exactly the services it needs instead of trying to override
+# "frontend" into non-existence:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+#     --env-file .env.prod up -d --build db backend nginx
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+#     --env-file .env.prod run --rm frontend-builder
+#
+# What this overlay changes vs. the dev stack:
+#   - db: no published port (removes "5432:5432" — only reachable on the
+#     Compose-internal network, docs/M13_DESIGN.md Section 3)
+#   - backend: no bind mount, no --reload, no published port (nginx is
+#     the only public entry point; the backend is reached by nginx over
+#     the internal Compose network using the service name "backend",
+#     not localhost/loopback the way the native-process tests in
+#     deploy/tests/ reach it — same trust boundary, different plumbing)
+#   - frontend: the dev service (a running Vite dev server) does not
+#     exist in this overlay at all — nginx serves the `vite build`
+#     output as static files instead (deploy/nginx/conf.d/erp.conf)
+#   - nginx: new service, the only one with published ports (80/443)
+#
+# Config-validated in this milestone (`docker compose -f ... config`),
+# not daemon-tested — this sandbox's Docker daemon cannot start (nested
+# container `ulimit` restriction, docs/M13_DESIGN.md Section 2). The
+# live-fire proxy/TLS/rate-limit tests (deploy/tests/) instead run
+# nginx and uvicorn as native processes, which exercises identical
+# proxy behavior.
+
+services:
+  db:
+    ports: !reset []
+    restart: always
+
+  backend:
+    build:
+      context: ./backend
+    restart: always
+    env_file:
+      - .env.prod
+    environment:
+      DATABASE_URL: postgresql+psycopg://erp_app:${ERP_APP_PASSWORD:?ERP_APP_PASSWORD must be set in .env.prod}@db:5432/${POSTGRES_DB:-erp_prod}
+      MIGRATIONS_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-erp_user}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env.prod}@db:5432/${POSTGRES_DB:-erp_prod}
+      ENVIRONMENT: production
+      # Overrides the dev compose file's http://localhost:5173 — that
+      # value would be actively wrong here (M12's fail-closed validator,
+      # app/core/config.py, would still accept it since it isn't a
+      # wildcard, but it would simply never match the real production
+      # frontend origin, breaking every browser request with a CORS
+      # error). Required, not defaulted, so a deploy can't silently
+      # inherit the dev value.
+      CORS_ORIGINS: ${PRODUCTION_CORS_ORIGINS:?PRODUCTION_CORS_ORIGINS (e.g. https://erp.example.com) must be set in .env.prod}
+    ports: !reset []
+    volumes: !reset []
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips="*"
+    # forwarded-allow-ips="*" is safe HERE specifically because, in this
+    # overlay, nothing but nginx is on the Compose-internal network path
+    # to the backend at all (no published port — see above); the trust
+    # boundary is enforced by network topology, not by uvicorn's own IP
+    # allowlist, which cannot express "trust the nginx container" by a
+    # stable IP anyway (Compose assigns it dynamically). This is
+    # DIFFERENT from the native-process tests in deploy/tests/, which
+    # rely on uvicorn's default 127.0.0.1-only trust because there both
+    # processes share one host's loopback interface instead of an
+    # isolated Compose network.
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deploy/nginx/conf.d/erp-compose.conf:/etc/nginx/conf.d/erp.conf:ro
+      - ./deploy/nginx/conf.d/proxy_params.inc:/etc/nginx/conf.d/proxy_params.inc:ro
+      - ./deploy/tls:/etc/nginx/tls:ro
+      - frontend_dist:/srv/erp/frontend-dist:ro
+      - certbot_webroot:/var/www/certbot:ro
+    depends_on:
+      - backend
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:80/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  frontend-builder:
+    build:
+      context: ./frontend
+    # Not a long-running service: builds the static assets once into
+    # the shared `frontend_dist` volume, then exits. `docker compose up`
+    # runs it to completion before nginx needs the volume populated;
+    # re-run `docker compose run --rm frontend-builder` after a
+    # frontend change, matching the "application deployment" step of
+    # deploy/scripts/deploy.sh (M13 Phase 10).
+    command: sh -c "npm run build && cp -r dist/* /output/"
+    volumes:
+      - frontend_dist:/output
+
+volumes:
+  frontend_dist:
+  certbot_webroot:
