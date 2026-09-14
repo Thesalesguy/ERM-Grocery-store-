@@ -81,9 +81,9 @@ def _owner_url(db_name: str) -> str:
 
 def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
     result = subprocess.run(cmd, capture_output=True, text=True, **kwargs)
-    assert (
-        result.returncode == 0
-    ), f"command failed: {' '.join(cmd)}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    assert result.returncode == 0, (
+        f"command failed: {' '.join(cmd)}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
     return result
 
 
@@ -509,8 +509,7 @@ def test_real_backup_and_restore_preserves_financial_and_operational_integrity(
             # survived the round-trip.
             sale_journal_entry_id = db.execute(
                 text(
-                    "SELECT id FROM journal_entries WHERE source_type = 'SALE' "
-                    "ORDER BY id LIMIT 1"
+                    "SELECT id FROM journal_entries WHERE source_type = 'SALE' ORDER BY id LIMIT 1"
                 )
             ).scalar_one()
             with pytest.raises(ConflictError) as exc_info:
