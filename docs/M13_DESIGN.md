@@ -264,14 +264,19 @@ something this milestone depends on.
 ## 6. Monitoring and alerting
 
 Prometheus (single static binary, its own package, no daemon
-dependencies beyond what's already needed) + Alertmanager + two
+dependencies beyond what's already needed) + Alertmanager + two stock
 exporters (`node_exporter` for host metrics, `postgres_exporter` for
-DB metrics) + one small custom Python health-poller for the
-application's own `/health`, `/health/db`, `/health/migration`
-endpoints (Prometheus's own `blackbox_exporter` would work too, but a
-~40-line script that calls the endpoints already built in M12 and
-turns their JSON into three gauges is simpler to reason about and
-needs no extra package). No Grafana — Prometheus's own expression
+DB metrics, both running as the least-privilege `erp_monitor` role —
+`pg_monitor` grants read-only access to PostgreSQL's own statistics
+views and nothing else) + one small custom exporter,
+`deploy/prometheus/erp_exporter.py` (~250 lines), for everything the
+two stock exporters cannot see: the application's own `/health`,
+`/health/db`, `/health/migration` endpoints (three gauges), per-status-
+class request counts, 429 counts, and slow-request counts parsed by
+tailing nginx's own JSON access log incrementally (a real byte-offset
+tail, not a re-parse every cycle), and authentication-failure counts
+(`LOGIN_FAILURE`/`REFRESH_TOKEN_REUSE_DETECTED`) polled directly from
+the `audit_logs` table. No Grafana — Prometheus's own expression
 browser and Alertmanager's own UI are sufficient for this milestone's
 scale; adding a dashboarding layer would be exactly the "unnecessarily
 large observability platform" the task warns against.
@@ -279,21 +284,34 @@ large observability platform" the task warns against.
 Monitored: API availability, DB availability, migration health (M12's
 three health endpoints), disk space (`node_exporter` filesystem
 metrics), memory/CPU (`node_exporter`), backup success/failure (a
-metric written by the backup script itself, Section 7), request error
-rate and slow requests (parsed from the app's structured JSON access
-logs — see Section 13), authentication failures (existing
-`LOGIN_FAILURE`/`REFRESH_TOKEN_REUSE_DETECTED` audit events, exposed as
-a metric by a small counter the health-poller also maintains),
-rate-limit events (nginx's own error log `limiting requests` lines),
-database connection exhaustion (`postgres_exporter`'s
-`pg_stat_activity` metrics against `max_connections`), application
-restart/crash (`node_exporter`'s process metrics, or simpler: a
-Prometheus `up{job="backend"}` gap).
+Prometheus textfile-collector metric written by `backup_offbox.sh`
+itself, Section 5 — picked up by `node_exporter --collector.textfile.
+directory`, not duplicated by a second poller), request error rate and
+slow requests (`erp_exporter.py` tailing the app's structured JSON
+access log — see Section 13), authentication failures (`erp_exporter.
+py` polling `audit_logs` directly), rate-limit events (429 counts from
+the same access-log tail — simpler and more precise than parsing
+nginx's free-text error log for "limiting requests" lines, and it is
+the same log already being tailed for status-class counts), database
+connection exhaustion (`postgres_exporter`'s `pg_stat_activity`
+metrics summed across all databases/states against `max_connections`
+— found during live testing that the raw per-database/state metric
+needs an explicit `sum()`, not a per-series comparison), application
+restart/crash (a Prometheus `up{job="erp_exporter"}` gap, and a
+"was down in the last 5m but is up now" rule that catches a
+restart-then-recover cycle a simple `up==0` alert would miss).
 
 Every alert rule defined in `deploy/prometheus/alerts.yml` states its
 condition, severity, and expected operator action inline as
 annotations — reproduced in full in `docs/M13_HARDENING_AUDIT.md`
-rather than duplicated here.
+rather than duplicated here. Live-fire tested end-to-end (real
+PostgreSQL stopped/started, a real corrupted backup-status file) in
+`deploy/tests/test_monitoring.py`; see that file's module docstring for
+exactly what is re-verified on every test run versus what was proven
+once interactively (the production `for:` durations themselves — 1m/2m/
+5m — would make the automated suite too slow to re-run on every
+invocation, so the automated tests use a copy of the same rules with
+only `for:` shortened).
 
 ## 7. Audit log read endpoint
 

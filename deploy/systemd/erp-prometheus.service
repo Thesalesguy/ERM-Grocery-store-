@@ -1,0 +1,22 @@
+[Unit]
+Description=ERP monitoring: Prometheus
+After=network.target
+
+[Service]
+Type=simple
+User=erp-monitor
+Group=erp-monitor
+ExecStart=/usr/bin/prometheus \
+    --config.file=/srv/erp/deploy/prometheus/prometheus.yml \
+    --storage.tsdb.path=/var/lib/erp/prometheus-data \
+    --storage.tsdb.retention.time=15d \
+    --web.listen-address=127.0.0.1:9090
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/erp/prometheus-data
+
+[Install]
+WantedBy=multi-user.target

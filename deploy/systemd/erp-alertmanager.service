@@ -1,0 +1,29 @@
+[Unit]
+Description=ERP monitoring: Alertmanager
+After=network.target
+
+[Service]
+Type=simple
+User=erp-monitor
+Group=erp-monitor
+# --cluster.listen-address="" disables Alertmanager's gossip clustering.
+# A single-node deployment (this milestone's whole topology) has nothing
+# to gossip with, and without this flag Alertmanager refuses to start on
+# a host with no private/advertisable IP (found during Phase 6 testing:
+# "couldn't deduce an advertise address" -- this sandbox's network
+# namespace has no private IP either, which is representative of a
+# single-NIC VPS with only a public address).
+ExecStart=/usr/bin/prometheus-alertmanager \
+    --config.file=/srv/erp/deploy/prometheus/alertmanager.yml \
+    --storage.path=/var/lib/erp/alertmanager-data \
+    --web.listen-address=127.0.0.1:9093 \
+    --cluster.listen-address=
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/erp/alertmanager-data
+
+[Install]
+WantedBy=multi-user.target

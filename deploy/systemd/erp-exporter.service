@@ -1,0 +1,27 @@
+[Unit]
+Description=ERP monitoring: erp_exporter (application + nginx-log + audit metrics)
+After=network.target erp-backend.service nginx.service
+Wants=erp-backend.service
+
+[Service]
+Type=simple
+User=erp-monitor
+# Membership in the group that owns /var/log/nginx (typically
+# adm on Debian/Ubuntu) is required to read the access log -- grant it
+# with: usermod -aG adm erp-monitor
+Group=erp-monitor
+EnvironmentFile=/etc/erp/monitoring.env
+ExecStart=/usr/bin/python3 /srv/erp/deploy/prometheus/erp_exporter.py \
+    --port 9101 \
+    --app-base-url http://127.0.0.1:8000 \
+    --nginx-log /var/log/nginx/access.log \
+    --db-url ${ERP_MONITOR_DB_URL} \
+    --interval 5
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

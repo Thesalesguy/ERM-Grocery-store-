@@ -1,0 +1,22 @@
+# M13 Phase 6: minimal Alertmanager config. Real deployment: replace
+# the `webhook_configs` URL with a real notification channel (email,
+# Slack incoming webhook, PagerDuty, ntfy.sh — all have a free tier
+# with no signup required for ntfy.sh specifically). Deliberately no
+# external service is wired up by default so this milestone never
+# depends on one existing.
+route:
+  receiver: default
+  group_by: ["alertname"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - match:
+        severity: critical
+      receiver: default
+      repeat_interval: 1h
+
+receivers:
+  - name: default
+    # webhook_configs:
+    #   - url: "https://your-notification-endpoint.example/alert"

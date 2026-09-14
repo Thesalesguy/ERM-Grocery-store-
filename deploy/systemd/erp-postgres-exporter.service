@@ -1,0 +1,25 @@
+[Unit]
+Description=ERP monitoring: postgres_exporter (database metrics)
+After=network.target postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=erp-monitor
+Group=erp-monitor
+EnvironmentFile=/etc/erp/monitoring.env
+# Debian/Ubuntu's prometheus-postgres-exporter package binary. Connects
+# as `erp_monitor` -- a role granted ONLY the built-in read-only
+# `pg_monitor` role (deploy/scripts/bootstrap_monitoring_role.sql), never
+# erp_user (schema owner) or erp_app (runtime app role): "do not grant
+# broad privileges for convenience" applies to the monitoring stack too.
+ExecStart=/usr/bin/prometheus-postgres-exporter \
+    --web.listen-address=127.0.0.1:9187
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
