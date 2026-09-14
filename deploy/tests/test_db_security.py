@@ -81,15 +81,30 @@ def test_connection_and_disconnection_logging_produces_real_log_lines() -> None:
     run([*SUDO, "-u", "postgres", "psql", "-c", "SELECT pg_reload_conf();"])
     try:
         time.sleep(0.5)  # let the reload take effect before the next connection
-        engine = create_engine(DB_URL)
+        # A fixed-size tail is not reliable here: other tests/processes
+        # in this shared sandbox Postgres generate their own connection
+        # traffic concurrently, which can push this test's own lines out
+        # of a small fixed window. Record the log's exact size first and
+        # read only the bytes appended after that point instead.
+        size_before = int(run([*SUDO, "stat", "-c%s", _PG_LOG_PATH]).stdout.strip())
+
+        # NullPool: SQLAlchemy's default pool returns a connection to
+        # the pool (keeping the physical socket open for reuse) rather
+        # than closing it when `with engine.connect()` exits -- no
+        # "disconnection" log line would ever appear until the pool
+        # itself is later disposed. NullPool closes the real connection
+        # on every checkin, which is what this test needs to observe.
+        from sqlalchemy.pool import NullPool
+
+        engine = create_engine(DB_URL, poolclass=NullPool)
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         time.sleep(0.5)  # let the disconnection line actually get written
 
-        tail = run([*SUDO, "tail", "-n", "30", _PG_LOG_PATH]).stdout
-        assert "connection received" in tail
-        assert "connection authorized" in tail
-        assert "disconnection: session time" in tail
+        new_content = run([*SUDO, "tail", "-c", f"+{size_before + 1}", _PG_LOG_PATH]).stdout
+        assert "connection received" in new_content
+        assert "connection authorized" in new_content
+        assert "disconnection: session time" in new_content
     finally:
         run([*SUDO, "-u", "postgres", "psql", "-c", "ALTER SYSTEM SET log_connections = off;"])
         run([*SUDO, "-u", "postgres", "psql", "-c", "ALTER SYSTEM SET log_disconnections = off;"])
