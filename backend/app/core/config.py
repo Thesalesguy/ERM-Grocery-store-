@@ -24,6 +24,19 @@ _KNOWN_INSECURE_SECRET_KEYS = {
 _MIN_PRODUCTION_SECRET_KEY_LENGTH = 32
 _DATABASE_PLACEHOLDER_MARKER = "CHANGE_ME_IN_PRODUCTION"
 
+# M13 Phase 9: the DEV-fixture passwords this repo's own .env.example /
+# local setup uses (distinct from bootstrap_db_roles.sql's
+# CHANGE_ME_IN_PRODUCTION marker above, which only catches a cluster
+# that was bootstrapped but never had its password rotated). Found as a
+# real gap during this phase: setting ENVIRONMENT=production while
+# simply forgetting to override DATABASE_URL/MIGRATIONS_DATABASE_URL
+# from their Settings-class dev defaults passed the placeholder check
+# above (neither dev password contains that marker string) and would
+# have booted "in production" against a well-known, publicly-visible
+# development credential. Never let a dev credential silently become a
+# production one.
+_KNOWN_INSECURE_DATABASE_PASSWORDS = {"erp_app_password", "erp_password"}
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -139,6 +152,19 @@ class Settings(BaseSettings):
                 "MIGRATIONS_DATABASE_URL still contains the bootstrap placeholder "
                 "password; rotate it before starting in production"
             )
+        for known_password in _KNOWN_INSECURE_DATABASE_PASSWORDS:
+            if known_password in self.DATABASE_URL:
+                raise ValueError(
+                    f"DATABASE_URL still contains the known development password "
+                    f"{known_password!r}; a production deploy must never reuse a "
+                    "development credential"
+                )
+            if self.MIGRATIONS_DATABASE_URL and known_password in self.MIGRATIONS_DATABASE_URL:
+                raise ValueError(
+                    f"MIGRATIONS_DATABASE_URL still contains the known development "
+                    f"password {known_password!r}; a production deploy must never "
+                    "reuse a development credential"
+                )
         if "*" in self.cors_origins_list:
             raise ValueError(
                 "CORS_ORIGINS must not be a wildcard in production (also "

@@ -118,6 +118,61 @@ def test_production_with_placeholder_migrations_database_password_fails_closed(
         Settings()
 
 
+def test_production_with_unrotated_dev_database_password_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M13 Phase 9: a real gap found during this phase -- the dev-fixture
+    password ("erp_app_password", from this repo's own backend/.env.example
+    default) contains no CHANGE_ME_IN_PRODUCTION marker, so simply
+    forgetting to override DATABASE_URL from its Settings-class default
+    while flipping ENVIRONMENT to production previously passed every
+    existing check. A dev credential must never silently become a
+    production one."""
+    _clear_relevant_env(monkeypatch)
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("SECRET_KEY", "a" * 40)
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgresql+psycopg://erp_app:erp_app_password@localhost:5432/erp_dev"
+    )
+    with pytest.raises(ValidationError, match="DATABASE_URL"):
+        Settings()
+
+
+def test_production_with_unrotated_dev_migrations_database_password_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_relevant_env(monkeypatch)
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("SECRET_KEY", "a" * 40)
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgresql+psycopg://erp_app:a-real-rotated-password@db:5432/erp_prod"
+    )
+    monkeypatch.setenv(
+        "MIGRATIONS_DATABASE_URL",
+        "postgresql+psycopg://erp_user:erp_password@localhost:5432/erp_dev",
+    )
+    with pytest.raises(ValidationError, match="MIGRATIONS_DATABASE_URL"):
+        Settings()
+
+
+def test_production_with_a_genuinely_rotated_password_is_not_falsely_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dev-password check must match the known insecure values
+    exactly -- it must not become so broad that it rejects a real
+    rotated password that merely shares a substring (e.g. "password")
+    with the values it's guarding against."""
+    _clear_relevant_env(monkeypatch)
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("SECRET_KEY", "a" * 40)
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql+psycopg://erp_app:Tr0ub4dor-and-a-real-random-password-99@db:5432/erp_prod",
+    )
+    settings = Settings()
+    assert settings.is_production is True
+
+
 def test_production_with_wildcard_cors_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     _clear_relevant_env(monkeypatch)
     monkeypatch.setenv("ENVIRONMENT", "production")
