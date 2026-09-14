@@ -21,7 +21,7 @@ leaking its existence.
 from datetime import date
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -97,8 +97,8 @@ def list_journals(
     source_type: str | None = None,
     date_from: date | None = None,
     date_to: date | None = None,
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_read_permission),
 ) -> list[JournalEntryRead]:

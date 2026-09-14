@@ -14,6 +14,7 @@ from app.api.v1.api import api_router
 from app.api.v1.endpoints import health
 from app.core.config import get_settings
 from app.core.exceptions import register_exception_handlers
+from app.core.http_hardening import MaxBodySizeMiddleware, add_security_headers
 from app.core.logging import configure_logging
 
 settings = get_settings()
@@ -45,6 +46,8 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.add_middleware(MaxBodySizeMiddleware)
+    app.middleware("http")(add_security_headers)
 
     register_exception_handlers(app)
 

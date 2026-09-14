@@ -11,7 +11,7 @@ as an integer `sale_id` — a static path segment must be registered ahead
 of a same-prefix parameterized one to win the match.
 """
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -139,8 +139,8 @@ def create_sale(
 @router.get("", response_model=list[SaleRead])
 def list_sales(
     store_id: int | None = None,
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_read_permission),
 ) -> list[SaleRead]:
@@ -156,8 +156,8 @@ def list_sales(
 def list_sale_returns(
     sale_id: int | None = None,
     store_id: int | None = None,
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_return_read_permission),
 ) -> list[SaleReturnRead]:

@@ -15,7 +15,7 @@ endpoints: a plan's generated document is fetched via the EXISTING
 link), per the task's explicit "never duplicate existing PO/transfer
 endpoints" instruction."""
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
@@ -95,8 +95,8 @@ def list_supplier_products(
     supplier_id: int | None = None,
     product_id: int | None = None,
     is_active: bool | None = None,
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_read_permission),
 ) -> list[SupplierProductRead]:
@@ -144,8 +144,8 @@ def list_replenishment_plans(
     store_id: int | None = None,
     status_filter: str | None = None,
     generation_batch_id: str | None = None,
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_read_permission),
 ) -> list[ReplenishmentPlanRead]:

@@ -6,7 +6,7 @@ app.modules.auth.permissions for the full matrix and
 docs/M2_AUTH_AND_POS.md for the documented rationale).
 """
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
@@ -54,8 +54,8 @@ def list_products(
     category_id: int | None = None,
     is_active: bool | None = None,
     search: str | None = None,
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_read_permission),
 ) -> list[ProductRead]:

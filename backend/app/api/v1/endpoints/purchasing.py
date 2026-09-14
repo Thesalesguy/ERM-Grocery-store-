@@ -15,7 +15,7 @@ Section 12).
 
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -77,8 +77,8 @@ def create_supplier(
 def list_suppliers(
     is_active: bool | None = None,
     search: str | None = None,
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_read_permission),
 ) -> list[SupplierRead]:
@@ -202,8 +202,8 @@ def list_purchase_orders(
     store_id: int | None = None,
     supplier_id: int | None = None,
     status_filter: str | None = None,
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_read_permission),
 ) -> list[PurchaseOrderRead]:

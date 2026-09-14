@@ -20,7 +20,7 @@ independent by a mutation test in tests/test_ap_api.py).
 
 from datetime import date
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -110,8 +110,8 @@ def list_invoices(
     store_id: int | None = None,
     supplier_id: int | None = None,
     status: str | None = None,
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_read_permission),
 ) -> list[PurchaseInvoiceRead]:
@@ -307,8 +307,8 @@ def list_payments(
     store_id: int | None = None,
     supplier_id: int | None = None,
     purchase_invoice_id: int | None = None,
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_read_permission),
 ) -> list[SupplierPaymentRead]:
@@ -379,8 +379,8 @@ def create_credit_note(
 def list_credit_notes(
     store_id: int | None = None,
     supplier_id: int | None = None,
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_read_permission),
 ) -> list[SupplierCreditNoteRead]:

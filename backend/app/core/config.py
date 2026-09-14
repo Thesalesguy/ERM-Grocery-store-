@@ -60,6 +60,15 @@ class Settings(BaseSettings):
 
     LOG_LEVEL: str = "INFO"
 
+    # M12 Phase 7: application-layer half of the M2-deferred request-size
+    # gap (docs/M12_DESIGN.md Section 14). 2MB comfortably covers the
+    # largest legitimate payload in this app (a multi-line sale/purchase
+    # order submission) while still rejecting an oversized body with a
+    # clean 413 before it is ever read into memory. The proxy-layer half
+    # (`client_max_body_size`) is a separate, documented production
+    # control for whenever nginx is actually stood up.
+    MAX_REQUEST_BODY_BYTES: int = 2 * 1024 * 1024
+
     @field_validator("ENVIRONMENT")
     @classmethod
     def _validate_environment(cls, value: str) -> str:
