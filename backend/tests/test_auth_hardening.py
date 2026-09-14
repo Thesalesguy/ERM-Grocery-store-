@@ -46,6 +46,23 @@ def _forge_token(payload: dict, *, secret: str, algorithm: str) -> str:
     return jwt.encode(payload, secret, algorithm=algorithm)
 
 
+def _attempt_refresh(
+    raw_refresh: str, barrier: threading.Barrier, lock: threading.Lock, results: list[str]
+) -> None:
+    thread_session = SessionLocal()
+    try:
+        barrier.wait(timeout=5)
+        try:
+            service.refresh_access_token(thread_session, raw_refresh_token=raw_refresh)
+            with lock:
+                results.append("success")
+        except Exception:  # noqa: BLE001 -- classifying pass/fail only
+            with lock:
+                results.append("rejected")
+    finally:
+        thread_session.close()
+
+
 # --------------------------------------------------------------------
 # Credential stuffing / rate limiting
 # --------------------------------------------------------------------
@@ -110,70 +127,74 @@ def test_concurrent_refresh_with_same_token_never_yields_two_sessions() -> None:
     SAME not-yet-revoked token must not both succeed. Uses genuinely
     independent DB connections/threads (the shared `db`/`client` fixtures
     run everything on one connection -- see test_concurrency.py's module
-    docstring for why real concurrency proofs can't use them)."""
-    session = SessionLocal()
-    store = make_store(session)
-    user = make_user_with_role(session, store, CASHIER, username=f"race_{uuid.uuid4().hex[:8]}")
-    session.commit()
-    _, _access, raw_refresh = service.login(
-        session, username=user.username, password=DEFAULT_TEST_PASSWORD
-    )
+    docstring for why real concurrency proofs can't use them).
 
-    barrier = threading.Barrier(2)
-    lock = threading.Lock()
-    results: list[str] = []
-
-    def attempt() -> None:
-        thread_session = SessionLocal()
-        try:
-            barrier.wait(timeout=5)
-            try:
-                service.refresh_access_token(thread_session, raw_refresh_token=raw_refresh)
-                with lock:
-                    results.append("success")
-            except Exception:  # noqa: BLE001 -- classifying pass/fail only
-                with lock:
-                    results.append("rejected")
-        finally:
-            thread_session.close()
-
-    threads = [threading.Thread(target=attempt) for _ in range(2)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-    # Deliberately no teardown deletes here: refresh/login write audit_log
-    # rows, and erp_app has no DELETE privilege on audit_logs (M12 Phase 8
-    # DB privilege audit) -- so, like test_concurrency.py, this leaves its
-    # small, uniquely-named committed rows (store/user/tokens/audit
-    # entries) in place rather than fighting the very immutability this
-    # milestone verified elsewhere.
-    assert results.count("success") == 1, (
-        f"exactly one concurrent refresh of the same token must succeed, got {results}"
-    )
-    assert results.count("rejected") == 1
-
-    # Reuse-detection must have fired: the row lock forces the loser to
-    # observe the token as already-revoked (not merely "someone else got
-    # there"), which is the compromise signal that revokes every active
-    # session for this user -- so even the WINNER's brand new refresh
-    # token must already be dead.
-    remaining_active = (
-        session.execute(
-            select(RefreshToken).where(
-                RefreshToken.user_id == user.id, RefreshToken.revoked_at.is_(None)
-            )
+    Repeated across many independent trials, each with its own fresh
+    user/login/token: a single trial is not reliable proof either way for
+    a timing-dependent race. M12 Phase 19 mutation testing found this the
+    hard way -- removing `.with_for_update()` from
+    refresh_access_token was NOT reliably caught by a single-trial version
+    of this test (thread scheduling occasionally serializes the two
+    requests enough that even the buggy code happens to behave, by luck,
+    exactly once). The manual probe that first found the bug needed
+    ~15 trials to show the race in 14/15 attempts; this loop mirrors that
+    scale so the mutation is caught with overwhelming probability rather
+    than occasionally slipping through a green CI run."""
+    trial_count = 12
+    for _ in range(trial_count):
+        session = SessionLocal()
+        store = make_store(session)
+        user = make_user_with_role(session, store, CASHIER, username=f"race_{uuid.uuid4().hex[:8]}")
+        session.commit()
+        _, _access, raw_refresh = service.login(
+            session, username=user.username, password=DEFAULT_TEST_PASSWORD
         )
-        .scalars()
-        .all()
-    )
-    session.close()
-    assert remaining_active == [], (
-        "a concurrent replay of a single-use refresh token must be treated as a "
-        "compromise signal, revoking every session for the user -- not silently "
-        "handing out two valid sessions"
-    )
+
+        barrier = threading.Barrier(2)
+        lock = threading.Lock()
+        results: list[str] = []
+
+        threads = [
+            threading.Thread(target=_attempt_refresh, args=(raw_refresh, barrier, lock, results))
+            for _ in range(2)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # Deliberately no teardown deletes here: refresh/login write
+        # audit_log rows, and erp_app has no DELETE privilege on
+        # audit_logs (M12 Phase 8 DB privilege audit) -- so, like
+        # test_concurrency.py, this leaves its small, uniquely-named
+        # committed rows (store/user/tokens/audit entries) in place
+        # rather than fighting the very immutability this milestone
+        # verified elsewhere.
+        assert results.count("success") == 1, (
+            f"exactly one concurrent refresh of the same token must succeed, got {results}"
+        )
+        assert results.count("rejected") == 1
+
+        # Reuse-detection must have fired: the row lock forces the loser
+        # to observe the token as already-revoked (not merely "someone
+        # else got there"), which is the compromise signal that revokes
+        # every active session for this user -- so even the WINNER's
+        # brand new refresh token must already be dead.
+        remaining_active = (
+            session.execute(
+                select(RefreshToken).where(
+                    RefreshToken.user_id == user.id, RefreshToken.revoked_at.is_(None)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        session.close()
+        assert remaining_active == [], (
+            "a concurrent replay of a single-use refresh token must be treated as a "
+            "compromise signal, revoking every session for the user -- not silently "
+            "handing out two valid sessions"
+        )
 
 
 def test_expired_refresh_token_row_is_rejected(client: TestClient, db: Session) -> None:
