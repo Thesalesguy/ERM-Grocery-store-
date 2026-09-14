@@ -69,6 +69,20 @@ class Settings(BaseSettings):
     # control for whenever nginx is actually stood up.
     MAX_REQUEST_BODY_BYTES: int = 2 * 1024 * 1024
 
+    # M13 Phase 8: explicit, documented connection-pool bounds rather than
+    # relying on SQLAlchemy's own implicit defaults (which happen to be
+    # the same numbers -- 5 and 10 -- but as an unstated default, not a
+    # value anyone chose). Each running process can hold at most
+    # DB_POOL_SIZE + DB_MAX_OVERFLOW connections open; with N uvicorn
+    # workers that's N * 15 by default. A production deploy running
+    # multiple workers must size these (or PostgreSQL's own
+    # max_connections) so the application alone cannot exhaust the
+    # cluster's connection limit -- see docs/M13_HARDENING_AUDIT.md
+    # Section 8 for the worked example against this deployment's default
+    # max_connections=100.
+    DB_POOL_SIZE: int = 5
+    DB_MAX_OVERFLOW: int = 10
+
     @field_validator("ENVIRONMENT")
     @classmethod
     def _validate_environment(cls, value: str) -> str:
