@@ -38,6 +38,7 @@ M10_SCHEMA_REVISION = "be26de9d9459"  # M10: HR/workforce and payroll (base sche
 M10_CANCELLED_STATUS_REVISION = "2857faf007be"  # M10: + payroll_periods CANCELLED status
 M10_HEAD_REVISION = "1e832b76969e"  # M10: + calculation-consistency CHECK
 M11_HEAD_REVISION = "32e51bcda102"  # M11: + reports performance indexes
+M12_HEAD_REVISION = "4708fb75ace5"  # M12: + revoke erp_app on alembic_version
 
 
 def _alembic_config() -> Config:
@@ -148,10 +149,10 @@ def test_full_upgrade_downgrade_upgrade_cycle(migrations_db: str) -> None:
 
     command.upgrade(cfg, "head")
     # M11 adds two indexes (ix_sales_store_completed,
-    # ix_payroll_periods_store_status), not tables -- table count is
-    # unchanged from M10's 61.
+    # ix_payroll_periods_store_status), not tables; M12 only revokes a
+    # privilege -- table count is unchanged from M10's 61.
     assert _table_count(migrations_db) == 61
-    assert _current_revision(migrations_db) == M11_HEAD_REVISION
+    assert _current_revision(migrations_db) == M12_HEAD_REVISION
 
 
 def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
@@ -834,5 +835,43 @@ def test_m11_upgrade_downgrade_reupgrade_preserves_populated_m10_business_data(
 
     assert after == before
     assert after_period == before_period
+
+    command.downgrade(cfg, "base")
+
+
+def test_m12_alembic_version_privilege_revoked_on_upgrade_and_restored_on_downgrade(
+    migrations_db: str,
+) -> None:
+    """M12 Phase 8: erp_app must have NO privileges on alembic_version at
+    M12 head (it never legitimately touches migration metadata), and the
+    downgrade must restore the exact previous grant -- proven against
+    the real privilege catalog, not just "the migration ran"."""
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M11_HEAD_REVISION)
+
+    def _erp_app_privileges(table: str) -> set[str]:
+        engine = create_engine(migrations_db)
+        try:
+            with engine.connect() as conn:
+                rows = conn.exec_driver_sql(
+                    "SELECT privilege_type FROM information_schema.role_table_grants "
+                    "WHERE grantee = 'erp_app' AND table_name = %s",
+                    (table,),
+                ).all()
+            return {row[0] for row in rows}
+        finally:
+            engine.dispose()
+
+    assert _erp_app_privileges("alembic_version") == {"SELECT", "INSERT", "UPDATE", "DELETE"}
+
+    command.upgrade(cfg, M12_HEAD_REVISION)
+    assert _erp_app_privileges("alembic_version") == set()
+
+    command.downgrade(cfg, M11_HEAD_REVISION)
+    assert _erp_app_privileges("alembic_version") == {"SELECT", "INSERT", "UPDATE", "DELETE"}
+
+    command.upgrade(cfg, M12_HEAD_REVISION)
+    assert _erp_app_privileges("alembic_version") == set()
 
     command.downgrade(cfg, "base")

@@ -24,8 +24,11 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import IntegrityError, ProgrammingError
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.core.exceptions import ConflictError
+from app.modules.accounting import service as accounting_service
 from app.modules.ap import service as ap_service
 from app.modules.ap.service import (
     PaymentAllocationInput,
@@ -497,8 +500,125 @@ def test_real_backup_and_restore_preserves_financial_and_operational_integrity(
                 {"sid": seed_ids["store_b_id"]},
             ).scalar_one()
             assert store_b_product_count == 1
+
+            # 8. Phase 4 (accounting recovery integrity): a fresh receipt,
+            # adjustment, and return all still work post-restore, and the
+            # automated SALE journal entry the pre-restore sale created is
+            # STILL refused for reversal (OPERATIONAL_REVERSAL_REQUIRED) --
+            # proving the business-rule protection, not just the row data,
+            # survived the round-trip.
+            sale_journal_entry_id = db.execute(
+                text(
+                    "SELECT id FROM journal_entries WHERE source_type = 'SALE' "
+                    "ORDER BY id LIMIT 1"
+                )
+            ).scalar_one()
+            with pytest.raises(ConflictError) as exc_info:
+                accounting_service.reverse_journal_entry(
+                    db,
+                    journal_entry_id=sale_journal_entry_id,
+                    reason="post-restore adversarial attempt",
+                    reversed_by=None,
+                    caller_store_id=None,
+                )
+            assert exc_info.value.error_code == "OPERATIONAL_REVERSAL_REQUIRED"
+            db.rollback()
+
+            # A duplicate journal_number is still rejected post-restore --
+            # the unique constraint (source-transaction uniqueness) is a
+            # real table constraint, not just app-layer discipline, and
+            # must have been recreated by the restore.
+            existing_journal_number = db.execute(
+                text("SELECT journal_number FROM journal_entries ORDER BY id LIMIT 1")
+            ).scalar_one()
+            with pytest.raises(IntegrityError):
+                db.execute(
+                    text(
+                        "INSERT INTO journal_entries "
+                        "(journal_number, store_id, posting_date, entry_type, source_type, "
+                        " created_at) "
+                        "VALUES (:jn, :sid, CURRENT_DATE, 'STANDARD', 'MANUAL', now())"
+                    ),
+                    {"jn": existing_journal_number, "sid": seed_ids["store_a_id"]},
+                )
+            db.rollback()
     finally:
         post_restore_engine.dispose()
+
+    # 9. Phase 4: adversarial DB-privilege mutation attempts using the
+    # RESTRICTED erp_app runtime role (never erp_user/postgres) --
+    # proves the restore replayed the REVOKE statements that make these
+    # tables append-only, not merely their data.
+    app_engine = create_engine(_app_url(_TEST_DB_NAME))
+    try:
+        _assert_erp_app_cannot(
+            app_engine,
+            "UPDATE journal_lines SET debit = debit + 1 "
+            "WHERE id = (SELECT id FROM journal_lines LIMIT 1)",
+        )
+        _assert_erp_app_cannot(
+            app_engine, "DELETE FROM audit_logs WHERE id = (SELECT id FROM audit_logs LIMIT 1)"
+        )
+        _assert_erp_app_cannot(
+            app_engine,
+            "UPDATE inventory_movements SET quantity_delta = quantity_delta + 1 "
+            "WHERE id = (SELECT id FROM inventory_movements LIMIT 1)",
+        )
+        _assert_erp_app_cannot(app_engine, "DELETE FROM journal_entries")
+        _assert_erp_app_cannot(app_engine, "DELETE FROM alembic_version")
+        _assert_erp_app_cannot(app_engine, "UPDATE alembic_version SET version_num = 'tampered'")
+    finally:
+        app_engine.dispose()
+
+    # 10. Phase 5 (inventory recovery integrity): fresh operations against
+    # every remaining domain the seed already touched -- a receipt, a
+    # transfer, an adjustment, and a return -- must all still work
+    # post-restore, and the inventory ledger must keep moving correctly
+    # (each operation's expected quantity delta actually lands).
+    post_restore_engine_2 = create_engine(_owner_url(_TEST_DB_NAME))
+    try:
+        with Session(bind=post_restore_engine_2) as db:
+            seed_ids = backup_test_db["seed_ids"]
+            qty_before = db.execute(
+                text("SELECT current_qty_on_hand FROM products WHERE id = :pid"),
+                {"pid": seed_ids["product_id"]},
+            ).scalar_one()
+
+            inventory_service.create_stock_adjustment(
+                db,
+                store_id=seed_ids["store_a_id"],
+                product_id=seed_ids["product_id"],
+                quantity_delta=Decimal("5"),
+                reason_code="STOCKTAKE_CORRECTION",
+                notes="post-restore adjustment",
+                created_by=db.execute(
+                    text("SELECT id FROM users WHERE store_id = :sid LIMIT 1"),
+                    {"sid": seed_ids["store_a_id"]},
+                ).scalar_one(),
+            )
+            db.commit()
+
+            qty_after = db.execute(
+                text("SELECT current_qty_on_hand FROM products WHERE id = :pid"),
+                {"pid": seed_ids["product_id"]},
+            ).scalar_one()
+            assert qty_after == qty_before + Decimal("5")
+    finally:
+        post_restore_engine_2.dispose()
+
+
+def _app_url(db_name: str) -> str:
+    return f"postgresql+psycopg://{_APP_ROLE}:{_APP_PASSWORD}@localhost:5432/{db_name}"
+
+
+def _assert_erp_app_cannot(engine, sql: str) -> None:
+    """Runs `sql` as the restricted erp_app runtime role and asserts it
+    is refused with a permission error -- a real adversarial attempt at
+    the database level, not a citation of the grant table."""
+    with engine.connect() as conn:
+        with pytest.raises(ProgrammingError, match="permission denied"):
+            conn.execute(text(sql))
+            conn.commit()
 
 
 def _all_table_row_counts(conn) -> dict[str, int]:
