@@ -38,7 +38,8 @@ M10_SCHEMA_REVISION = "be26de9d9459"  # M10: HR/workforce and payroll (base sche
 M10_CANCELLED_STATUS_REVISION = "2857faf007be"  # M10: + payroll_periods CANCELLED status
 M10_HEAD_REVISION = "1e832b76969e"  # M10: + calculation-consistency CHECK
 M11_HEAD_REVISION = "32e51bcda102"  # M11: + reports performance indexes
-M12_HEAD_REVISION = "4708fb75ace5"  # M12: + revoke erp_app on alembic_version
+M12_PHASE8_REVISION = "4708fb75ace5"  # M12: + revoke erp_app on alembic_version
+M12_HEAD_REVISION = "17fb9afe8d39"  # M12: + grant erp_app SELECT-only on alembic_version
 
 
 def _alembic_config() -> Config:
@@ -843,9 +844,12 @@ def test_m12_alembic_version_privilege_revoked_on_upgrade_and_restored_on_downgr
     migrations_db: str,
 ) -> None:
     """M12 Phase 8: erp_app must have NO privileges on alembic_version at
-    M12 head (it never legitimately touches migration metadata), and the
-    downgrade must restore the exact previous grant -- proven against
-    the real privilege catalog, not just "the migration ran"."""
+    the Phase 8 revision (it never legitimately touches migration
+    metadata), and the downgrade must restore the exact previous grant --
+    proven against the real privilege catalog, not just "the migration
+    ran". M12 Phase 11 then grants back SELECT only (for the new
+    /health/migration endpoint) at the true M12 head -- write immutability
+    (no INSERT/UPDATE/DELETE) must still hold there."""
     cfg = _alembic_config()
     command.downgrade(cfg, "base")
     command.upgrade(cfg, M11_HEAD_REVISION)
@@ -865,13 +869,19 @@ def test_m12_alembic_version_privilege_revoked_on_upgrade_and_restored_on_downgr
 
     assert _erp_app_privileges("alembic_version") == {"SELECT", "INSERT", "UPDATE", "DELETE"}
 
+    command.upgrade(cfg, M12_PHASE8_REVISION)
+    assert _erp_app_privileges("alembic_version") == set()
+
     command.upgrade(cfg, M12_HEAD_REVISION)
+    assert _erp_app_privileges("alembic_version") == {"SELECT"}
+
+    command.downgrade(cfg, M12_PHASE8_REVISION)
     assert _erp_app_privileges("alembic_version") == set()
 
     command.downgrade(cfg, M11_HEAD_REVISION)
     assert _erp_app_privileges("alembic_version") == {"SELECT", "INSERT", "UPDATE", "DELETE"}
 
     command.upgrade(cfg, M12_HEAD_REVISION)
-    assert _erp_app_privileges("alembic_version") == set()
+    assert _erp_app_privileges("alembic_version") == {"SELECT"}
 
     command.downgrade(cfg, "base")

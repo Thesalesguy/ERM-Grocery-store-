@@ -10,6 +10,7 @@ import logging
 import logging.config
 
 from app.core.config import get_settings
+from app.core.correlation import RequestIdLogFilter
 
 _REDACTED_KEYS = {
     "password",
@@ -43,18 +44,19 @@ def configure_logging() -> None:
             "disable_existing_loggers": False,
             "filters": {
                 "redact_sensitive": {"()": RedactSensitiveFieldsFilter},
+                "request_id": {"()": RequestIdLogFilter},
             },
             "formatters": {
                 "json": {
                     "()": "pythonjsonlogger.json.JsonFormatter",
-                    "format": "%(asctime)s %(levelname)s %(name)s %(message)s",
+                    "format": "%(asctime)s %(levelname)s %(name)s %(request_id)s %(message)s",
                 },
             },
             "handlers": {
                 "console": {
                     "class": "logging.StreamHandler",
                     "formatter": "json",
-                    "filters": ["redact_sensitive"],
+                    "filters": ["redact_sensitive", "request_id"],
                 },
             },
             "root": {
