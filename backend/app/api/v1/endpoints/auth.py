@@ -17,8 +17,14 @@ from app.core.config import get_settings
 from app.core.exceptions import UnauthorizedError
 from app.core.rate_limit import login_rate_limiter, refresh_rate_limiter
 from app.modules.auth import service
-from app.modules.auth.schemas import AccessTokenResponse, CurrentUserResponse, LoginRequest
-from app.modules.auth.service import CurrentUser, get_current_user
+from app.modules.auth.permissions import USERS_MANAGE
+from app.modules.auth.schemas import (
+    AccessTokenResponse,
+    CurrentUserResponse,
+    LoginRequest,
+    UserDeactivateResponse,
+)
+from app.modules.auth.service import CurrentUser, get_current_user, require_permission
 
 
 def _client_ip(request: Request) -> str:
@@ -116,3 +122,20 @@ def me(current_user: CurrentUser = Depends(get_current_user)) -> CurrentUserResp
         store_id=current_user.store_id,
         permissions=sorted(current_user.permissions),
     )
+
+
+@router.post("/users/{user_id}/deactivate", response_model=UserDeactivateResponse)
+def deactivate_user(
+    user_id: int,
+    request: Request,
+    current_user: CurrentUser = Depends(require_permission(USERS_MANAGE)),
+    db: Session = Depends(get_db),
+) -> UserDeactivateResponse:
+    user = service.deactivate_user(
+        db,
+        target_user_id=user_id,
+        actor_id=current_user.id,
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+    )
+    return UserDeactivateResponse(id=user.id, username=user.username, is_active=user.is_active)
