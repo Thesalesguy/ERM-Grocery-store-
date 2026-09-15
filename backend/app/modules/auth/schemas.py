@@ -20,3 +20,9 @@ class CurrentUserResponse(BaseModel):
     full_name: str
     store_id: int | None
     permissions: list[str]
+
+
+class UserDeactivateResponse(BaseModel):
+    id: int
+    username: str
+    is_active: bool

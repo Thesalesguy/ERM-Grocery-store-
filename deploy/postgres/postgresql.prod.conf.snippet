@@ -1,0 +1,49 @@
+# M13 Phase 8: recommended production PostgreSQL settings, additive to
+# whatever postgresql.conf the target distro/managed-Postgres ships with.
+# Apply with: append to postgresql.conf (or postgresql.conf.d/*.conf on
+# distros that support it), then `systemctl reload postgresql` (a SIGHUP
+# reload is sufficient for every setting below -- none require a restart).
+#
+# Every value here was verified against the real PostgreSQL 16 instance
+# in this sandbox (deploy/tests/test_db_security.py), not copied from
+# documentation.
+
+# --- Network exposure ---------------------------------------------------
+# Never '*' on a publicly-routable interface. 'localhost' if the backend
+# runs on the same host; the Docker Compose private network's bridge
+# address if running in docker-compose.prod.yml (db has no published
+# ports there -- see that file). This sandbox's own Postgres was already
+# found configured this way (listen_addresses=localhost) -- confirming
+# the value to require, not inventing it.
+listen_addresses = 'localhost'
+
+# --- Connection limits ----------------------------------------------------
+# Must comfortably exceed (erp_app's pool_size + max_overflow) * worker
+# count, plus headroom for erp_user (migrations, ad hoc admin access),
+# erp_monitor (postgres_exporter), and a manual psql session during an
+# incident. Default is 100; with app/core/config.py's own
+# DB_POOL_SIZE=5 + DB_MAX_OVERFLOW=10 defaults and up to 4 uvicorn
+# workers, the application alone can hold at most 60 connections --
+# comfortably under 100, but size this explicitly for your actual
+# worker count rather than assuming the default is enough.
+max_connections = 100
+
+# --- Idle-in-transaction protection ---------------------------------------
+# 0 (disabled) is PostgreSQL's own default -- a backend bug that opens a
+# transaction and never commits/rolls back would hold that connection,
+# and any locks it acquired, forever. 5 minutes is generous for this
+# application's longest legitimate single statement (a stock count
+# variance report) while still recovering a leaked connection within
+# one incident-response window. Verified to actually terminate a stalled
+# session, not just documented, in deploy/tests/test_db_security.py.
+idle_in_transaction_session_timeout = '5min'
+
+# --- Database-level audit trail --------------------------------------------
+# Independent of this application's own audit_logs table (M2) -- an
+# attacker who somehow bypassed the application layer entirely (e.g. a
+# stolen erp_app credential used directly via psql) cannot also suppress
+# PostgreSQL's own connection log, since it is written by the database
+# server itself, not application code.
+log_connections = on
+log_disconnections = on
+log_destination = 'stderr'

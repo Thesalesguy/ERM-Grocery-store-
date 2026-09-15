@@ -34,6 +34,7 @@ each a genuinely atomic multi-effect transaction — on the other, which
 never call commit()/rollback() themselves; the caller commits once.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
@@ -1924,16 +1925,27 @@ class ApAgingRow:
 
 
 def ap_aging(
-    db: Session, *, store_id: int | None = None, as_of: date | None = None
+    db: Session,
+    *,
+    store_id: int | None = None,
+    store_ids: Sequence[int] | None = None,
+    as_of: date | None = None,
 ) -> list[ApAgingRow]:
     """Standard aging buckets (current / 1-30 / 31-60 / 61-90 / 90+ days
     past due_date) for every outstanding (POSTED/PARTIALLY_PAID) invoice,
     grouped by supplier. The bucketed balance is `_outstanding_balance`
     (grand_total - amount_paid - amount_credited) — a credit note reduces
-    an invoice's aged balance exactly like a payment does."""
+    an invoice's aged balance exactly like a payment does.
+
+    `store_ids` (M11 addition, docs/M11_DESIGN.md Section 2): an
+    explicit store subset, additive to the existing `store_id`
+    single-store/all-stores filter — every existing caller is
+    unaffected."""
     as_of = as_of or date.today()
     query = select(PurchaseInvoice).where(PurchaseInvoice.status.in_(_OUTSTANDING_INVOICE_STATUSES))
-    if store_id is not None:
+    if store_ids is not None:
+        query = query.where(PurchaseInvoice.store_id.in_(store_ids))
+    elif store_id is not None:
         query = query.where(PurchaseInvoice.store_id == store_id)
     invoices = list(db.execute(query).scalars().all())
 
@@ -1986,17 +1998,23 @@ class ApReconciliationRow:
     discrepancy: Decimal
 
 
-def ap_reconciliation(db: Session, *, store_id: int | None = None) -> ApReconciliationRow:
+def ap_reconciliation(
+    db: Session, *, store_id: int | None = None, store_ids: Sequence[int] | None = None
+) -> ApReconciliationRow:
     """Compares the Accounts Payable GL control-account balance against
     the AP subledger total (Σ outstanding invoice balances, now net of
     both payments AND credit notes) — unchanged mechanism from M6, same
-    shape as accounting.service.inventory_reconciliation."""
-    rows = accounting_service.trial_balance(db, store_id=store_id)
+    shape as accounting.service.inventory_reconciliation.
+
+    `store_ids` (M11 addition): see `ap_aging`'s own docstring."""
+    rows = accounting_service.trial_balance(db, store_id=store_id, store_ids=store_ids)
     ap_row = next((r for r in rows if r.account_code == ACCOUNT_ACCOUNTS_PAYABLE), None)
     gl_balance = (ap_row.total_credit - ap_row.total_debit) if ap_row else Decimal("0")
 
     query = select(PurchaseInvoice).where(PurchaseInvoice.status.in_(_OUTSTANDING_INVOICE_STATUSES))
-    if store_id is not None:
+    if store_ids is not None:
+        query = query.where(PurchaseInvoice.store_id.in_(store_ids))
+    elif store_id is not None:
         query = query.where(PurchaseInvoice.store_id == store_id)
     subledger_total = sum(
         (_outstanding_balance(invoice) for invoice in db.execute(query).scalars()),
@@ -2019,21 +2037,25 @@ class PurchaseClearingReconciliationRow:
 
 
 def purchase_clearing_reconciliation(
-    db: Session, *, store_id: int | None = None
+    db: Session, *, store_id: int | None = None, store_ids: Sequence[int] | None = None
 ) -> PurchaseClearingReconciliationRow:
     """Compares the Purchase Clearing GL balance against the sum, across
     every PurchaseOrderItem (optionally scoped to one store), of the
     FIFO-priced value still received-but-not-invoiced — unchanged from M6
     (credit notes never touch Purchase Clearing; see
-    docs/M7_ADVANCED_AP_SETTLEMENT.md Section 13)."""
-    rows = accounting_service.trial_balance(db, store_id=store_id)
+    docs/M7_ADVANCED_AP_SETTLEMENT.md Section 13).
+
+    `store_ids` (M11 addition): see `ap_aging`'s own docstring."""
+    rows = accounting_service.trial_balance(db, store_id=store_id, store_ids=store_ids)
     clearing_row = next((r for r in rows if r.account_code == ACCOUNT_PURCHASE_CLEARING), None)
     gl_balance = (
         (clearing_row.total_credit - clearing_row.total_debit) if clearing_row else Decimal("0")
     )
 
     query = select(PurchaseOrder)
-    if store_id is not None:
+    if store_ids is not None:
+        query = query.where(PurchaseOrder.store_id.in_(store_ids))
+    elif store_id is not None:
         query = query.where(PurchaseOrder.store_id == store_id)
     purchase_orders = list(db.execute(query).scalars().all())
     outstanding_total = Decimal("0")

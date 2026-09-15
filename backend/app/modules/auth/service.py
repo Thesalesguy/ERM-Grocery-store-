@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
 from app.core.config import get_settings
-from app.core.exceptions import ForbiddenError, UnauthorizedError
+from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError, UnauthorizedError
 from app.core.security import (
     create_access_token,
     decode_access_token,
@@ -157,10 +157,23 @@ def refresh_access_token(
     unknown or expired token (never issued, or aged out) gets the same
     generic 401 as before — nothing here changes what an attacker
     observes in the response, only what the server does about it.
+
+    `.with_for_update()` (M12 Phase 6 hardening audit — previously an
+    undetected defect, closed here): without a row lock, two requests
+    presenting the SAME not-yet-revoked token concurrently (a legitimate
+    client racing an attacker's stolen copy, or a double-submit) both read
+    `revoked_at IS NULL` before either commits, and both proceed to mark
+    it revoked and mint a brand-new refresh token — handing out two valid
+    sessions from one single-use token with reuse-detection never firing,
+    since neither request ever observed the row as already revoked. The
+    lock forces the second transaction to block until the first commits,
+    then re-read the now-revoked row and correctly take the reuse-detected
+    branch below, exactly as if the second request had arrived a moment
+    later instead of at the same instant.
     """
     token_hash = hash_refresh_token(raw_refresh_token)
     row = db.execute(
-        select(RefreshToken).where(RefreshToken.token_hash == token_hash)
+        select(RefreshToken).where(RefreshToken.token_hash == token_hash).with_for_update()
     ).scalar_one_or_none()
     now = datetime.now(UTC)
 
@@ -201,6 +214,59 @@ def refresh_access_token(
     )
     db.commit()
     return user, access_token, raw_new
+
+
+def deactivate_user(
+    db: Session,
+    *,
+    target_user_id: int,
+    actor_id: int,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+) -> User:
+    """M12 Phase 10 (docs/M12_DESIGN.md Section 1.6): the one
+    operator-facing administrative capability this milestone adds —
+    revoking a terminated or compromised account's access without shell/
+    DB access. Sets `users.is_active = False` (already checked at login
+    and on every token-refresh/get_current_user call) and immediately
+    revokes every refresh token the account holds, so a session that is
+    mid-way through its 15-minute access-token lifetime is not merely
+    prevented from logging in again — get_current_user's own is_active
+    check kills it on the very next request, and the refresh revocation
+    stops it from quietly renewing past that point (M12 Phase 6/9:
+    session revocation must be immediate, not "eventually", for a
+    compromise response to mean anything).
+
+    Self-deactivation is refused: the actor locking out their OWN account
+    is exactly the scenario that would force a return to the shell/DB
+    access this capability exists to avoid (there being no reactivation
+    capability in this milestone — docs/M12_DESIGN.md Section 20 — a
+    lone admin deactivating themselves would have no way back in through
+    the API at all).
+    """
+    if target_user_id == actor_id:
+        raise ConflictError(
+            "You cannot deactivate your own account.", error_code="CANNOT_DEACTIVATE_SELF"
+        )
+    user = db.get(User, target_user_id)
+    if user is None:
+        raise NotFoundError(f"User {target_user_id} not found")
+    was_active = user.is_active
+    user.is_active = False
+    _revoke_all_refresh_tokens_for_user(db, target_user_id)
+    audit_service.log_event(
+        db,
+        user_id=actor_id,
+        action="USER_DEACTIVATED",
+        entity_type="user",
+        entity_id=target_user_id,
+        before={"is_active": was_active},
+        after={"is_active": False},
+        ip_address=ip_address,
+        user_agent=user_agent,
+    )
+    db.commit()
+    return user
 
 
 def logout(db: Session, *, raw_refresh_token: str) -> None:

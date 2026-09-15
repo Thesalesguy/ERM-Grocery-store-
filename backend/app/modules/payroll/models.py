@@ -179,6 +179,12 @@ class PayrollPeriod(TimestampMixin, Base):
         Index("ix_payroll_periods_store_id", "store_id"),
         Index("ix_payroll_periods_status", "status"),
         Index("ix_payroll_periods_payroll_run_id", "payroll_run_id"),
+        # M11 (docs/M11_DESIGN.md Section 11): payroll_cost_summary,
+        # headcount_by_store, and the KPI dashboard all filter by store_id
+        # AND status together (e.g. status='POSTED') -- a composite index
+        # serves that combined filter better than the two single-column
+        # indexes above can.
+        Index("ix_payroll_periods_store_status", "store_id", "status"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)

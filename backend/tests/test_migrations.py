@@ -37,6 +37,9 @@ M9_HEAD_REVISION = "36ec624cf083"  # M9: supplier product catalog, replenishment
 M10_SCHEMA_REVISION = "be26de9d9459"  # M10: HR/workforce and payroll (base schema)
 M10_CANCELLED_STATUS_REVISION = "2857faf007be"  # M10: + payroll_periods CANCELLED status
 M10_HEAD_REVISION = "1e832b76969e"  # M10: + calculation-consistency CHECK
+M11_HEAD_REVISION = "32e51bcda102"  # M11: + reports performance indexes
+M12_PHASE8_REVISION = "4708fb75ace5"  # M12: + revoke erp_app on alembic_version
+M12_HEAD_REVISION = "17fb9afe8d39"  # M12: + grant erp_app SELECT-only on alembic_version
 
 
 def _alembic_config() -> Config:
@@ -146,8 +149,11 @@ def test_full_upgrade_downgrade_upgrade_cycle(migrations_db: str) -> None:
     assert _table_count(migrations_db) == 8
 
     command.upgrade(cfg, "head")
+    # M11 adds two indexes (ix_sales_store_completed,
+    # ix_payroll_periods_store_status), not tables; M12 only revokes a
+    # privilege -- table count is unchanged from M10's 61.
     assert _table_count(migrations_db) == 61
-    assert _current_revision(migrations_db) == M10_HEAD_REVISION
+    assert _current_revision(migrations_db) == M12_HEAD_REVISION
 
 
 def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
@@ -737,3 +743,145 @@ def test_m10_cancelled_status_downgrade_refuses_when_cancelled_period_exists(
         finally:
             engine.dispose()
         command.downgrade(cfg, "base")
+
+
+def test_m11_indexes_created_on_upgrade_and_removed_on_downgrade(migrations_db: str) -> None:
+    """docs/M11_DESIGN.md Section 11/14: the two performance indexes
+    this milestone adds must actually appear at M11 head, disappear on
+    downgrade to the M10 head (a purely additive, non-destructive step —
+    dropping an index can never lose data or relax an invariant, so no
+    downgrade guard is needed here, unlike the M7/M8/M9/M10 guard tests
+    above), and come back on re-upgrade. Proven against Alembic's own
+    behavior directly (inspector.get_indexes), not just "the migration
+    ran without raising"."""
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M10_HEAD_REVISION)
+
+    def _index_names(table: str) -> set[str]:
+        engine = create_engine(migrations_db)
+        try:
+            return {ix["name"] for ix in inspect(engine).get_indexes(table)}
+        finally:
+            engine.dispose()
+
+    assert "ix_sales_store_completed" not in _index_names("sales")
+    assert "ix_payroll_periods_store_status" not in _index_names("payroll_periods")
+
+    command.upgrade(cfg, M11_HEAD_REVISION)
+    assert "ix_sales_store_completed" in _index_names("sales")
+    assert "ix_payroll_periods_store_status" in _index_names("payroll_periods")
+
+    command.downgrade(cfg, M10_HEAD_REVISION)
+    assert "ix_sales_store_completed" not in _index_names("sales")
+    assert "ix_payroll_periods_store_status" not in _index_names("payroll_periods")
+
+    command.upgrade(cfg, M11_HEAD_REVISION)
+    assert "ix_sales_store_completed" in _index_names("sales")
+    assert "ix_payroll_periods_store_status" in _index_names("payroll_periods")
+
+    command.downgrade(cfg, "base")
+
+
+def test_m11_upgrade_downgrade_reupgrade_preserves_populated_m10_business_data(
+    migrations_db: str,
+) -> None:
+    """A purely additive index migration must never touch existing rows.
+    Seeds real M0-M10 business data at the M10 head, cycles through the
+    M11 upgrade/downgrade/re-upgrade, and proves every row survives
+    byte-for-byte -- the same discipline as
+    test_m0_m8_data_integrity_survives_m9_upgrade_downgrade_reupgrade
+    above, applied to M11's own migration."""
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M10_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            store_id = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, created_at) "
+                "VALUES ('M11 Migration Test Store', 'UTC', true, now()) RETURNING id"
+            ).scalar_one()
+            conn.exec_driver_sql(
+                "INSERT INTO payroll_periods "
+                "(store_id, period_start, period_end, pay_date, status, created_at) "
+                f"VALUES ({store_id}, '2024-01-01', '2024-01-15', '2024-01-20', 'DRAFT', now())"
+            )
+        with engine.connect() as conn:
+            before = conn.exec_driver_sql(
+                "SELECT id, name FROM stores WHERE id = %s", (store_id,)
+            ).one()
+            before_period = conn.exec_driver_sql(
+                "SELECT store_id, status FROM payroll_periods WHERE store_id = %s", (store_id,)
+            ).one()
+    finally:
+        engine.dispose()
+
+    command.upgrade(cfg, M11_HEAD_REVISION)
+    command.downgrade(cfg, M10_HEAD_REVISION)
+    command.upgrade(cfg, M11_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.connect() as conn:
+            after = conn.exec_driver_sql(
+                "SELECT id, name FROM stores WHERE id = %s", (store_id,)
+            ).one()
+            after_period = conn.exec_driver_sql(
+                "SELECT store_id, status FROM payroll_periods WHERE store_id = %s", (store_id,)
+            ).one()
+    finally:
+        engine.dispose()
+
+    assert after == before
+    assert after_period == before_period
+
+    command.downgrade(cfg, "base")
+
+
+def test_m12_alembic_version_privilege_revoked_on_upgrade_and_restored_on_downgrade(
+    migrations_db: str,
+) -> None:
+    """M12 Phase 8: erp_app must have NO privileges on alembic_version at
+    the Phase 8 revision (it never legitimately touches migration
+    metadata), and the downgrade must restore the exact previous grant --
+    proven against the real privilege catalog, not just "the migration
+    ran". M12 Phase 11 then grants back SELECT only (for the new
+    /health/migration endpoint) at the true M12 head -- write immutability
+    (no INSERT/UPDATE/DELETE) must still hold there."""
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M11_HEAD_REVISION)
+
+    def _erp_app_privileges(table: str) -> set[str]:
+        engine = create_engine(migrations_db)
+        try:
+            with engine.connect() as conn:
+                rows = conn.exec_driver_sql(
+                    "SELECT privilege_type FROM information_schema.role_table_grants "
+                    "WHERE grantee = 'erp_app' AND table_name = %s",
+                    (table,),
+                ).all()
+            return {row[0] for row in rows}
+        finally:
+            engine.dispose()
+
+    assert _erp_app_privileges("alembic_version") == {"SELECT", "INSERT", "UPDATE", "DELETE"}
+
+    command.upgrade(cfg, M12_PHASE8_REVISION)
+    assert _erp_app_privileges("alembic_version") == set()
+
+    command.upgrade(cfg, M12_HEAD_REVISION)
+    assert _erp_app_privileges("alembic_version") == {"SELECT"}
+
+    command.downgrade(cfg, M12_PHASE8_REVISION)
+    assert _erp_app_privileges("alembic_version") == set()
+
+    command.downgrade(cfg, M11_HEAD_REVISION)
+    assert _erp_app_privileges("alembic_version") == {"SELECT", "INSERT", "UPDATE", "DELETE"}
+
+    command.upgrade(cfg, M12_HEAD_REVISION)
+    assert _erp_app_privileges("alembic_version") == {"SELECT"}
+
+    command.downgrade(cfg, "base")

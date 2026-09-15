@@ -4,4 +4,12 @@ __pycache__
 .pytest_cache
 .mypy_cache
 .ruff_cache
+# M13 Phase 9: every dotenv variant, not just the bare .env -- defense
+# in depth. The primary guarantee is structural (docker-compose.yml's
+# build.context is ./backend, so .env.prod at the repo root is never
+# even part of the build context to begin with), but this still guards
+# a future accidental `backend/.env.prod` or a differently-invoked
+# `docker build backend/`.
 .env
+.env.*
+!.env.example

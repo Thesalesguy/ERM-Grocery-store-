@@ -1,0 +1,30 @@
+[Unit]
+Description=ERP monitoring: node_exporter (host metrics)
+After=network.target
+
+[Service]
+Type=simple
+User=erp-monitor
+Group=erp-monitor
+# Debian/Ubuntu's prometheus-node-exporter package binary; NOT a bare
+# `node_exporter` on this distro (found the hard way during Phase 6
+# development -- `ls /usr/bin/prometheus*` is the source of truth).
+#
+# --collector.textfile.directory points at the SAME directory
+# backup_offbox.sh's BACKUP_STATUS_FILE writes into (see
+# deploy/systemd/README.md for the one-time directory/group setup this
+# sharing requires -- deliberately NOT DynamicUser, since a dynamic,
+# per-boot UID cannot be shared with the separate process that writes
+# the backup-status file).
+ExecStart=/usr/bin/prometheus-node-exporter \
+    --web.listen-address=127.0.0.1:9100 \
+    --collector.textfile.directory=/var/lib/erp/textfile_collector
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/erp/textfile_collector
+
+[Install]
+WantedBy=multi-user.target

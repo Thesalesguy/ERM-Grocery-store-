@@ -46,6 +46,12 @@ class Sale(TimestampMixin, Base):
         ),
         Index("ix_sales_store_created", "store_id", "created_at"),
         Index("ix_sales_cashier_id", "cashier_id"),
+        # M11 (docs/M11_DESIGN.md Section 11): every sales report filters
+        # by store_id and a completed_at range -- distinct from
+        # ix_sales_store_created's created_at, which is set on every sale
+        # (including still-OPEN ones) and isn't what date-ranged reports
+        # query on.
+        Index("ix_sales_store_completed", "store_id", "completed_at"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)

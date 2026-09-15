@@ -5,7 +5,7 @@ stock adjustments.
 the adjustment endpoint (see app.modules.auth.permissions).
 """
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
@@ -71,8 +71,8 @@ def list_stock(
     store_id: int | None = None,
     search: str | None = None,
     low_stock_only: bool = False,
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_read_permission),
 ) -> list[StockLevelRead]:
@@ -105,8 +105,8 @@ def list_movements(
     product_id: int | None = None,
     movement_type: str | None = None,
     store_id: int | None = None,
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_read_permission),
 ) -> list[InventoryMovementRead]:
@@ -190,8 +190,8 @@ def create_stock_count(
 def list_stock_counts(
     store_id: int | None = None,
     status: str | None = None,
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_read_permission),
 ) -> list[StockCountRead]:
