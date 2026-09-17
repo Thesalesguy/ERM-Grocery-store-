@@ -1,4 +1,4 @@
-import { apiFetch } from './client'
+import { apiFetch, setAccessToken } from './client'
 
 export interface AccessTokenResponse {
   access_token: string
@@ -25,8 +25,28 @@ export function fetchCurrentUser(): Promise<CurrentUser> {
   return apiFetch<CurrentUser>('/api/v1/auth/me')
 }
 
+let refreshPromise: Promise<AccessTokenResponse> | null = null
+
 export function refresh(): Promise<AccessTokenResponse> {
-  return apiFetch<AccessTokenResponse>('/api/v1/auth/refresh', { method: 'POST' })
+    if (refreshPromise) {
+        return refreshPromise
+    }
+
+    refreshPromise = (async () => {
+        try {
+            const response = await apiFetch<AccessTokenResponse>('/api/v1/auth/refresh', { method: 'POST' })
+
+            if (response && response.access_token) {
+                setAccessToken(response.access_token)
+            }
+
+            return response
+        } finally {
+            refreshPromise = null
+        }
+    })()
+
+    return refreshPromise
 }
 
 export function logout(): Promise<void> {
