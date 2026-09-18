@@ -91,7 +91,7 @@ export function ProductsPage() {
   const [error, setError] = useState<string | null>(null)
     const [showForm, setShowForm] = useState(false)
     const [selectedStoreId, setSelectedStoreId] = useState<number | null>(null)
-    const [availableStores, setAvailableStores] = useState<{ id: number; name: string }[]>([{ id: 1, name: 'Main Street Branch' }])
+    const [availableStores, setAvailableStores] = useState<{ id: number; name: string }[]>([{ id: 2, name: 'Main Street Branch' }])
 
 
   async function load() {
