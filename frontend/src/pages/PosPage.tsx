@@ -193,7 +193,6 @@ export function PosPage() {
             value={scanValue}
             onChange={(e) => setScanValue(e.target.value)}
             onKeyDown={handleScanSubmit}
-            onBlur={() => scannerInputRef.current?.focus()}
             className="mt-1 w-full rounded border border-gray-300 px-3 py-2 font-mono text-sm focus:border-blue-500 focus:outline-none"
             placeholder="Ready to scan…"
             autoFocus
