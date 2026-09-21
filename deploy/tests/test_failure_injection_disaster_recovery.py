@@ -544,7 +544,18 @@ scrape_configs:
         prom_url = f"http://127.0.0.1:{PROMETHEUS_PORT + port_offset}"
 
         def _target_up(job: str) -> bool:
+            # Prometheus returns a plain-text 503 ("Service Unavailable")
+            # on every API endpoint, not JSON, while it is still loading
+            # its TSDB at startup -- calling .json() unconditionally here
+            # used to raise JSONDecodeError and crash the whole test
+            # instead of letting the retry loop below wait it out. Found
+            # as a real, reproducible failure at full deploy/tests/ suite
+            # scale (higher sandbox load makes Prometheus's startup
+            # window wide enough to actually land on), never in this
+            # file alone or paired with just one other file.
             resp = httpx.get(f"{prom_url}/api/v1/targets", timeout=3.0)
+            if resp.status_code != 200:
+                return False
             targets = resp.json()["data"]["activeTargets"]
             return any(t["labels"]["job"] == job and t["health"] == "up" for t in targets)
 
@@ -561,10 +572,13 @@ scrape_configs:
         fired = False
         while time.monotonic() < deadline:
             resp = httpx.get(f"{prom_url}/api/v1/alerts", timeout=3.0)
-            states = {a["labels"]["alertname"]: a["state"] for a in resp.json()["data"]["alerts"]}
-            if states.get("ERPMonitoringTargetDown") == "firing":
-                fired = True
-                break
+            if resp.status_code == 200:
+                states = {
+                    a["labels"]["alertname"]: a["state"] for a in resp.json()["data"]["alerts"]
+                }
+                if states.get("ERPMonitoringTargetDown") == "firing":
+                    fired = True
+                    break
             time.sleep(1.0)
         assert fired, "ERPMonitoringTargetDown never fired after erp_exporter was killed"
 
@@ -592,10 +606,11 @@ scrape_configs:
         resolved = False
         while time.monotonic() < deadline:
             resp = httpx.get(f"{prom_url}/api/v1/alerts", timeout=3.0)
-            names = {a["labels"]["alertname"] for a in resp.json()["data"]["alerts"]}
-            if "ERPMonitoringTargetDown" not in names:
-                resolved = True
-                break
+            if resp.status_code == 200:
+                names = {a["labels"]["alertname"] for a in resp.json()["data"]["alerts"]}
+                if "ERPMonitoringTargetDown" not in names:
+                    resolved = True
+                    break
             time.sleep(1.0)
         assert resolved, "ERPMonitoringTargetDown never cleared after erp_exporter recovered"
     finally:

@@ -35,6 +35,13 @@ PG_URL="${DB_URL/postgresql+psycopg:/postgresql:}"
 
 echo "Backing up ${DB_NAME} to ${OUTPUT_FILE} ..."
 pg_dump -Fc -f "$OUTPUT_FILE" "$PG_URL"
+# M13 Phase 18: pg_dump creates its output under the invoking process's
+# umask -- typically 0644/0664, world- or group-readable. This file is
+# the full plaintext database (every table, unencrypted) until
+# backup_offbox.sh encrypts it, so it must never be readable by any OS
+# user other than whoever owns it (found as a real gap: a default
+# umask leaves every local backup world-readable).
+chmod 600 "$OUTPUT_FILE"
 echo "Backup complete: $(du -h "$OUTPUT_FILE" | cut -f1) at ${OUTPUT_FILE}"
 echo
 echo "Retention is operator-managed in M12 (no automatic rotation/off-box"

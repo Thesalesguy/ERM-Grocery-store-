@@ -39,6 +39,10 @@ rclone copy "${RCLONE_REMOTE}/${MANIFEST_FILENAME}" "$STAGING_DIR" --checksum
 echo "=== 2/4: decrypt ==="
 DECRYPTED_FILE="${STAGING_DIR}/${DUMP_BASENAME}"
 age -d -i "$AGE_IDENTITY_FILE" -o "$DECRYPTED_FILE" "${STAGING_DIR}/${ENCRYPTED_FILENAME}"
+# M13 Phase 18: same reasoning as backup_database.sh's chmod -- this is
+# the full plaintext database, created under the invoking process's
+# umask (typically world/group-readable) the moment `age` writes it.
+chmod 600 "$DECRYPTED_FILE"
 
 echo "=== 3/4: verify checksum against the manifest — REFUSE if it doesn't match ==="
 EXPECTED_CHECKSUM="$(python3 -c "import json; print(json.load(open('${STAGING_DIR}/${MANIFEST_FILENAME}'))['sha256_plaintext'])")"
