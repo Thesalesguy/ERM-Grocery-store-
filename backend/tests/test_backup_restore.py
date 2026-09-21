@@ -81,9 +81,9 @@ def _owner_url(db_name: str) -> str:
 
 def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
     result = subprocess.run(cmd, capture_output=True, text=True, **kwargs)
-    assert result.returncode == 0, (
-        f"command failed: {' '.join(cmd)}\nstdout: {result.stdout}\nstderr: {result.stderr}"
-    )
+    assert (
+        result.returncode == 0
+    ), f"command failed: {' '.join(cmd)}\nstdout: {result.stdout}\nstderr: {result.stderr}"
     return result
 
 

@@ -30,7 +30,9 @@ def test_a_wrong_database_password_fails_closed_without_leaking_the_password() -
     message -- which app/api/v1/endpoints/health.py's health_db and
     app/core/exceptions.py's catch-all handler both log via
     logger.exception -- must never contain the password itself."""
-    wrong_password = "totally-wrong-password-xyz-99"  # noqa: S105 -- test fixture, not a real secret
+    wrong_password = (
+        "totally-wrong-password-xyz-99"  # noqa: S105 -- test fixture, not a real secret
+    )
     engine = create_engine(f"postgresql+psycopg://erp_app:{wrong_password}@localhost:5432/erp_dev")
     with pytest.raises(SQLAlchemyError) as exc_info:
         with engine.connect() as conn:

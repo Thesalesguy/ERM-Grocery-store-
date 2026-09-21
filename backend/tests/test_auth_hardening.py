@@ -170,9 +170,9 @@ def test_concurrent_refresh_with_same_token_never_yields_two_sessions() -> None:
         # committed rows (store/user/tokens/audit entries) in place
         # rather than fighting the very immutability this milestone
         # verified elsewhere.
-        assert results.count("success") == 1, (
-            f"exactly one concurrent refresh of the same token must succeed, got {results}"
-        )
+        assert (
+            results.count("success") == 1
+        ), f"exactly one concurrent refresh of the same token must succeed, got {results}"
         assert results.count("rejected") == 1
 
         # Reuse-detection must have fired: the row lock forces the loser
