@@ -77,9 +77,9 @@ def test_cashier_cannot_access_any_report_endpoint(client: TestClient, db: Sessi
 
     for method, path, params in _REPORT_ENDPOINTS:
         response = client.request(method, path, params=params, headers=headers)
-        assert (
-            response.status_code == 403
-        ), f"{path} should be 403 for CASHIER, got {response.status_code}"
+        assert response.status_code == 403, (
+            f"{path} should be 403 for CASHIER, got {response.status_code}"
+        )
 
 
 def test_inventory_clerk_can_reach_inventory_and_purchasing_but_not_sales_or_financial_or_payroll(
@@ -149,9 +149,9 @@ def test_auditor_can_read_every_report_domain(client: TestClient, db: Session) -
 
     for method, path, params in _REPORT_ENDPOINTS:
         response = client.request(method, path, params=params, headers=headers)
-        assert (
-            response.status_code == 200
-        ), f"{path} should be 200 for AUDITOR, got {response.status_code}: {response.text}"
+        assert response.status_code == 200, (
+            f"{path} should be 200 for AUDITOR, got {response.status_code}: {response.text}"
+        )
 
 
 def test_manager_can_read_every_report_domain(client: TestClient, db: Session) -> None:
@@ -163,9 +163,9 @@ def test_manager_can_read_every_report_domain(client: TestClient, db: Session) -
 
     for method, path, params in _REPORT_ENDPOINTS:
         response = client.request(method, path, params=params, headers=headers)
-        assert (
-            response.status_code == 200
-        ), f"{path} should be 200 for MANAGER, got {response.status_code}: {response.text}"
+        assert response.status_code == 200, (
+            f"{path} should be 200 for MANAGER, got {response.status_code}: {response.text}"
+        )
 
 
 # --- Cross-store isolation at the route layer -------------------------------

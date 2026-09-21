@@ -1481,8 +1481,7 @@ def create_supplier_credit_note(
         po = db.get(PurchaseOrder, purchase_return.purchase_order_id)
         if po is None or po.supplier_id != supplier_id:
             raise ConflictError(
-                f"Purchase return {purchase_return_id} does not belong to supplier "
-                f"{supplier_id}",
+                f"Purchase return {purchase_return_id} does not belong to supplier {supplier_id}",
                 error_code="SUPPLIER_MISMATCH",
             )
         return_value = sum(

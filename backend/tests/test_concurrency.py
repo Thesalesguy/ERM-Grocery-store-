@@ -474,9 +474,9 @@ def test_two_concurrent_multi_item_sales_with_lines_in_different_order_do_not_de
         thread_b.join(timeout=15)
 
         outcomes = [result_a, result_b]
-        assert all(
-            r.unexpected_error is None for r in outcomes
-        ), f"a deadlock or other unexpected error occurred: {outcomes}"
+        assert all(r.unexpected_error is None for r in outcomes), (
+            f"a deadlock or other unexpected error occurred: {outcomes}"
+        )
         # Plenty of stock (5 each, only 1 requested each) — both sales
         # should succeed; the point of this test is deadlock-freedom, not
         # stock contention (that's tests A/B/D above).

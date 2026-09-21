@@ -397,9 +397,9 @@ def test_e_multi_item_receipt_with_reversed_line_order_does_not_deadlock() -> No
         thread_b.join(timeout=15)
 
         outcomes = [result_a, result_b]
-        assert all(
-            r.unexpected_error is None for r in outcomes
-        ), f"a deadlock or other unexpected error occurred: {outcomes}"
+        assert all(r.unexpected_error is None for r in outcomes), (
+            f"a deadlock or other unexpected error occurred: {outcomes}"
+        )
         assert all(r.succeeded for r in outcomes), outcomes
 
 
