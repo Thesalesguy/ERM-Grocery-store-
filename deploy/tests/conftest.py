@@ -137,4 +137,29 @@ def production_stack() -> Generator[dict, None, None]:
         except subprocess.TimeoutExpired:
             uvicorn_proc.kill()
         uvicorn_log.close()
+
+        # Several test files (test_connectivity_failure.py, test_H in
+        # test_integrated_production_session.py, and Phase 17's
+        # test_duplicate_sale_retry_survives_a_backend_restart /
+        # test_concurrent_sale_requests_during_service_recovery)
+        # deliberately kill and restart the backend mid-module via their
+        # own pgrep/kill-based helpers to simulate a real crash+recovery
+        # -- the replacement process they start is a fresh, untracked
+        # subprocess.Popen that `uvicorn_proc` above never has a handle
+        # to, so terminating only `uvicorn_proc` can leave that
+        # replacement running after the module ends (found as a real
+        # leak: it survived into the next pytest invocation and
+        # collided with the next module's own port-8000 bind). This is
+        # the same safety-net sweep those helpers already use on
+        # themselves, applied once more here so no module can leave one
+        # behind regardless of which test last restarted it.
+        leftover = subprocess.run(
+            ["pgrep", "-f", "uvicorn app.main:app.*--port 8000"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        for pid in leftover.stdout.split():
+            subprocess.run(["kill", "-TERM", pid], stderr=subprocess.DEVNULL, check=False)
+
         shutil.rmtree(cert_dir, ignore_errors=True)
