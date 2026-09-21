@@ -481,7 +481,7 @@ either).
 
 ## 14. Operational runbooks
 
-`docs/RUNBOOKS.md`, one section per required scenario, each with
+`docs/M13_PRODUCTION_RUNBOOKS.md`, one section per required scenario, each with
 symptoms/immediate checks/safe actions/dangerous actions/recovery/
 verification. Never a first-line "mutate accounting/inventory tables
 directly" step — every financial/inventory runbook's recovery path

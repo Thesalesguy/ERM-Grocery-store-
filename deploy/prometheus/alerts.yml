@@ -2,7 +2,7 @@
 # `expr`), severity (a label), and the operator action it expects (the
 # `action` annotation) -- the task's own explicit requirement, and the
 # discipline against "an alert that is impossible to act upon": each
-# `action` names a real runbook in docs/RUNBOOKS.md (M13 Phase 14), not
+# `action` names a real runbook in docs/M13_PRODUCTION_RUNBOOKS.md (M13 Phase 14), not
 # a vague "investigate".
 groups:
   - name: erp_availability
@@ -14,7 +14,7 @@ groups:
           severity: critical
         annotations:
           summary: "The API is not responding to GET /health"
-          action: "docs/RUNBOOKS.md #1 Application unavailable"
+          action: "docs/M13_PRODUCTION_RUNBOOKS.md #1 Application unavailable"
 
       - alert: ERPDatabaseDown
         expr: erp_db_up == 0
@@ -23,7 +23,7 @@ groups:
           severity: critical
         annotations:
           summary: "The API cannot reach PostgreSQL (GET /health/db failing)"
-          action: "docs/RUNBOOKS.md #2 Database unavailable"
+          action: "docs/M13_PRODUCTION_RUNBOOKS.md #2 Database unavailable"
 
       - alert: ERPMigrationMismatch
         expr: erp_migration_current == 0
@@ -32,7 +32,7 @@ groups:
           severity: warning
         annotations:
           summary: "Deployed code's migration head does not match the database's applied version"
-          action: "docs/RUNBOOKS.md #6 Migration failure"
+          action: "docs/M13_PRODUCTION_RUNBOOKS.md #6 Migration failure"
 
       - alert: ERPApiRecentlyDown
         expr: min_over_time(erp_api_up[5m]) == 0 and erp_api_up == 1
@@ -40,7 +40,7 @@ groups:
           severity: warning
         annotations:
           summary: "The API was down at some point in the last 5 minutes and has since recovered -- a restart or crash likely occurred"
-          action: "docs/RUNBOOKS.md #1 Application unavailable -- review why it restarted even though it is up now"
+          action: "docs/M13_PRODUCTION_RUNBOOKS.md #1 Application unavailable -- review why it restarted even though it is up now"
 
   - name: erp_backup
     rules:
@@ -51,7 +51,7 @@ groups:
           severity: critical
         annotations:
           summary: "The last off-box backup attempt failed"
-          action: "docs/RUNBOOKS.md #4 Backup failure"
+          action: "docs/M13_PRODUCTION_RUNBOOKS.md #4 Backup failure"
 
       - alert: ERPBackupStale
         expr: (time() - erp_backup_last_run_timestamp_seconds) > 90000
@@ -59,7 +59,7 @@ groups:
           severity: warning
         annotations:
           summary: "No backup has run in over 25 hours (expected: nightly)"
-          action: "docs/RUNBOOKS.md #4 Backup failure -- check the backup cron/timer itself is still scheduled"
+          action: "docs/M13_PRODUCTION_RUNBOOKS.md #4 Backup failure -- check the backup cron/timer itself is still scheduled"
 
   - name: erp_resources
     rules:
@@ -70,7 +70,7 @@ groups:
           severity: critical
         annotations:
           summary: "Less than 10% disk space remaining on {{ $labels.mountpoint }}"
-          action: "docs/RUNBOOKS.md #3 Disk full"
+          action: "docs/M13_PRODUCTION_RUNBOOKS.md #3 Disk full"
 
       - alert: ERPMemoryLow
         expr: (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) < 0.10
@@ -79,7 +79,7 @@ groups:
           severity: warning
         annotations:
           summary: "Less than 10% memory available"
-          action: "Investigate memory usage per process (ps aux --sort=-%mem); restart the backend if it is the cause (docs/RUNBOOKS.md #1)"
+          action: "Investigate memory usage per process (ps aux --sort=-%mem); restart the backend if it is the cause (docs/M13_PRODUCTION_RUNBOOKS.md #1)"
 
       - alert: ERPDatabaseConnectionsNearExhaustion
         # postgres_exporter's pg_stat_activity_count is broken out per
@@ -92,7 +92,7 @@ groups:
           severity: warning
         annotations:
           summary: "Over 80% of PostgreSQL's max_connections are in use"
-          action: "docs/RUNBOOKS.md #2 Database unavailable -- identify and terminate stuck/idle-in-transaction connections before they exhaust the pool entirely"
+          action: "docs/M13_PRODUCTION_RUNBOOKS.md #2 Database unavailable -- identify and terminate stuck/idle-in-transaction connections before they exhaust the pool entirely"
 
   - name: erp_security
     rules:
@@ -103,7 +103,7 @@ groups:
           severity: warning
         annotations:
           summary: "Over 5% of requests are returning 5xx in the last 5 minutes"
-          action: "docs/RUNBOOKS.md #15 High error rate"
+          action: "docs/M13_PRODUCTION_RUNBOOKS.md #15 High error rate"
 
       - alert: ERPElevatedAuthFailureRate
         expr: increase(erp_auth_failures_total[5m]) > 20
@@ -111,7 +111,7 @@ groups:
           severity: warning
         annotations:
           summary: "More than 20 failed logins in 5 minutes -- possible credential-stuffing attempt"
-          action: "docs/RUNBOOKS.md #7 Authentication incident"
+          action: "docs/M13_PRODUCTION_RUNBOOKS.md #7 Authentication incident"
 
       - alert: ERPRefreshTokenReuseDetected
         expr: increase(erp_auth_reuse_detected_total[5m]) > 0
@@ -119,7 +119,7 @@ groups:
           severity: critical
         annotations:
           summary: "A refresh-token reuse (compromise signal) was detected -- sessions were force-revoked automatically"
-          action: "docs/RUNBOOKS.md #7 Authentication incident -- confirm the affected account, consider requiring a password reset"
+          action: "docs/M13_PRODUCTION_RUNBOOKS.md #7 Authentication incident -- confirm the affected account, consider requiring a password reset"
 
       - alert: ERPElevatedRateLimitEvents
         expr: increase(erp_nginx_requests_429_total[5m]) > 50
@@ -135,7 +135,7 @@ groups:
           severity: warning
         annotations:
           summary: "Over 20 requests slower than 1s in the last 5 minutes"
-          action: "docs/RUNBOOKS.md #15 High error rate -- check erp_db_up and pg_stat_activity_count first (a slow DB is the most likely cause)"
+          action: "docs/M13_PRODUCTION_RUNBOOKS.md #15 High error rate -- check erp_db_up and pg_stat_activity_count first (a slow DB is the most likely cause)"
 
   - name: erp_monitoring_self
     rules:
@@ -157,4 +157,4 @@ groups:
           severity: warning
         annotations:
           summary: "Monitoring target {{ $labels.job }} has not been scraped successfully"
-          action: "docs/RUNBOOKS.md #16 Monitoring component down -- restart the named exporter; other alerts for what it measures cannot be trusted while it is down"
+          action: "docs/M13_PRODUCTION_RUNBOOKS.md #16 Monitoring component down -- restart the named exporter; other alerts for what it measures cannot be trusted while it is down"

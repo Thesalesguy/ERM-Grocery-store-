@@ -1,6 +1,6 @@
 # Operational Runbooks
 
-M13 Phase 14. Fifteen scenarios, each stating: **Symptoms** (how you'd
+M13 Phases 14, 17-18. Sixteen scenarios, each stating: **Symptoms** (how you'd
 notice), **Immediate checks** (what to look at first, read-only),
 **Safe actions** (what you may do), **Dangerous actions** (what you
 must NOT do), **Recovery**, **Verification** (how you know it's

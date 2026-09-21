@@ -57,7 +57,7 @@ write a NEW test only for a genuine gap.
                                                  its own death produces silence, not a firing
                                                  alert). Fixed by adding ERPMonitoringTargetDown
                                                  to deploy/prometheus/alerts.yml and
-                                                 docs/RUNBOOKS.md Section 16.
+                                                 docs/M13_PRODUCTION_RUNBOOKS.md Section 16.
  12. Disk-pressure condition                -> NEW: test_backup_fails_cleanly_under_disk_pressure
                                                  below.
  13. Invalid production secret/
