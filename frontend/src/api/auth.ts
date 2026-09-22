@@ -28,25 +28,27 @@ export function fetchCurrentUser(): Promise<CurrentUser> {
 let refreshPromise: Promise<AccessTokenResponse> | null = null
 
 export function refresh(): Promise<AccessTokenResponse> {
-    if (refreshPromise) {
-        return refreshPromise
-    }
-
-    refreshPromise = (async () => {
-        try {
-            const response = await apiFetch<AccessTokenResponse>('/api/v1/auth/refresh', { method: 'POST' })
-
-            if (response && response.access_token) {
-                setAccessToken(response.access_token)
-            }
-
-            return response
-        } finally {
-            refreshPromise = null
-        }
-    })()
-
+  if (refreshPromise) {
     return refreshPromise
+  }
+
+  refreshPromise = (async () => {
+    try {
+      const response = await apiFetch<AccessTokenResponse>('/api/v1/auth/refresh', {
+        method: 'POST',
+      })
+
+      if (response && response.access_token) {
+        setAccessToken(response.access_token)
+      }
+
+      return response
+    } finally {
+      refreshPromise = null
+    }
+  })()
+
+  return refreshPromise
 }
 
 export function logout(): Promise<void> {
