@@ -81,6 +81,38 @@ def authenticate_user(db: Session, username: str, password: str) -> User:
     return user
 
 
+def verify_user_credentials(db: Session, username: str, password: str) -> User | None:
+    """A non-raising sibling of `authenticate_user`, for inline
+    identity-verification INSIDE another operation's own transaction
+    (M14, app.modules.sales.service's return/void approval gate) rather
+    than as a standalone login.
+
+    Deliberately NOT a thin wrapper around `authenticate_user`: that
+    function commits immediately and logs a `LOGIN_FAILURE` audit event
+    on failure — correct for an actual login attempt, but both would be
+    wrong here. A premature commit here would commit whatever the
+    caller's own in-progress transaction had already flushed (nothing,
+    if callers check approval before their first `db.add`, as
+    create_sale_return does — but this function must not assume that of
+    every future caller). And "LOGIN_FAILURE" would mislabel a failed
+    approval attempt as a failed login in the audit trail. Callers own
+    their own audit logging and commit timing; this function only
+    verifies and returns.
+
+    Reuses `verify_password` and the same dummy-hash timing-safety idiom
+    as `authenticate_user` (a nonexistent/inactive username must take the
+    same time as a wrong password for a real one), so this new
+    credential-check surface has the identical timing characteristics as
+    login rather than a weaker, hand-rolled comparison.
+    """
+    user = db.execute(select(User).where(User.username == username)).scalar_one_or_none()
+    hash_to_check = user.password_hash if user is not None else _DUMMY_PASSWORD_HASH
+    password_ok = verify_password(password, hash_to_check)
+    if user is None or not user.is_active or not password_ok:
+        return None
+    return user
+
+
 def login(
     db: Session,
     *,

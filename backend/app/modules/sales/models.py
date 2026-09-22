@@ -195,12 +195,22 @@ class SaleReturn(TimestampMixin, Base):
     refund_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     processed_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
     # Manager/admin approval gate for returns above a configurable
-    # threshold (docs/TECHNICAL_BLUEPRINT.md assumption #5). NULL means
-    # not (yet) approved — enforcement of the threshold itself is
-    # application logic for a later milestone, not a DB constraint.
-    # Still deferred in M5 (docs/M5_RETURNS_VOIDS_REFUNDS.md "Known
-    # limitations") — every M5 return leaves this NULL.
+    # threshold (docs/TECHNICAL_BLUEPRINT.md assumption #5). Deferred from
+    # M5 through M13 (docs/M5_RETURNS_VOIDS_REFUNDS.md "Known
+    # limitations") -- every pre-M14 return left this NULL. M14
+    # (docs/M14_DESIGN.md) enforces it: this holds the verified approving
+    # user's id whenever `approval_required` is true, and stays NULL when
+    # it's false (the store had no threshold configured, or this return's
+    # amount was below it).
     approved_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    # M14: frozen at creation time, like every other financial fact on
+    # this row (BR-2) -- whether THIS return, at the moment it was
+    # created, was subject to the store's approval threshold. Recording
+    # this (rather than re-deriving it later from the store's current
+    # threshold, which can change) means a later threshold edit can never
+    # retroactively make an already-approved return look unapproved, or
+    # vice versa.
+    approval_required: Mapped[bool] = mapped_column(nullable=False, default=False)
 
     items: Mapped[list["SaleReturnItem"]] = relationship(back_populates="sale_return")
 

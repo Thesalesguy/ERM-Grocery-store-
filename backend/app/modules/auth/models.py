@@ -7,6 +7,7 @@ app.modules.auth.service — see the module docstring in __init__.py.
 """
 
 from datetime import datetime
+from decimal import Decimal
 
 from sqlalchemy import (
     Boolean,
@@ -14,6 +15,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Numeric,
     String,
     UniqueConstraint,
 )
@@ -28,6 +30,10 @@ class Store(TimestampMixin, Base):
         CheckConstraint(
             "attendance_day_boundary_hour >= 0 AND attendance_day_boundary_hour <= 23",
             name="ck_stores_attendance_day_boundary_hour",
+        ),
+        CheckConstraint(
+            "return_approval_threshold_amount IS NULL OR return_approval_threshold_amount >= 0",
+            name="ck_stores_return_approval_threshold_non_negative",
         ),
     )
 
@@ -49,6 +55,20 @@ class Store(TimestampMixin, Base):
     # established convention) converted into this store's own
     # `timezone` — never the server's local clock.
     attendance_day_boundary_hour: Mapped[int] = mapped_column(nullable=False, default=0)
+
+    # M14 (docs/M14_DESIGN.md): per-store return/void approval threshold,
+    # following the exact same precedent as attendance_day_boundary_hour
+    # above -- store configuration lives as a typed column on Store, never
+    # a generic settings table (no such table exists in this repository;
+    # TECHNICAL_BLUEPRINT.md's Section C.7 `store_settings` sketch was
+    # never actually built). NULL (the default) means no threshold is
+    # configured for this store -- the M14 approval gate is inactive and
+    # every return/void behaves exactly as it did before M14. This is
+    # deliberately NOT a seeded dollar amount: no business evidence exists
+    # in this repository for what that amount should be, so production
+    # must explicitly set one (Numeric(12, 2), same precision as every
+    # other stored money amount in this system).
+    return_approval_threshold_amount: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
 
     users: Mapped[list["User"]] = relationship(back_populates="store")
 

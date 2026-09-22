@@ -43,6 +43,18 @@ ACCOUNTING_ADMIN = "accounting.admin"
 SALES_RETURN_READ = "sales.return.read"
 SALES_RETURN_WRITE = "sales.return.write"
 SALES_VOID = "sales.void"
+# M14 (docs/M14_DESIGN.md): a distinct permission from sales.void —
+# sales.void gates INITIATING a void (already Manager/Admin-only);
+# sales.return.approve gates being the SECOND user who authorizes another
+# user's return/void once its amount reaches the store's configured
+# approval threshold. Kept separate (mirrors the read/write/heavier-
+# action split used everywhere else in this matrix — count.review vs.
+# count.post, supply_chain.approve vs. .execute) so a role could
+# plausibly hold one without the other, and so a Manager voiding a sale
+# above threshold still needs a second Manager or an Admin to approve it
+# — the same self-approval boundary this permission's holder is subject
+# to is enforced in app.modules.sales.service, not by this grant alone.
+SALES_RETURN_APPROVE = "sales.return.approve"
 # M6 (docs/M6_AP_VENDOR_ACCOUNTING.md "RBAC"): four minimal AP permissions,
 # not a reuse of accounting.reverse/accounting.post — mirrors the M5
 # read/write/(heavier action) split. ap.write covers creating a DRAFT
@@ -189,6 +201,10 @@ ALL_PERMISSIONS: dict[str, str] = {
     SALES_RETURN_READ: "View sale returns and return eligibility",
     SALES_RETURN_WRITE: "Process a merchandise return against a completed sale",
     SALES_VOID: "Void an entire completed sale (a full return of every line in one action)",
+    SALES_RETURN_APPROVE: (
+        "Approve another user's return/void once its amount reaches the store's "
+        "configured approval threshold"
+    ),
     AP_READ: "View supplier invoices, AP balances, aging, and Purchase Clearing reconciliation",
     AP_WRITE: "Create a draft supplier invoice",
     AP_POST: (
@@ -266,6 +282,7 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         SALES_RETURN_READ,
         SALES_RETURN_WRITE,
         SALES_VOID,
+        SALES_RETURN_APPROVE,
         AP_READ,
         AP_WRITE,
         AP_POST,

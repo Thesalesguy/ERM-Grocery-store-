@@ -41,11 +41,20 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, NoResultFound
 from sqlalchemy.orm import Session, selectinload
 
-from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationAppError
+from app.core.exceptions import (
+    ConflictError,
+    ForbiddenError,
+    NotFoundError,
+    UnauthorizedError,
+    ValidationAppError,
+)
+from app.core.rate_limit import approval_rate_limiter
 from app.modules.accounting import service as accounting_service
 from app.modules.accounting.service import SaleReturnLineEffect
 from app.modules.audit import service as audit_service
+from app.modules.auth import service as auth_service
 from app.modules.auth.models import Store
+from app.modules.auth.permissions import SALES_RETURN_APPROVE
 from app.modules.inventory import service as inventory_service
 from app.modules.products.models import Product
 from app.modules.sales.models import (
@@ -519,6 +528,180 @@ def _proportional_share(
     return entitled_after - entitled_before
 
 
+def _compute_line_refund(
+    sale_item: SaleItem, requested_qty: Decimal
+) -> tuple[Decimal, Decimal, Decimal, Decimal]:
+    """Returns (refund_price, discount_refunded, tax_refunded,
+    line_refund_amount) for returning `requested_qty` of `sale_item`.
+    Pure — reads only the frozen SaleItem fields already loaded, no DB
+    write. Factored out (M14, docs/M14_DESIGN.md) so the SAME computation
+    both (a) decides whether the M14 approval gate applies, before any
+    row is created, and (b) produces the SaleReturnItem actually posted —
+    the amount a manager approves and the amount that posts are
+    guaranteed identical by construction, not by convention.
+    """
+    already_returned = sale_item.quantity_returned
+    refund_price = _round_money(sale_item.unit_price_at_sale * requested_qty)
+    discount_refunded = _proportional_share(
+        total=sale_item.discount_amount,
+        original_qty=sale_item.quantity,
+        already_returned_qty=already_returned,
+        this_return_qty=requested_qty,
+    )
+    tax_refunded = _proportional_share(
+        total=sale_item.tax_amount,
+        original_qty=sale_item.quantity,
+        already_returned_qty=already_returned,
+        this_return_qty=requested_qty,
+    )
+    line_refund_amount = refund_price - discount_refunded + tax_refunded
+    return refund_price, discount_refunded, tax_refunded, line_refund_amount
+
+
+def _resolve_return_approval(
+    db: Session,
+    *,
+    store: Store,
+    refund_amount: Decimal,
+    initiating_user_id: int | None,
+    approver_username: str | None,
+    approver_password: str | None,
+    ip_address: str | None,
+    user_agent: str | None,
+) -> tuple[bool, int | None]:
+    """The M14 approval gate (docs/M14_DESIGN.md). Returns
+    (approval_required, approved_by) for the caller to freeze onto the
+    new SaleReturn row. Raises before any SaleReturn/SaleReturnItem row
+    is created (create_sale_return calls this before its first db.add),
+    so a rejected approval leaves nothing to roll back — no orphaned
+    approval state, no partially-authorized financial operation.
+
+    Threshold semantics: `refund_amount >= store.return_approval_threshold_amount`
+    ("at or above" — see docs/M14_DESIGN.md "Boundary semantics" for why
+    this, not `>`, is the intended boundary). A NULL threshold means the
+    gate is inactive for this store (pre-M14 behavior, unchanged).
+    """
+    threshold = store.return_approval_threshold_amount
+    if threshold is None or refund_amount < threshold:
+        return False, None
+
+    if not approver_username or not approver_password:
+        raise ForbiddenError(
+            "This operation totals "
+            f"{refund_amount} which is at or above this store's approval threshold "
+            f"of {threshold}; a manager/admin approver's credentials are required",
+            error_code="APPROVAL_REQUIRED",
+        )
+
+    approver = auth_service.verify_user_credentials(db, approver_username, approver_password)
+    if approver is None:
+        audit_service.log_event(
+            db,
+            user_id=None,
+            action="SALE_RETURN_APPROVAL_FAILED",
+            entity_type="store",
+            entity_id=store.id,
+            after={
+                "attempted_approver_username": approver_username,
+                "reason": "invalid_credentials",
+                "refund_amount": refund_amount,
+                "threshold": threshold,
+            },
+            ip_address=ip_address,
+            user_agent=user_agent,
+        )
+        db.commit()
+        raise UnauthorizedError(
+            "Invalid approver credentials", error_code="INVALID_APPROVER_CREDENTIALS"
+        )
+
+    if approver.id == initiating_user_id:
+        audit_service.log_event(
+            db,
+            user_id=approver.id,
+            action="SALE_RETURN_APPROVAL_FAILED",
+            entity_type="store",
+            entity_id=store.id,
+            after={
+                "reason": "self_approval_not_allowed",
+                "refund_amount": refund_amount,
+                "threshold": threshold,
+            },
+            ip_address=ip_address,
+            user_agent=user_agent,
+        )
+        db.commit()
+        raise ForbiddenError(
+            "The user who initiated this return/void cannot also approve it — a "
+            "different manager or admin must approve",
+            error_code="SELF_APPROVAL_NOT_ALLOWED",
+        )
+
+    approver_permissions = auth_service.get_user_permissions(db, approver.id)
+    if SALES_RETURN_APPROVE not in approver_permissions:
+        audit_service.log_event(
+            db,
+            user_id=approver.id,
+            action="SALE_RETURN_APPROVAL_FAILED",
+            entity_type="store",
+            entity_id=store.id,
+            after={
+                "reason": "approval_permission_denied",
+                "refund_amount": refund_amount,
+                "threshold": threshold,
+            },
+            ip_address=ip_address,
+            user_agent=user_agent,
+        )
+        db.commit()
+        raise ForbiddenError(
+            "This user does not hold return/void approval authority",
+            error_code="APPROVAL_PERMISSION_DENIED",
+        )
+
+    try:
+        _enforce_store_access(approver.store_id, store.id, "this store's return approvals")
+    except ForbiddenError:
+        audit_service.log_event(
+            db,
+            user_id=approver.id,
+            action="SALE_RETURN_APPROVAL_FAILED",
+            entity_type="store",
+            entity_id=store.id,
+            after={
+                "reason": "approval_store_access_denied",
+                "approver_store_id": approver.store_id,
+                "refund_amount": refund_amount,
+                "threshold": threshold,
+            },
+            ip_address=ip_address,
+            user_agent=user_agent,
+        )
+        db.commit()
+        raise
+
+    audit_service.log_event(
+        db,
+        user_id=approver.id,
+        action="SALE_RETURN_APPROVAL_GRANTED",
+        entity_type="store",
+        entity_id=store.id,
+        after={
+            "initiating_user_id": initiating_user_id,
+            "refund_amount": refund_amount,
+            "threshold": threshold,
+        },
+        ip_address=ip_address,
+        user_agent=user_agent,
+    )
+    # A legitimate manager who mistyped their own password a couple of
+    # times before succeeding shouldn't stay throttled afterward — mirrors
+    # login_rate_limiter's own reset-on-success behavior exactly.
+    if ip_address:
+        approval_rate_limiter.reset(ip_address)
+    return True, approver.id
+
+
 def _match_or_reject_idempotent_return(
     db: Session,
     *,
@@ -585,13 +768,16 @@ def create_sale_return(
     ip_address: str | None = None,
     user_agent: str | None = None,
     _is_void: bool = False,
+    approver_username: str | None = None,
+    approver_password: str | None = None,
 ) -> SaleReturn:
     """Atomically: idempotency fast path -> validate -> lock the Sale row
-    -> validate sale/line state -> lock affected product rows (restocked
-    lines only, sorted, deadlock-safe) -> compute refund per line from
-    frozen sale data -> post one inventory movement + WAC recompute per
-    restocked line -> update quantity_returned -> advance Sale.status ->
-    audit -> post accounting -> return (caller commits).
+    -> validate sale/line state -> compute the refund total and check the
+    M14 approval gate (docs/M14_DESIGN.md) -> lock affected product rows
+    (restocked lines only, sorted, deadlock-safe) -> compute refund per
+    line from frozen sale data -> post one inventory movement + WAC
+    recompute per restocked line -> update quantity_returned -> advance
+    Sale.status -> audit -> post accounting -> return (caller commits).
 
     `client_transaction_id` idempotency (mirrors finalize_sale/
     receive_goods exactly) is extended here per M5 task Section 8: a
@@ -601,6 +787,13 @@ def create_sale_return(
     return) is rejected with IDEMPOTENCY_KEY_CONFLICT rather than
     silently returning an unrelated result or silently creating a second
     one.
+
+    M14: `approver_username`/`approver_password` are only consulted if
+    the computed refund total requires approval (see
+    _resolve_return_approval) — the approval check runs, and can raise,
+    BEFORE the first `db.add` below, so a rejected approval creates
+    nothing (no SaleReturn, no SaleReturnItem, no inventory movement, no
+    journal entry) for the caller's rollback/no-commit to undo.
     """
     if refund_method not in PAYMENT_METHODS:
         raise ValidationAppError(
@@ -714,6 +907,35 @@ def create_sale_return(
                 error_code="EXCESSIVE_RETURN_QUANTITY",
             )
 
+    # --- M14 approval gate (docs/M14_DESIGN.md): compute the exact refund
+    # total this request would produce, purely from the already-resolved,
+    # already-locked-via-Sale SaleItem data above — no mutation has
+    # happened yet, so this is safe to compute (and to raise out of)
+    # before any product lock or row creation. The SAME per-line helper
+    # is called again in the posting loop below for the SAME items/
+    # quantities, so the amount approved here and the amount posted below
+    # are always identical. -----------------------------------------------
+    store = db.get(Store, store_id)
+    if store is None:
+        raise NotFoundError(f"Store {store_id} not found")
+    total_refund_amount_for_gate = sum(
+        (
+            _compute_line_refund(sale_items_by_id[item_id], qty)[3]
+            for item_id, qty in requested_qty_by_item.items()
+        ),
+        start=Decimal("0"),
+    )
+    approval_required, approved_by = _resolve_return_approval(
+        db,
+        store=store,
+        refund_amount=total_refund_amount_for_gate,
+        initiating_user_id=created_by,
+        approver_username=approver_username,
+        approver_password=approver_password,
+        ip_address=ip_address,
+        user_agent=user_agent,
+    )
+
     # --- Lock every distinct product row that will actually be
     # restocked, ascending id order (deadlock-safe). ---------------------
     restock_product_ids = sorted(
@@ -737,6 +959,8 @@ def create_sale_return(
         refund_method=refund_method,
         refund_amount=Decimal("0"),  # filled in below once every line is computed
         processed_by=created_by,
+        approval_required=approval_required,
+        approved_by=approved_by,
     )
     db.add(sale_return)
     try:
@@ -775,20 +999,9 @@ def create_sale_return(
         restock = restock_by_item[sale_item_id]
         already_returned = sale_item.quantity_returned
 
-        refund_price = _round_money(sale_item.unit_price_at_sale * requested_qty)
-        discount_refunded = _proportional_share(
-            total=sale_item.discount_amount,
-            original_qty=sale_item.quantity,
-            already_returned_qty=already_returned,
-            this_return_qty=requested_qty,
+        refund_price, discount_refunded, tax_refunded, line_refund_amount = _compute_line_refund(
+            sale_item, requested_qty
         )
-        tax_refunded = _proportional_share(
-            total=sale_item.tax_amount,
-            original_qty=sale_item.quantity,
-            already_returned_qty=already_returned,
-            this_return_qty=requested_qty,
-        )
-        line_refund_amount = refund_price - discount_refunded + tax_refunded
         total_refund_amount += line_refund_amount
 
         db.add(
@@ -890,12 +1103,18 @@ def void_sale(
     created_by: int | None = None,
     ip_address: str | None = None,
     user_agent: str | None = None,
+    approver_username: str | None = None,
+    approver_password: str | None = None,
 ) -> SaleReturn:
     """A full-sale void = a return of every line's full remaining
     quantity, restocked, in one call — see the module docstring above
     for why this is not a separate implementation. Idempotent under the
     same client_transaction_id as create_sale_return (they share one
-    uniqueness space on sale_returns.client_transaction_id)."""
+    uniqueness space on sale_returns.client_transaction_id). Subject to
+    the same M14 approval gate as an ordinary return (docs/M14_DESIGN.md)
+    — voids are not exempt: the sale.void permission gates who may
+    INITIATE a void, which is a separate question from who may APPROVE
+    one that reaches the store's threshold."""
     sale = db.execute(select(Sale).where(Sale.id == sale_id).with_for_update()).scalar_one_or_none()
     if sale is None:
         raise NotFoundError(f"Sale {sale_id} not found")
@@ -928,6 +1147,8 @@ def void_sale(
         ip_address=ip_address,
         user_agent=user_agent,
         _is_void=True,
+        approver_username=approver_username,
+        approver_password=approver_password,
     )
 
 

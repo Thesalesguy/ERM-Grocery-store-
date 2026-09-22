@@ -24,7 +24,7 @@ from sqlalchemy.orm import Session
 from app.modules.accounting.models import JournalEntry
 from app.modules.ap.models import PurchaseInvoice, SupplierCreditNote, SupplierPayment
 from app.modules.audit.models import AuditLog
-from app.modules.auth.models import User
+from app.modules.auth.models import Store, User
 from app.modules.hr.models import AttendanceRecord, EmploymentAssignment
 from app.modules.inventory.models import StockAdjustment, StockCount, StockCountLine
 from app.modules.payroll.models import PayrollPeriod
@@ -121,7 +121,19 @@ _OR_STORE_ENTITY_MODELS: dict[str, tuple[Any, str, str]] = {
 # employee's current employment_assignments.store_id; user -> the
 # user's own store_id, technically direct but modeled separately since
 # User isn't a "business entity" table like the others).
-_JOIN_RESOLVED_ENTITY_TYPES = frozenset({"stock_count_line", "employee", "user"})
+#
+# "store" (M14, docs/M14_DESIGN.md): the return/void approval gate logs
+# entity_type="store"/entity_id=<store.id> (there is no per-approval row
+# to point at -- see app.modules.sales.service._resolve_return_approval),
+# so entity_id IS the store's own id, not a foreign key to look up via a
+# store_id COLUMN the way every _DIRECT_STORE_ENTITY_MODELS entry works.
+# Modeled here, not there, for that reason -- special-cased below in
+# _entity_ids_for_store. Without this, these events would silently fall
+# into "unknown entity_type -> excluded, not guessed", meaning a store-
+# scoped Manager could never see their own store's approval audit trail
+# through the existing /audit-logs endpoint (a real gap, found and fixed
+# while adding these events, not shipped un-noticed).
+_JOIN_RESOLVED_ENTITY_TYPES = frozenset({"stock_count_line", "employee", "user", "store"})
 
 # entity_types with NO store dimension at all -- always excluded from a
 # store-scoped reader's results, regardless of filter.
@@ -170,6 +182,9 @@ def _entity_ids_for_store(entity_type: str, store_id: int) -> Select | None:
 
     if entity_type == "user":
         return select(User.id).where(User.store_id == store_id)
+
+    if entity_type == "store":
+        return select(Store.id).where(Store.id == store_id)
 
     return None
 

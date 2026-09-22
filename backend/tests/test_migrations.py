@@ -40,6 +40,7 @@ M10_HEAD_REVISION = "1e832b76969e"  # M10: + calculation-consistency CHECK
 M11_HEAD_REVISION = "32e51bcda102"  # M11: + reports performance indexes
 M12_PHASE8_REVISION = "4708fb75ace5"  # M12: + revoke erp_app on alembic_version
 M12_HEAD_REVISION = "17fb9afe8d39"  # M12: + grant erp_app SELECT-only on alembic_version
+M14_HEAD_REVISION = "e0d2359bb08a"  # M14: return/void approval threshold
 
 
 def _alembic_config() -> Config:
@@ -150,10 +151,13 @@ def test_full_upgrade_downgrade_upgrade_cycle(migrations_db: str) -> None:
 
     command.upgrade(cfg, "head")
     # M11 adds two indexes (ix_sales_store_completed,
-    # ix_payroll_periods_store_status), not tables; M12 only revokes a
-    # privilege -- table count is unchanged from M10's 61.
+    # ix_payroll_periods_store_status), not tables; M12 only revokes/
+    # grants a privilege; M14 adds two COLUMNS (stores.
+    # return_approval_threshold_amount, sale_returns.approval_required),
+    # not tables -- table count is unchanged from M10's 61 all the way to
+    # head.
     assert _table_count(migrations_db) == 61
-    assert _current_revision(migrations_db) == M12_HEAD_REVISION
+    assert _current_revision(migrations_db) == M14_HEAD_REVISION
 
 
 def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
@@ -169,7 +173,8 @@ def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
     finally:
         engine.dispose()
     assert role_count == 6
-    assert permission_count == 44
+    # M14 adds one new permission (sales.return.approve) on top of M12's 44.
+    assert permission_count == 45
 
 
 def test_m7_downgrade_refuses_when_credit_note_data_exists(migrations_db: str) -> None:

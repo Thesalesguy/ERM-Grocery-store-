@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
 from app.core.exceptions import NotFoundError
+from app.core.rate_limit import approval_rate_limiter
 from app.modules.auth.permissions import (
     POS_USE,
     SALES_READ,
@@ -220,6 +221,15 @@ def create_sale_return(
     current_user: CurrentUser = Depends(_return_write_permission),
 ) -> SaleReturnRead:
     enforce_store_access(current_user, payload.store_id)
+    # M14 (docs/M14_DESIGN.md): an approval attempt verifies a SECOND
+    # user's password inline, a credential-check surface outside
+    # /auth/login — throttled the same way login is, keyed by client IP,
+    # so it can't become an unthrottled password-guessing oracle against
+    # manager/admin accounts. Only checked when an approval attempt is
+    # actually being made (a below-threshold return never touches this).
+    if payload.approver_username:
+        client_ip = request.client.host if request.client else "unknown"
+        approval_rate_limiter.check(client_ip)
     sale_return = service.create_sale_return(
         db,
         sale_id=sale_id,
@@ -238,6 +248,8 @@ def create_sale_return(
         created_by=current_user.id,
         ip_address=request.client.host if request.client else None,
         user_agent=request.headers.get("user-agent"),
+        approver_username=payload.approver_username,
+        approver_password=payload.approver_password,
     )
     db.commit()
     db.refresh(sale_return)
@@ -253,6 +265,10 @@ def void_sale(
     current_user: CurrentUser = Depends(_void_permission),
 ) -> SaleReturnRead:
     enforce_store_access(current_user, payload.store_id)
+    # M14: same rate-limited approval-credential check as create_sale_return.
+    if payload.approver_username:
+        client_ip = request.client.host if request.client else "unknown"
+        approval_rate_limiter.check(client_ip)
     sale_return = service.void_sale(
         db,
         sale_id=sale_id,
@@ -265,6 +281,8 @@ def void_sale(
         created_by=current_user.id,
         ip_address=request.client.host if request.client else None,
         user_agent=request.headers.get("user-agent"),
+        approver_username=payload.approver_username,
+        approver_password=payload.approver_password,
     )
     db.commit()
     db.refresh(sale_return)
