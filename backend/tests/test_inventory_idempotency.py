@@ -152,6 +152,8 @@ def test_service_layer_retry_with_same_key_returns_original(db: Session) -> None
     retried create_stock_adjustment call with the same key is a no-op."""
     store = make_store(db)
     product = make_product(db, store, current_qty_on_hand=Decimal("5"))
+    username = f"idem_adj_{unique_suffix()}"
+    user = make_user_with_role(db, store, INVENTORY_CLERK, username=username)
     db.commit()
 
     key = f"txn-{unique_suffix()}"
@@ -162,7 +164,7 @@ def test_service_layer_retry_with_same_key_returns_original(db: Session) -> None
         quantity_delta=Decimal("-1"),
         reason_code="EXPIRY",
         notes=None,
-        created_by=1,
+        created_by=user.id,
         client_transaction_id=key,
     )
     db.commit()
@@ -173,7 +175,7 @@ def test_service_layer_retry_with_same_key_returns_original(db: Session) -> None
         quantity_delta=Decimal("-1"),
         reason_code="EXPIRY",
         notes=None,
-        created_by=1,
+        created_by=user.id,
         client_transaction_id=key,
     )
     assert second.id == first.id
@@ -206,6 +208,7 @@ def _attempt_adjustment(
     *,
     store_id: int,
     product_id: int,
+    created_by: int,
     client_transaction_id: str,
     barrier: threading.Barrier,
     result: _AdjustmentOutcome,
@@ -220,7 +223,7 @@ def _attempt_adjustment(
             quantity_delta=Decimal("-1"),
             reason_code="DAMAGE",
             notes=None,
-            created_by=1,
+            created_by=created_by,
             client_transaction_id=client_transaction_id,
         )
         session.commit()
@@ -238,8 +241,10 @@ def test_concurrent_duplicate_adjustment_requests_create_only_one_adjustment() -
     try:
         store = make_store(setup_session)
         product = make_product(setup_session, store, current_qty_on_hand=Decimal("20"))
+        username = f"idem_adj_{unique_suffix()}"
+        user = make_user_with_role(setup_session, store, INVENTORY_CLERK, username=username)
         setup_session.commit()
-        store_id, product_id = store.id, product.id
+        store_id, product_id, created_by = store.id, product.id, user.id
     finally:
         setup_session.close()
 
@@ -251,6 +256,7 @@ def test_concurrent_duplicate_adjustment_requests_create_only_one_adjustment() -
         kwargs=dict(
             store_id=store_id,
             product_id=product_id,
+            created_by=created_by,
             client_transaction_id=shared_key,
             barrier=barrier,
             result=result_a,
@@ -261,6 +267,7 @@ def test_concurrent_duplicate_adjustment_requests_create_only_one_adjustment() -
         kwargs=dict(
             store_id=store_id,
             product_id=product_id,
+            created_by=created_by,
             client_transaction_id=shared_key,
             barrier=barrier,
             result=result_b,
