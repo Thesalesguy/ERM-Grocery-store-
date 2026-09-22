@@ -21,6 +21,7 @@ from app.api.v1.endpoints import (
     replenishment,
     reports,
     sales,
+    shifts,
     transfers,
 )
 
@@ -29,6 +30,7 @@ api_router.include_router(auth.router)
 api_router.include_router(products.router)
 api_router.include_router(inventory.router)
 api_router.include_router(sales.router)
+api_router.include_router(shifts.router)
 api_router.include_router(purchasing.router)
 api_router.include_router(accounting.router)
 api_router.include_router(ap.router)

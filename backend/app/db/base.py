@@ -69,6 +69,7 @@ from app.modules.sales.models import (  # noqa: F401
     SaleReturn,
     SaleReturnItem,
 )
+from app.modules.shifts.models import CashierShift, CashMovement  # noqa: F401
 from app.modules.tax.models import TaxRate  # noqa: F401
 from app.modules.transfers.models import (  # noqa: F401
     InterStoreTransfer,

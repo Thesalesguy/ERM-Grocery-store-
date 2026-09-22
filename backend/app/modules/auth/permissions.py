@@ -178,6 +178,21 @@ PAYROLL_CALCULATE = "payroll.calculate"
 PAYROLL_APPROVE = "payroll.approve"
 PAYROLL_POST = "payroll.post"
 PAYROLL_REVERSE = "payroll.reverse"
+# M15 (docs/M15_DESIGN.md "Permissions"): shift.manage covers a cashier's
+# own OPEN/close/cash-movement actions on THEIR OWN shift -- granted
+# alongside pos.use to every role that can operate the POS at all (mirrors
+# how sales.return.write sits alongside pos.use for Cashier). shift.read
+# is separate (view-only, for a Manager/Admin/Auditor reviewing shift
+# history/reconciliation) mirroring the read/write split used everywhere
+# else in this matrix. shift.override is its own, narrower permission --
+# NOT folded into shift.manage -- gating specifically the ability to close
+# a DIFFERENT cashier's shift, mirroring sales.return.approve's own
+# tier-separation reasoning: a role could plausibly have shift.manage
+# (run your own till) without shift.override (close someone else's), and
+# this milestone's Cashier role does exactly that.
+SHIFT_MANAGE = "shift.manage"
+SHIFT_READ = "shift.read"
+SHIFT_OVERRIDE = "shift.override"
 
 ALL_PERMISSIONS: dict[str, str] = {
     PRODUCTS_READ: "View products and barcodes",
@@ -233,6 +248,9 @@ ALL_PERMISSIONS: dict[str, str] = {
     PAYROLL_APPROVE: "Approve a calculated payroll period before posting",
     PAYROLL_POST: "Post an approved payroll period, creating a real GL liability",
     PAYROLL_REVERSE: "Reverse a posted payroll period with a compensating entry",
+    SHIFT_MANAGE: "Open, record cash movements against, and close one's own cashier shift",
+    SHIFT_READ: "View cashier shift history and reconciliation detail",
+    SHIFT_OVERRIDE: "Close another cashier's shift on their behalf",
 }
 
 # --- Roles --------------------------------------------------------------
@@ -309,6 +327,9 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         # Deliberately NOT PAYROLL_POST or PAYROLL_REVERSE — see the
         # permission constants' docstring above for the full
         # conflict-of-interest justification (M10 design decision #2).
+        SHIFT_MANAGE,
+        SHIFT_READ,
+        SHIFT_OVERRIDE,
     ],
     CASHIER: [
         PRODUCTS_READ,
@@ -316,6 +337,16 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         SALES_READ,
         SALES_RETURN_READ,
         SALES_RETURN_WRITE,
+        # M15: a Cashier can run their OWN till (open/close/record a cash
+        # movement, view its own history) but NOT shift.override —
+        # closing another cashier's shift is Manager/Admin-only,
+        # mirroring sales.return.approve's own separation. shift.read
+        # alongside shift.manage mirrors how Cashier already holds
+        # sales.read/sales.return.read alongside pos.use/sales.return.write
+        # — operating something and viewing your own history of it go
+        # together everywhere else in this matrix.
+        SHIFT_MANAGE,
+        SHIFT_READ,
     ],
     INVENTORY_CLERK: [
         PRODUCTS_READ,
@@ -356,6 +387,7 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         HR_READ,
         ATTENDANCE_READ,
         PAYROLL_READ,
+        SHIFT_READ,
     ],
     # M10 design decision #3's exact scope: employee master data,
     # employment history, attendance, and payroll preparation/read.

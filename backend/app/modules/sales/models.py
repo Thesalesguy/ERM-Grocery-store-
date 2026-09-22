@@ -80,6 +80,17 @@ class Sale(TimestampMixin, Base):
     voided_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
     voided_reason: Mapped[str | None] = mapped_column(Text)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # M15 (docs/M15_DESIGN.md "Shift association"): the cashier's OPEN
+    # CashierShift at the moment this sale finalized, or NULL if the
+    # cashier had no open shift (opportunistic attribution, not a
+    # mandatory requirement -- see the design doc's "Scope boundary": a
+    # pre-M15 sale, and any sale finalized without an open shift, is
+    # simply unattributed, never fabricated after the fact). Lives here,
+    # not on Payment: every Payment row for one Sale is created in the
+    # same checkout event, so a per-Payment shift_id would be redundant --
+    # this one column is sufficient to attribute every payment on the
+    # sale to the same shift.
+    shift_id: Mapped[int | None] = mapped_column(ForeignKey("cashier_shifts.id"))
 
     items: Mapped[list["SaleItem"]] = relationship(back_populates="sale")
     payments: Mapped[list["Payment"]] = relationship(back_populates="sale")
@@ -211,6 +222,15 @@ class SaleReturn(TimestampMixin, Base):
     # retroactively make an already-approved return look unapproved, or
     # vice versa.
     approval_required: Mapped[bool] = mapped_column(nullable=False, default=False)
+    # M15: the same opportunistic shift attribution as Sale.shift_id above
+    # -- the PROCESSING cashier's OPEN shift at the moment this return/void
+    # was created, which may be a DIFFERENT shift (even a different day)
+    # than whatever shift the ORIGINAL sale happened under. A return's own
+    # refund_method/refund_amount affect physical cash independently of
+    # the original sale, so it needs its own shift_id rather than one
+    # derived through sale_id -- see docs/M15_DESIGN.md "Shift
+    # association" for the full reasoning.
+    shift_id: Mapped[int | None] = mapped_column(ForeignKey("cashier_shifts.id"))
 
     items: Mapped[list["SaleReturnItem"]] = relationship(back_populates="sale_return")
 

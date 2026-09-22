@@ -41,6 +41,8 @@ M11_HEAD_REVISION = "32e51bcda102"  # M11: + reports performance indexes
 M12_PHASE8_REVISION = "4708fb75ace5"  # M12: + revoke erp_app on alembic_version
 M12_HEAD_REVISION = "17fb9afe8d39"  # M12: + grant erp_app SELECT-only on alembic_version
 M14_HEAD_REVISION = "e0d2359bb08a"  # M14: return/void approval threshold
+M15_PRE_HARDENING_REVISION = "1a4bae98d246"  # pre-M15: stock adjustment idempotency
+M15_HEAD_REVISION = "db482a11ee31"  # M15: cashier/till shift sessions
 
 
 def _alembic_config() -> Config:
@@ -136,28 +138,29 @@ def test_full_upgrade_downgrade_upgrade_cycle(migrations_db: str) -> None:
     assert _table_count(migrations_db) == 46
 
     command.upgrade(cfg, "head")
-    # M10 adds fifteen tables: departments, positions, employees,
-    # employment_status_periods, employment_assignments,
-    # compensation_periods, overtime_policies, attendance_records,
-    # deduction_types, deduction_rates, payroll_periods,
+    # This jump goes all the way to the CURRENT head, not just M10 (the
+    # explicit M9_HEAD_REVISION step above was the last named checkpoint
+    # before "head" is used for the rest of the chain). M10 adds fifteen
+    # tables: departments, positions, employees, employment_status_periods,
+    # employment_assignments, compensation_periods, overtime_policies,
+    # attendance_records, deduction_types, deduction_rates, payroll_periods,
     # payroll_employee_results, payroll_earning_lines,
     # payroll_deduction_lines, payroll_reversals (stores.
     # attendance_day_boundary_hour and the accounts/journal_entries
-    # widening are a column/rows/CHECK change, not tables).
-    assert _table_count(migrations_db) == 61
+    # widening are a column/rows/CHECK change, not tables) -- 46 + 15 = 61.
+    # M11 adds two indexes, not tables; M12 only revokes/grants a
+    # privilege; M14 adds two COLUMNS, not tables -- unchanged at 61
+    # through M14. The pre-M15 hardening migration adds one COLUMN, not a
+    # table. M15 itself adds exactly two new tables (cashier_shifts,
+    # cash_movements): 61 + 2 = 63.
+    assert _table_count(migrations_db) == 63
 
     command.downgrade(cfg, M0_REVISION)
     assert _table_count(migrations_db) == 8
 
     command.upgrade(cfg, "head")
-    # M11 adds two indexes (ix_sales_store_completed,
-    # ix_payroll_periods_store_status), not tables; M12 only revokes/
-    # grants a privilege; M14 adds two COLUMNS (stores.
-    # return_approval_threshold_amount, sale_returns.approval_required),
-    # not tables -- table count is unchanged from M10's 61 all the way to
-    # head.
-    assert _table_count(migrations_db) == 61
-    assert _current_revision(migrations_db) == M14_HEAD_REVISION
+    assert _table_count(migrations_db) == 63
+    assert _current_revision(migrations_db) == M15_HEAD_REVISION
 
 
 def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
@@ -173,8 +176,11 @@ def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
     finally:
         engine.dispose()
     assert role_count == 6
-    # M14 adds one new permission (sales.return.approve) on top of M12's 44.
-    assert permission_count == 45
+    # M14 adds one new permission (sales.return.approve) on top of M12's
+    # 44 = 45. M15 adds three more (shift.manage, shift.read,
+    # shift.override) = 48. The pre-M15 hardening migration adds no
+    # permissions (a column only).
+    assert permission_count == 48
 
 
 def test_m7_downgrade_refuses_when_credit_note_data_exists(migrations_db: str) -> None:

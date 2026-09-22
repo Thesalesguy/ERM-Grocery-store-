@@ -80,8 +80,9 @@ def test_manager_can_read_accounts_and_journals(client: TestClient, db: Session)
     # + 1 new M8 account (Inventory In Transit) + 6 new M10 payroll
     # accounts (Payroll Payable, Statutory Withholding Payable, Benefit/
     # Other Deduction Payable, Employer Contribution Payable, Wage &
-    # Salary Expense, Employer Contribution Expense).
-    assert len(response.json()) == 25
+    # Salary Expense, Employer Contribution Expense) + 1 new M15 account
+    # (Cash Over/Short).
+    assert len(response.json()) == 26
 
     response = client.get(f"/api/v1/accounting/journals?store_id={store.id}", headers=headers)
     assert response.status_code == 200

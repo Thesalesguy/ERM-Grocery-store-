@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import * as productsApi from '../api/products'
 import * as salesApi from '../api/sales'
+import * as shiftsApi from '../api/shifts'
 import { ApiError } from '../api/client'
 import { useAuth } from '../auth/AuthContext'
 
@@ -33,7 +34,7 @@ function cartSubtotal(cart: CartLine[]): number {
 }
 
 export function PosPage() {
-  const { user } = useAuth()
+  const { user, hasPermission } = useAuth()
   const scannerInputRef = useRef<HTMLInputElement>(null)
   // Idempotency key for the checkout currently being built (M2 hardening
   // audit Section 7): generated once when the cart first gets a line, and
@@ -53,10 +54,40 @@ export function PosPage() {
   const [completedSale, setCompletedSale] = useState<salesApi.Sale | null>(null)
   const [searchTerm, setSearchTerm] = useState('')
   const [searchResults, setSearchResults] = useState<productsApi.Product[]>([])
+  // M15: the cashier's own active till session, if any. Purely
+  // informational/operational from the frontend's point of view — the
+  // backend attributes a cash sale to it opportunistically and never
+  // blocks checkout on its absence (docs/M15_DESIGN.md "Scope boundary").
+  const [activeShift, setActiveShift] = useState<shiftsApi.Shift | null>(null)
+  const [shiftLoaded, setShiftLoaded] = useState(false)
+
+  async function refreshActiveShift() {
+    try {
+      const shift = await shiftsApi.getActiveShift()
+      setActiveShift(shift)
+    } catch {
+      setActiveShift(null)
+    } finally {
+      setShiftLoaded(true)
+    }
+  }
 
   useEffect(() => {
     scannerInputRef.current?.focus()
   }, [])
+
+  useEffect(() => {
+    // AuthProvider resolves `user` asynchronously (a silent-refresh +
+    // /auth/me round trip), so this must re-run once it does rather than
+    // reading a stale "not logged in yet" permission set on first mount.
+    if (!user) return
+    if (hasPermission('shift.manage')) {
+      refreshActiveShift()
+    } else {
+      setShiftLoaded(true)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user])
 
   function addToCart(product: productsApi.Product) {
     setCart((prev) => {
@@ -196,6 +227,14 @@ export function PosPage() {
       className="min-h-screen" // Keep your existing styles here
     >
       <h1 className="text-2xl font-semibold text-gray-900">Point of Sale</h1>
+
+      {hasPermission('shift.manage') && shiftLoaded && (
+        <ShiftPanel
+          storeId={user?.store_id ?? null}
+          activeShift={activeShift}
+          onShiftChanged={refreshActiveShift}
+        />
+      )}
 
       <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
         <div>
@@ -416,6 +455,285 @@ function Receipt({ sale, onNewSale }: { sale: salesApi.Sale; onNewSale: () => vo
       >
         New sale
       </button>
+    </div>
+  )
+}
+
+// --- M15: cashier till/shift session panel ---------------------------------
+//
+// Deliberately non-blocking: this panel lets a cashier open/close their
+// own till and record cash movements, but never gates checkout on it —
+// the backend attributes a cash sale to an active shift opportunistically
+// (docs/M15_DESIGN.md "Scope boundary"). Every number shown after a close
+// (expected cash, variance) comes straight from the server response; this
+// component never computes one itself, matching the "frontend is never
+// the source of financial truth" rule finalizeSale's own UI already
+// follows.
+
+function ShiftPanel({
+  storeId,
+  activeShift,
+  onShiftChanged,
+}: {
+  storeId: number | null
+  activeShift: shiftsApi.Shift | null
+  onShiftChanged: () => void
+}) {
+  const [showOpenForm, setShowOpenForm] = useState(false)
+  const [openingFloat, setOpeningFloat] = useState('')
+  const [openError, setOpenError] = useState<string | null>(null)
+  const [isOpening, setIsOpening] = useState(false)
+
+  const [showCloseForm, setShowCloseForm] = useState(false)
+  const [countedAmount, setCountedAmount] = useState('')
+  const [closeError, setCloseError] = useState<string | null>(null)
+  const [isClosing, setIsClosing] = useState(false)
+  const [lastClosed, setLastClosed] = useState<shiftsApi.Shift | null>(null)
+
+  const [showMovementForm, setShowMovementForm] = useState(false)
+  const [movementType, setMovementType] =
+    useState<shiftsApi.CashMovementInput['movement_type']>('PAID_IN')
+  const [movementAmount, setMovementAmount] = useState('')
+  const [movementReason, setMovementReason] = useState('')
+  const [movementError, setMovementError] = useState<string | null>(null)
+  const [isRecordingMovement, setIsRecordingMovement] = useState(false)
+
+  async function handleOpenShift() {
+    if (!storeId) {
+      setOpenError('Your account has no assigned store.')
+      return
+    }
+    setOpenError(null)
+    setIsOpening(true)
+    try {
+      await shiftsApi.openShift({
+        store_id: storeId,
+        opening_float: openingFloat || '0',
+        client_transaction_id: crypto.randomUUID(),
+      })
+      setShowOpenForm(false)
+      setOpeningFloat('')
+      onShiftChanged()
+    } catch (err) {
+      setOpenError(err instanceof ApiError ? err.message : 'Failed to open shift.')
+    } finally {
+      setIsOpening(false)
+    }
+  }
+
+  async function handleCloseShift() {
+    if (!activeShift) return
+    setCloseError(null)
+    setIsClosing(true)
+    try {
+      const closed = await shiftsApi.closeShift(activeShift.id, {
+        closing_counted_amount: countedAmount || '0',
+        client_transaction_id: crypto.randomUUID(),
+      })
+      setLastClosed(closed)
+      setShowCloseForm(false)
+      setCountedAmount('')
+      onShiftChanged()
+    } catch (err) {
+      setCloseError(err instanceof ApiError ? err.message : 'Failed to close shift.')
+    } finally {
+      setIsClosing(false)
+    }
+  }
+
+  async function handleRecordMovement() {
+    if (!activeShift) return
+    setMovementError(null)
+    setIsRecordingMovement(true)
+    try {
+      await shiftsApi.recordCashMovement(activeShift.id, {
+        movement_type: movementType,
+        amount: movementAmount,
+        reason: movementReason,
+        client_transaction_id: crypto.randomUUID(),
+      })
+      setShowMovementForm(false)
+      setMovementAmount('')
+      setMovementReason('')
+    } catch (err) {
+      setMovementError(err instanceof ApiError ? err.message : 'Failed to record cash movement.')
+    } finally {
+      setIsRecordingMovement(false)
+    }
+  }
+
+  if (lastClosed) {
+    const variance = Number(lastClosed.variance_amount ?? '0')
+    return (
+      <div className="mt-4 rounded border border-gray-200 bg-white p-4 text-sm">
+        <h2 className="font-semibold text-gray-900">Shift closed</h2>
+        <div className="mt-2 flex justify-between">
+          <span className="text-gray-500">Expected cash</span>
+          <span className="font-medium">{lastClosed.expected_cash_amount}</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-gray-500">Counted cash</span>
+          <span className="font-medium">{lastClosed.closing_counted_amount}</span>
+        </div>
+        <div className="flex justify-between font-semibold">
+          <span>Variance</span>
+          <span
+            className={
+              variance === 0 ? 'text-gray-900' : variance > 0 ? 'text-green-700' : 'text-red-700'
+            }
+          >
+            {variance === 0
+              ? 'Exact'
+              : variance > 0
+                ? `+${variance.toFixed(2)}`
+                : variance.toFixed(2)}
+          </span>
+        </div>
+        <button
+          onClick={() => setLastClosed(null)}
+          className="mt-3 text-xs text-blue-600 hover:underline"
+        >
+          Dismiss
+        </button>
+      </div>
+    )
+  }
+
+  if (!activeShift) {
+    return (
+      <div className="mt-4 rounded border border-amber-200 bg-amber-50 p-4 text-sm">
+        <div className="flex items-center justify-between">
+          <span className="text-amber-800">
+            No active till session — cash sales won't be attributed to a shift.
+          </span>
+          {!showOpenForm && (
+            <button
+              onClick={() => setShowOpenForm(true)}
+              className="rounded bg-amber-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-700"
+            >
+              Open till
+            </button>
+          )}
+        </div>
+        {showOpenForm && (
+          <div className="mt-3 flex items-center gap-2">
+            <input
+              value={openingFloat}
+              onChange={(e) => setOpeningFloat(e.target.value)}
+              placeholder="Opening float"
+              className="w-32 rounded border border-gray-300 px-2 py-1.5 text-sm"
+            />
+            <button
+              onClick={handleOpenShift}
+              disabled={isOpening}
+              className="rounded bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+            >
+              {isOpening ? 'Opening…' : 'Confirm'}
+            </button>
+            <button
+              onClick={() => setShowOpenForm(false)}
+              className="text-xs text-gray-600 hover:underline"
+            >
+              Cancel
+            </button>
+          </div>
+        )}
+        {openError && <p className="mt-2 text-xs text-red-600">{openError}</p>}
+      </div>
+    )
+  }
+
+  return (
+    <div className="mt-4 rounded border border-green-200 bg-green-50 p-4 text-sm">
+      <div className="flex items-center justify-between">
+        <span className="text-green-800">
+          Till open — opening float {activeShift.opening_float}
+        </span>
+        <div className="flex gap-2">
+          {!showMovementForm && (
+            <button
+              onClick={() => setShowMovementForm(true)}
+              className="rounded border border-green-600 px-3 py-1.5 text-xs font-medium text-green-700 hover:bg-green-100"
+            >
+              Cash movement
+            </button>
+          )}
+          {!showCloseForm && (
+            <button
+              onClick={() => setShowCloseForm(true)}
+              className="rounded bg-green-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-green-800"
+            >
+              Close till
+            </button>
+          )}
+        </div>
+      </div>
+
+      {showMovementForm && (
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <select
+            value={movementType}
+            onChange={(e) =>
+              setMovementType(e.target.value as shiftsApi.CashMovementInput['movement_type'])
+            }
+            className="rounded border border-gray-300 px-2 py-1.5 text-sm"
+          >
+            <option value="PAID_IN">Paid in</option>
+            <option value="PAID_OUT">Paid out</option>
+          </select>
+          <input
+            value={movementAmount}
+            onChange={(e) => setMovementAmount(e.target.value)}
+            placeholder="Amount"
+            className="w-24 rounded border border-gray-300 px-2 py-1.5 text-sm"
+          />
+          <input
+            value={movementReason}
+            onChange={(e) => setMovementReason(e.target.value)}
+            placeholder="Reason"
+            className="w-40 rounded border border-gray-300 px-2 py-1.5 text-sm"
+          />
+          <button
+            onClick={handleRecordMovement}
+            disabled={isRecordingMovement}
+            className="rounded bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+          >
+            {isRecordingMovement ? 'Saving…' : 'Confirm'}
+          </button>
+          <button
+            onClick={() => setShowMovementForm(false)}
+            className="text-xs text-gray-600 hover:underline"
+          >
+            Cancel
+          </button>
+        </div>
+      )}
+      {movementError && <p className="mt-2 text-xs text-red-600">{movementError}</p>}
+
+      {showCloseForm && (
+        <div className="mt-3 flex items-center gap-2">
+          <input
+            value={countedAmount}
+            onChange={(e) => setCountedAmount(e.target.value)}
+            placeholder="Counted cash"
+            className="w-32 rounded border border-gray-300 px-2 py-1.5 text-sm"
+          />
+          <button
+            onClick={handleCloseShift}
+            disabled={isClosing}
+            className="rounded bg-green-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-green-800 disabled:opacity-50"
+          >
+            {isClosing ? 'Closing…' : 'Confirm close'}
+          </button>
+          <button
+            onClick={() => setShowCloseForm(false)}
+            className="text-xs text-gray-600 hover:underline"
+          >
+            Cancel
+          </button>
+        </div>
+      )}
+      {closeError && <p className="mt-2 text-xs text-red-600">{closeError}</p>}
     </div>
   )
 }

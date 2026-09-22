@@ -111,6 +111,17 @@ AUTOMATED_SOURCE_TYPES = (
     # PayrollPeriod.status or the real pay obligation it represents).
     "PAYROLL_POSTING",
     "PAYROLL_REVERSAL",
+    # M15 (docs/M15_DESIGN.md "GL treatment"): posted once per shift close,
+    # only when the physical count differs from expected cash (a zero
+    # variance posts nothing — no financial event occurred). Blocked from
+    # generic reverse_journal_entry for the same reason every automated
+    # type above is: a bare journal reversal would not undo
+    # CashierShift.status/variance_amount or the real cash-handling event
+    # it represents. There is deliberately no CASH_SHIFT_VARIANCE_REVERSAL
+    # counterpart yet — M15 builds no shift-reopen/correction workflow
+    # (docs/M15_DESIGN.md "What M15 deliberately did not build"), so
+    # nothing in this milestone would ever call one.
+    "CASH_SHIFT_VARIANCE",
 )
 SOURCE_TYPES = AUTOMATED_SOURCE_TYPES + ("MANUAL",)
 ENTRY_TYPES = ("STANDARD", "REVERSAL")

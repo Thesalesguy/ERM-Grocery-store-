@@ -35,6 +35,8 @@ from sqlalchemy.orm import Session
 from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationAppError
 from app.modules.accounting.constants import (
     ACCOUNT_ACCOUNTS_PAYABLE,
+    ACCOUNT_CASH_ON_HAND,
+    ACCOUNT_CASH_OVER_SHORT,
     ACCOUNT_COGS,
     ACCOUNT_EMPLOYER_CONTRIBUTION_EXPENSE,
     ACCOUNT_EMPLOYER_CONTRIBUTION_PAYABLE,
@@ -76,6 +78,7 @@ if TYPE_CHECKING:
     from app.modules.purchasing.models import GoodsReceipt, PurchaseReturn
     from app.modules.sales.models import Sale, SaleReturn
     from app.modules.sales.service import PaymentInput, _ComputedLine
+    from app.modules.shifts.models import CashierShift
     from app.modules.transfers.models import InterStoreTransfer, InterStoreTransferReceipt
 
 
@@ -975,6 +978,57 @@ def post_payroll_reversal_journal(
         source_id=payroll_period.id,
         memo=memo,
         created_by=reversed_by,
+        lines=lines,
+    )
+
+
+# --- Cashier shifts (M15) ------------------------------------------------
+
+
+def post_cash_shift_variance_journal(
+    db: Session,
+    *,
+    shift: "CashierShift",
+    created_by: int | None,
+) -> JournalEntry | None:
+    """Posts the physical-cash-count-vs-expected variance discovered at
+    shift close (docs/M15_DESIGN.md "GL treatment"), mirroring
+    `post_stock_adjustment_journal`'s exact shape for a found/missing
+    physical count.
+
+    `variance_amount = closing_counted_amount - expected_cash_amount`
+    (docs/M15_DESIGN.md "Over/short sign convention"):
+    - Positive (an overage — more cash physically present than expected):
+      Dr Cash on Hand / Cr Cash Over/Short.
+    - Negative (a shortage): Dr Cash Over/Short / Cr Cash on Hand.
+
+    Returns None and posts nothing on exact reconciliation
+    (variance_amount == 0) — no financial event occurred, so there is
+    nothing to record; an entry with two zero-amount lines would also be
+    rejected by journal_lines' own `debit > 0 OR credit > 0` CHECK."""
+    variance = shift.variance_amount
+    if variance is None or variance == 0:
+        return None
+    amount = _quantize(abs(variance))
+    memo = f"Cashier shift {shift.id} close variance"
+    if variance > 0:
+        lines = [
+            _debit(ACCOUNT_CASH_ON_HAND, amount, description=memo),
+            _credit(ACCOUNT_CASH_OVER_SHORT, amount, description=memo),
+        ]
+    else:
+        lines = [
+            _debit(ACCOUNT_CASH_OVER_SHORT, amount, description=memo),
+            _credit(ACCOUNT_CASH_ON_HAND, amount, description=memo),
+        ]
+    return _post_journal(
+        db,
+        store_id=shift.store_id,
+        posting_date=(shift.closed_at.date() if shift.closed_at else date.today()),
+        source_type="CASH_SHIFT_VARIANCE",
+        source_id=shift.id,
+        memo=memo,
+        created_by=created_by,
         lines=lines,
     )
 

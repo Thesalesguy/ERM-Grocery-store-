@@ -65,6 +65,7 @@ from app.modules.sales.models import (
     SaleReturn,
     SaleReturnItem,
 )
+from app.modules.shifts import service as shifts_service
 from app.modules.tax.models import TaxRate
 
 _MONEY_QUANTUM = Decimal("0.01")
@@ -320,6 +321,10 @@ def finalize_sale(
     change_due = total_paid - grand_total
 
     # --- Create the sale -------------------------------------------------
+    # M15 (docs/M15_DESIGN.md "Shift association"): opportunistic, never
+    # mandatory — if the cashier currently has no open shift, shift_id is
+    # simply NULL and finalize_sale behaves exactly as it did before M15.
+    active_shift = shifts_service.lock_active_shift_for_cashier(db, cashier_id)
     sale = Sale(
         store_id=store_id,
         sale_number=_generate_sale_number(store_id),
@@ -333,6 +338,7 @@ def finalize_sale(
         amount_tendered=total_paid,
         change_due=change_due,
         completed_at=datetime.now(UTC),
+        shift_id=active_shift.id if active_shift is not None else None,
     )
     db.add(sale)
     try:
@@ -950,6 +956,16 @@ def create_sale_return(
         for product_id in restock_product_ids
     }
 
+    # M15 (docs/M15_DESIGN.md "Shift association"): the PROCESSING
+    # cashier's own open shift at the moment this return/void is created
+    # — may differ from whatever shift (if any) the ORIGINAL sale
+    # happened under. Opportunistic, never mandatory, same as
+    # finalize_sale's Sale.shift_id above.
+    active_shift = (
+        shifts_service.lock_active_shift_for_cashier(db, created_by)
+        if created_by is not None
+        else None
+    )
     sale_return = SaleReturn(
         sale_id=sale_id,
         store_id=store_id,
@@ -961,6 +977,7 @@ def create_sale_return(
         processed_by=created_by,
         approval_required=approval_required,
         approved_by=approved_by,
+        shift_id=active_shift.id if active_shift is not None else None,
     )
     db.add(sale_return)
     try:
