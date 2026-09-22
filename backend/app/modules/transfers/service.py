@@ -342,8 +342,7 @@ def ship_transfer(
         db_line = db_lines.get(input_line.transfer_line_id)
         if db_line is None or db_line.transfer_id != transfer_id:
             raise NotFoundError(
-                f"Transfer line {input_line.transfer_line_id} not found on transfer "
-                f"{transfer_id}"
+                f"Transfer line {input_line.transfer_line_id} not found on transfer {transfer_id}"
             )
         if input_line.quantity_to_ship > db_line.requested_quantity:
             raise ConflictError(
@@ -479,8 +478,7 @@ def receive_transfer(
 
     if transfer.status != "SHIPPED":
         raise ConflictError(
-            f"Transfer {transfer_id} is {transfer.status} and cannot be received (must be "
-            "SHIPPED)",
+            f"Transfer {transfer_id} is {transfer.status} and cannot be received (must be SHIPPED)",
             error_code="INVALID_TRANSFER_STATE",
         )
 
@@ -647,7 +645,7 @@ def cancel_transfer(
         transfer.to_store_id,
     ):
         raise ForbiddenError(
-            f"Your account is scoped to store {caller_store_id} and cannot cancel this " "transfer",
+            f"Your account is scoped to store {caller_store_id} and cannot cancel this transfer",
             error_code="STORE_ACCESS_DENIED",
         )
     if transfer.status == "CANCELLED":

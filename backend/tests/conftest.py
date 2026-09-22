@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
-from app.core.rate_limit import login_rate_limiter, refresh_rate_limiter
+from app.core.rate_limit import approval_rate_limiter, login_rate_limiter, refresh_rate_limiter
 from app.db.session import engine
 from app.main import app
 
@@ -28,9 +28,11 @@ def _reset_rate_limiters() -> Generator[None, None, None]:
     test so a rate-limit test's own tripped state never leaks either."""
     login_rate_limiter.clear()
     refresh_rate_limiter.clear()
+    approval_rate_limiter.clear()
     yield
     login_rate_limiter.clear()
     refresh_rate_limiter.clear()
+    approval_rate_limiter.clear()
 
 
 @pytest.fixture

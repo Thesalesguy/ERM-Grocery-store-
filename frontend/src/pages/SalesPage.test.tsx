@@ -191,6 +191,119 @@ describe('SalesPage', () => {
     expect(returnCreated).toBe(true)
   })
 
+  it('prompts for approver credentials on APPROVAL_REQUIRED and resubmits successfully', async () => {
+    const approvedReturn = {
+      id: 901,
+      sale_id: 55,
+      store_id: 7,
+      return_number: 'RET7-APPROVED',
+      client_transaction_id: 'ret-txn-2',
+      reason: null,
+      refund_method: 'CASH',
+      refund_amount: '10.00',
+      processed_by: 1,
+      approval_required: true,
+      approved_by: 42,
+      created_at: '2024-01-02T00:00:00Z',
+      items: [
+        {
+          id: 2,
+          sale_item_id: 200,
+          quantity: '1.000',
+          unit_price_refunded: '10.00',
+          discount_refunded: '0.00',
+          tax_refunded: '0.00',
+          unit_cost_refunded: '4.000000',
+          restock: true,
+          product_id: 55,
+          product_name: 'Widget',
+          product_sku: 'WID-1',
+        },
+      ],
+    }
+    let postAttempts = 0
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL, init?: RequestInit) => {
+        const url = String(input)
+        const method = (init?.method ?? 'GET').toUpperCase()
+        if (url.includes('/auth/refresh') && method === 'POST') {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              access_token: 'tok',
+              token_type: 'bearer',
+              expires_in_seconds: 900,
+            }),
+          } as Response
+        }
+        if (url.includes('/auth/me')) {
+          return { ok: true, status: 200, json: async () => AUTH_ROUTES[1].json } as Response
+        }
+        if (url.includes('/sales/55/returns') && method === 'POST') {
+          postAttempts += 1
+          const body = JSON.parse(String(init?.body ?? '{}'))
+          if (postAttempts === 1) {
+            // First attempt: no approver supplied -> server rejects.
+            return {
+              ok: false,
+              status: 403,
+              json: async () => ({
+                error: {
+                  code: 'APPROVAL_REQUIRED',
+                  message: 'This operation requires manager/admin approval',
+                },
+              }),
+            } as Response
+          }
+          // Retry with approver fields -> succeeds, same idempotency key.
+          expect(body.approver_username).toBe('manager1')
+          expect(body.approver_password).toBe('hunter2')
+          expect(body.client_transaction_id).toBe('ret-txn-2')
+          return { ok: true, status: 201, json: async () => approvedReturn } as Response
+        }
+        if (url.includes('/sales/55/return-eligibility')) {
+          return { ok: true, status: 200, json: async () => SAMPLE_ELIGIBILITY } as Response
+        }
+        if (url.includes('/sales/55')) {
+          return { ok: true, status: 200, json: async () => SAMPLE_SALE } as Response
+        }
+        throw new Error(`no route for ${method} ${url}`)
+      }),
+    )
+    // Deterministic idempotency key so the assertion above is exact.
+    vi.stubGlobal('crypto', { randomUUID: () => 'ret-txn-2' })
+
+    await renderSales()
+    fireEvent.change(screen.getByPlaceholderText('Sale ID'), { target: { value: '55' } })
+    fireEvent.click(screen.getByRole('button', { name: /find sale/i }))
+    await waitFor(() => expect(screen.getByText('SALE-TEST')).toBeInTheDocument())
+
+    fireEvent.change(screen.getByPlaceholderText('0'), { target: { value: '1' } })
+    fireEvent.click(screen.getByRole('button', { name: /process return/i }))
+
+    await waitFor(() =>
+      expect(screen.getByText(/have an authorized approver/i)).toBeInTheDocument(),
+    )
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'This operation requires manager/admin approval',
+    )
+
+    fireEvent.change(screen.getByLabelText('Approver username'), {
+      target: { value: 'manager1' },
+    })
+    fireEvent.change(screen.getByLabelText('Approver password'), {
+      target: { value: 'hunter2' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: /process return/i }))
+
+    await waitFor(() => expect(screen.getByText('Return processed')).toBeInTheDocument())
+    expect(screen.getByText('RET7-APPROVED')).toBeInTheDocument()
+    expect(screen.getByText(/manager\/admin approved \(user #42\)/i)).toBeInTheDocument()
+    expect(postAttempts).toBe(2)
+  })
+
   it('does not show write controls for a read-only user', async () => {
     mockFetchRoutes([
       {

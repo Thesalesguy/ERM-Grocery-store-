@@ -65,14 +65,49 @@ _APP_ROLE = "erp_app"
 _APP_PASSWORD = "erp_app_password"
 
 # Cluster administration (CREATE/DROP DATABASE, ALTER ROLE, pg_dump/
-# pg_restore run as the cluster owner) needs the actual `postgres`
-# superuser. Neither erp_user nor erp_app has CREATEDB (verified live
-# against this cluster: `\du` shows no special attributes on either) --
-# only `postgres` does. This sandbox's Postgres only trusts the
-# `postgres` OS user via the local Unix socket (peer auth), not a TCP
-# password -- the same `sudo -n -u postgres psql ...` pattern used
-# throughout this project's own M10/M11 migration testing sessions.
+# pg_restore run as the cluster owner) needs a role with real superuser-
+# level privilege -- neither erp_user nor erp_app has CREATEDB in a
+# real, hardened cluster (M1's privilege model; verified live: `\du`
+# shows no special attributes on either). Two environments this suite
+# actually runs in offer that privilege two different ways, detected
+# once below rather than assumed:
+#
+# - "sudo": this project's sandbox/local-dev convention -- a real,
+#   on-box PostgreSQL install where only the actual `postgres` OS/DB
+#   superuser has it, trusted via the local Unix socket (peer auth),
+#   not a TCP password -- the same `sudo -n -u postgres psql ...`
+#   pattern used throughout this project's own M10/M11 migration
+#   testing sessions.
+# - "tcp": GitHub Actions CI (.github/workflows/ci.yml) runs Postgres
+#   as a `services:` Docker container with `POSTGRES_USER: erp_user`,
+#   which makes erp_user THAT container's own bootstrap superuser --
+#   there is no local socket or `postgres` OS user on the runner at
+#   all, only a TCP connection authenticated by password. erp_user
+#   already holds every privilege this test needs there.
+#
+# Both paths exercise the identical verification logic below (row
+# counts, integrity snapshot, GL balance, erp_app privilege denial,
+# migration head) -- only how the administrative commands connect
+# differs. A prior version of this test hardcoded the "sudo" path only,
+# which meant it had never actually completed a run through real GitHub
+# Actions CI since M12 (a real, found-and-fixed gap, not a hypothetical
+# one -- see docs/M14_HARDENING_AUDIT.md).
 _SUDO_POSTGRES = ["sudo", "-n", "-u", "postgres"]
+
+
+def _detect_admin_mode() -> str:
+    """Probed once, at collection time, rather than assumed from an
+    environment variable or CI-specific flag -- keeps this file honest
+    about which environment it's actually running in without any extra
+    configuration a future environment would have to remember to set."""
+    try:
+        probe = subprocess.run(["sudo", "-n", "-u", "postgres", "true"], capture_output=True)
+    except FileNotFoundError:
+        return "tcp"
+    return "sudo" if probe.returncode == 0 else "tcp"
+
+
+_ADMIN_MODE = _detect_admin_mode()
 
 
 def _owner_url(db_name: str) -> str:
@@ -81,26 +116,35 @@ def _owner_url(db_name: str) -> str:
 
 def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
     result = subprocess.run(cmd, capture_output=True, text=True, **kwargs)
-    assert result.returncode == 0, (
-        f"command failed: {' '.join(cmd)}\nstdout: {result.stdout}\nstderr: {result.stderr}"
-    )
+    assert (
+        result.returncode == 0
+    ), f"command failed: {' '.join(cmd)}\nstdout: {result.stdout}\nstderr: {result.stderr}"
     return result
 
 
+def _admin_run(binary: str, *args: str) -> subprocess.CompletedProcess:
+    """Runs a PostgreSQL admin binary (psql/dropdb/createdb/pg_dump/
+    pg_restore) via whichever privilege path `_ADMIN_MODE` detected."""
+    if _ADMIN_MODE == "sudo":
+        return _run([*_SUDO_POSTGRES, binary, *args])
+    return _run(
+        [binary, "-h", "localhost", "-p", "5432", "-U", _OWNER_ROLE, *args],
+        env={**os.environ, "PGPASSWORD": _OWNER_PASSWORD},
+    )
+
+
 def _psql_admin(sql: str, *, dbname: str = "postgres") -> None:
-    _run([*_SUDO_POSTGRES, "psql", "-d", dbname, "-v", "ON_ERROR_STOP=1", "-c", sql])
+    _admin_run("psql", "-d", dbname, "-v", "ON_ERROR_STOP=1", "-c", sql)
 
 
 def _recreate_empty_database(db_name: str) -> None:
-    _run([*_SUDO_POSTGRES, "dropdb", "--if-exists", "--force", db_name])
-    _run([*_SUDO_POSTGRES, "createdb", "-O", _OWNER_ROLE, db_name])
+    _admin_run("dropdb", "--if-exists", "--force", db_name)
+    _admin_run("createdb", "-O", _OWNER_ROLE, db_name)
 
 
 def _bootstrap_app_role(db_name: str) -> None:
     bootstrap_sql = Path(__file__).resolve().parent.parent / "scripts" / "bootstrap_db_roles.sql"
-    _run(
-        [*_SUDO_POSTGRES, "psql", "-d", db_name, "-v", "ON_ERROR_STOP=1", "-f", str(bootstrap_sql)]
-    )
+    _admin_run("psql", "-d", db_name, "-v", "ON_ERROR_STOP=1", "-f", str(bootstrap_sql))
     # bootstrap_db_roles.sql intentionally leaves a placeholder password;
     # this test sets the same password the rest of the suite already
     # uses for erp_app so DATABASE_URL-shaped connections work.
@@ -399,7 +443,7 @@ def backup_test_db():
     if dump_path.exists():
         dump_path.unlink()
 
-    _run([*_SUDO_POSTGRES, "dropdb", "--if-exists", "--force", _TEST_DB_NAME])
+    _admin_run("dropdb", "--if-exists", "--force", _TEST_DB_NAME)
 
 
 def test_real_backup_and_restore_preserves_financial_and_operational_integrity(
@@ -427,22 +471,12 @@ def test_real_backup_and_restore_preserves_financial_and_operational_integrity(
     # the actual current GRANT/REVOKE state -- so erp_app's restricted
     # privileges on journal_entries/audit_logs/etc. round-trip exactly,
     # never --no-owner/--no-privileges, which would silently drop them).
-    _run([*_SUDO_POSTGRES, "pg_dump", "-Fc", "-f", str(dump_path), "-d", _TEST_DB_NAME])
+    _admin_run("pg_dump", "-Fc", "-f", str(dump_path), "-d", _TEST_DB_NAME)
     assert dump_path.exists() and dump_path.stat().st_size > 0
 
     # 3. Destroy and recreate the target database (empty), then restore.
     _recreate_empty_database(_TEST_DB_NAME)
-    _run(
-        [
-            *_SUDO_POSTGRES,
-            "pg_restore",
-            "--clean",
-            "--if-exists",
-            "-d",
-            _TEST_DB_NAME,
-            str(dump_path),
-        ]
-    )
+    _admin_run("pg_restore", "--clean", "--if-exists", "-d", _TEST_DB_NAME, str(dump_path))
 
     # 4. Verify migration state survived the restore untouched.
     from alembic.config import Config

@@ -58,6 +58,11 @@ function ReturnConfirmation({
         <span>Total refund ({saleReturn.refund_method})</span>
         <span>{saleReturn.refund_amount}</span>
       </div>
+      {saleReturn.approval_required && (
+        <p className="mt-2 text-xs text-amber-700">
+          Manager/admin approved (user #{saleReturn.approved_by}).
+        </p>
+      )}
       <p className="mt-3 text-xs text-gray-400">
         The accounting entries for this {isVoid ? 'void' : 'return'} were posted automatically by
         the server and are not editable here.
@@ -83,6 +88,15 @@ function SaleReturnWorkflow({ saleId, onReset }: { saleId: number; onReset: () =
   const [reason, setReason] = useState('')
   const [submitError, setSubmitError] = useState<string | null>(null)
   const [isSubmitting, setIsSubmitting] = useState(false)
+  // M14: the server is the only source of truth for whether this
+  // operation's amount requires approval — the UI never predicts this
+  // itself (it doesn't know the store's threshold). It learns this only
+  // from an APPROVAL_REQUIRED response to an actual attempt, then shows
+  // the approver fields and lets the SAME attempt (same idempotency key)
+  // be resubmitted with them filled in.
+  const [needsApproval, setNeedsApproval] = useState(false)
+  const [approverUsername, setApproverUsername] = useState('')
+  const [approverPassword, setApproverPassword] = useState('')
   const [result, setResult] = useState<{ saleReturn: salesApi.SaleReturn; isVoid: boolean } | null>(
     null,
   )
@@ -128,6 +142,22 @@ function SaleReturnWorkflow({ saleId, onReset }: { saleId: number; onReset: () =
     .map(([saleItemId, draft]) => ({ saleItemId: Number(saleItemId), draft }))
     .filter(({ draft }) => draft.quantity.trim() !== '' && Number(draft.quantity) > 0)
 
+  // M14: a failed approval attempt (wrong password, self-approval, no
+  // permission, wrong store) is a submit failure like any other — shown
+  // via submitError — but the approver fields STAY visible so the
+  // cashier/manager can correct and retry, rather than being dropped
+  // back to "no approval needed yet".
+  function handleSubmitError(err: unknown, fallback: string) {
+    if (err instanceof ApiError) {
+      if (err.code === 'APPROVAL_REQUIRED') {
+        setNeedsApproval(true)
+      }
+      setSubmitError(err.message)
+      return
+    }
+    setSubmitError(fallback)
+  }
+
   async function submitReturn() {
     if (!user?.store_id || returnLines.length === 0) return
     if (idempotencyKeyRef.current === null) {
@@ -147,11 +177,14 @@ function SaleReturnWorkflow({ saleId, onReset }: { saleId: number; onReset: () =
           quantity: draft.quantity,
           restock: draft.restock,
         })),
+        ...(needsApproval
+          ? { approver_username: approverUsername, approver_password: approverPassword }
+          : {}),
       })
       idempotencyKeyRef.current = null
       setResult({ saleReturn, isVoid: false })
     } catch (err) {
-      setSubmitError(err instanceof ApiError ? err.message : 'Failed to process the return.')
+      handleSubmitError(err, 'Failed to process the return.')
     } finally {
       setIsSubmitting(false)
     }
@@ -175,11 +208,14 @@ function SaleReturnWorkflow({ saleId, onReset }: { saleId: number; onReset: () =
         client_transaction_id: idempotencyKeyRef.current,
         refund_method: refundMethod,
         reason: reason.trim() || undefined,
+        ...(needsApproval
+          ? { approver_username: approverUsername, approver_password: approverPassword }
+          : {}),
       })
       idempotencyKeyRef.current = null
       setResult({ saleReturn, isVoid: true })
     } catch (err) {
-      setSubmitError(err instanceof ApiError ? err.message : 'Failed to void the sale.')
+      handleSubmitError(err, 'Failed to void the sale.')
     } finally {
       setIsSubmitting(false)
     }
@@ -310,6 +346,46 @@ function SaleReturnWorkflow({ saleId, onReset }: { saleId: number; onReset: () =
                   />
                 </div>
               </div>
+
+              {needsApproval && (
+                <div className="mt-3 rounded border border-amber-300 bg-amber-50 p-3">
+                  <p className="text-sm font-medium text-amber-800">
+                    This amount requires manager/admin approval. Have an authorized approver (not
+                    yourself) enter their credentials below.
+                  </p>
+                  <div className="mt-2 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                    <div>
+                      <label
+                        htmlFor="approver-username"
+                        className="block text-sm font-medium text-gray-700"
+                      >
+                        Approver username
+                      </label>
+                      <input
+                        id="approver-username"
+                        value={approverUsername}
+                        onChange={(e) => setApproverUsername(e.target.value)}
+                        className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-sm"
+                      />
+                    </div>
+                    <div>
+                      <label
+                        htmlFor="approver-password"
+                        className="block text-sm font-medium text-gray-700"
+                      >
+                        Approver password
+                      </label>
+                      <input
+                        id="approver-password"
+                        type="password"
+                        value={approverPassword}
+                        onChange={(e) => setApproverPassword(e.target.value)}
+                        className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-sm"
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {submitError && (
                 <p role="alert" className="mt-3 rounded bg-red-50 px-3 py-2 text-sm text-red-700">

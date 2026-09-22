@@ -481,7 +481,7 @@ either).
 
 ## 14. Operational runbooks
 
-`docs/RUNBOOKS.md`, one section per required scenario, each with
+`docs/M13_PRODUCTION_RUNBOOKS.md`, one section per required scenario, each with
 symptoms/immediate checks/safe actions/dangerous actions/recovery/
 verification. Never a first-line "mutate accounting/inventory tables
 directly" step — every financial/inventory runbook's recovery path
@@ -522,3 +522,32 @@ an operator should budget for, not hidden.
    general (Section 11) — only paired schema+app downgrade is.
 6. No Grafana/dashboarding layer — Prometheus/Alertmanager's own UIs
    only, a deliberate scope choice against "unnecessarily large."
+7. No `pg_hba.conf` snippet is shipped alongside
+   `deploy/postgres/postgresql.prod.conf.snippet` (found in Phase 18's
+   adversarial audit) — `listen_addresses=localhost` is required and
+   verified live, but the second layer (which auth method PostgreSQL
+   accepts on that loopback connection) is left to the target distro's
+   own defaults, undocumented. Password auth is proven required in
+   practice (`test_a_wrong_database_password_fails_closed_without_leaking_the_password`),
+   but nothing pins that down as a required `pg_hba.conf` rule rather
+   than an accident of the distro default. Accepted risk, not fixed in
+   this milestone.
+
+## 18. Phases 16–20 closure
+
+Phases 0–15 above are this milestone's architecture and intent, largely
+unchanged since Phase 1. Phases 16–20 — the permanent integrated
+production-topology test session, failure injection / disaster
+recovery, the adversarial security audit, mutation testing, and the
+final integrity/migration/regression gate — are documented separately
+rather than folded in here, since they are evidence of what was
+actually tested against this design, not the design itself:
+
+- `docs/M13_TESTING_SESSIONS.md` — the major test sessions, each with
+  objective, environment, procedure, expected/actual result, defects
+  found and fixed, and the regression test that now guards it.
+- `docs/M13_HARDENING_AUDIT.md` — the adversarial audit findings
+  (classified CRITICAL/HIGH/MEDIUM/LOW/ACCEPTED RISK), the mutation-
+  testing results, the final self-audit, and the final verdict.
+- `docs/M13_PRODUCTION_RUNBOOKS.md` — 16 incident runbooks (Phase 14,
+  extended in Phase 17).

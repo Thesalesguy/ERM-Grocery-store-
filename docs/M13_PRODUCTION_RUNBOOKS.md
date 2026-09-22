@@ -1,6 +1,6 @@
 # Operational Runbooks
 
-M13 Phase 14. Fifteen scenarios, each stating: **Symptoms** (how you'd
+M13 Phases 14, 17-18. Sixteen scenarios, each stating: **Symptoms** (how you'd
 notice), **Immediate checks** (what to look at first, read-only),
 **Safe actions** (what you may do), **Dangerous actions** (what you
 must NOT do), **Recovery**, **Verification** (how you know it's
@@ -631,3 +631,46 @@ one.
 **Verification**: `ERPElevatedRequestErrorRate`/
 `ERPElevatedSlowRequestRate` clear; the specific endpoint(s) identified
 during triage return to normal latency/status-code distribution.
+
+---
+
+## 16. Monitoring component down
+
+**Symptoms**: `ERPMonitoringTargetDown` fires (`up{job!="prometheus"}
+== 0` for the named job). Found as a real gap during M13 Phase 17
+failure-injection testing: every other alert in this file is computed
+from `erp_exporter`'s own scrape (`erp_api_up`, `erp_db_up`,
+`erp_migration_current`, etc.) — if `erp_exporter` itself crashes,
+those alerts don't fire "down", they simply stop producing fresh
+samples, and nothing else in this file would have told an operator the
+system had gone blind. Prometheus's own `up` metric is the only signal
+that still reflects reality when a target disappears entirely.
+
+**Immediate checks**:
+- `curl http://<prometheus-host>:9090/api/v1/targets` — confirm which
+  job (`erp_exporter`, `node_exporter`, or `postgres_exporter`) is
+  reporting `"health": "down"`, and read its `lastError`.
+- `systemctl status erp-exporter` (or the equivalent unit for
+  `node_exporter`/`postgres_exporter`) — is the process actually
+  running?
+- Check the exporter's own log for a crash/exception.
+
+**Safe actions**:
+- Restart the named exporter service.
+- Confirm Prometheus's `/targets` page shows it healthy again.
+
+**Dangerous actions**:
+- Do not treat "no other alerts are firing" as evidence the system is
+  healthy while this alert is active — it means the opposite: the
+  alerts that would normally tell you are not receiving data.
+- Do not silence this alert as a workaround for a flapping exporter;
+  fix the exporter's stability instead (a flapping monitoring target is
+  itself a reliability problem worth root-causing).
+
+**Recovery**: the named exporter process is running and being scraped
+successfully again.
+
+**Verification**: the target shows `"health": "up"` in Prometheus;
+`ERPMonitoringTargetDown` clears; spot-check that the alerts that
+depend on this exporter (Sections 1–2 for `erp_exporter`) are producing
+fresh values again, not just that the target itself is up.

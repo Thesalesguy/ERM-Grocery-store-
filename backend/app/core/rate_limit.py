@@ -99,3 +99,13 @@ class FixedWindowRateLimiter:
 # refresh-token-guessing meaningfully slower than an unthrottled endpoint.
 login_rate_limiter = FixedWindowRateLimiter(limit=10, window_seconds=300)
 refresh_rate_limiter = FixedWindowRateLimiter(limit=30, window_seconds=300)
+
+# M14 (docs/M14_DESIGN.md): the return/void approval gate verifies a
+# second user's password inline (app.modules.auth.service.
+# verify_user_credentials), a credential-check surface outside
+# /auth/login and /auth/refresh that would otherwise have no throttling
+# at all -- same threshold and window as login_rate_limiter, same
+# per-client-IP keying rationale (see module docstring above), kept as
+# its own instance so a burst of legitimate return/void traffic can never
+# consume a login budget or vice versa.
+approval_rate_limiter = FixedWindowRateLimiter(limit=10, window_seconds=300)

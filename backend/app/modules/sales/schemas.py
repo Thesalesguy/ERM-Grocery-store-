@@ -128,6 +128,15 @@ class SaleReturnCreate(BaseModel):
     refund_method: str
     reason: str | None = Field(default=None, max_length=2000)
     lines: list[SaleReturnLineCreate] = Field(min_length=1, max_length=500)
+    # M14 (docs/M14_DESIGN.md): only consulted server-side if the
+    # computed refund total is at or above the store's configured
+    # approval threshold — harmless to omit or send on a return that
+    # turns out not to need them. The approving manager's own
+    # credentials, re-verified inline by
+    # app.modules.auth.service.verify_user_credentials; never a token or
+    # a pre-issued "approval" that could be replayed or reused.
+    approver_username: str | None = Field(default=None, max_length=150)
+    approver_password: str | None = Field(default=None, max_length=255)
 
     @field_validator("refund_method")
     @classmethod
@@ -143,6 +152,10 @@ class VoidSaleCreate(BaseModel):
     client_transaction_id: str = Field(min_length=1, max_length=100)
     refund_method: str
     reason: str | None = Field(default=None, max_length=2000)
+    # M14: same semantics as SaleReturnCreate.approver_* above — a void
+    # is subject to the identical approval gate.
+    approver_username: str | None = Field(default=None, max_length=150)
+    approver_password: str | None = Field(default=None, max_length=255)
 
     @field_validator("refund_method")
     @classmethod
@@ -180,6 +193,8 @@ class SaleReturnRead(BaseModel):
     refund_method: str
     refund_amount: Decimal
     processed_by: int | None
+    approval_required: bool
+    approved_by: int | None
     created_at: datetime
     items: list[SaleReturnItemRead] = Field(default_factory=list)
 

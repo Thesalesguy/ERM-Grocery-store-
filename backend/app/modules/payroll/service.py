@@ -297,8 +297,7 @@ def cancel_payroll_period(
         return period
     if period.status not in _CANCELLABLE_STATUSES:
         raise ConflictError(
-            f"Payroll period {payroll_period_id} is {period.status} and can no longer "
-            "be cancelled",
+            f"Payroll period {payroll_period_id} is {period.status} and can no longer be cancelled",
             error_code="INVALID_PERIOD_STATE",
         )
 
@@ -498,8 +497,7 @@ def calculate_payroll_period(
     _enforce_store_access(caller_store_id, period.store_id, "payroll period")
     if period.status not in _CALCULABLE_STATUSES:
         raise ConflictError(
-            f"Payroll period {payroll_period_id} is {period.status} and cannot be "
-            "(re)calculated",
+            f"Payroll period {payroll_period_id} is {period.status} and cannot be (re)calculated",
             error_code="INVALID_PERIOD_STATE",
         )
 
@@ -755,7 +753,7 @@ def post_payroll_period(
     except IntegrityError as exc:
         db.rollback()
         raise ConflictError(
-            f"Payroll period {payroll_period_id} posting client_transaction_id was " "already used",
+            f"Payroll period {payroll_period_id} posting client_transaction_id was already used",
             error_code="DUPLICATE_POSTING_REQUEST",
         ) from exc
 

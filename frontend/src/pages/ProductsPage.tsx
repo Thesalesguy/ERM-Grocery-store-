@@ -89,10 +89,11 @@ export function ProductsPage() {
   const [search, setSearch] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-    const [showForm, setShowForm] = useState(false)
-    const [selectedStoreId, setSelectedStoreId] = useState<number | null>(null)
-    const [availableStores, setAvailableStores] = useState<{ id: number; name: string }[]>([{ id: 2, name: 'Main Street Branch' }])
-
+  const [showForm, setShowForm] = useState(false)
+  const [selectedStoreId, setSelectedStoreId] = useState<number | null>(null)
+  const [availableStores] = useState<{ id: number; name: string }[]>([
+    { id: 2, name: 'Main Street Branch' },
+  ])
 
   async function load() {
     setLoading(true)
@@ -143,50 +144,56 @@ export function ProductsPage() {
         )}
       </div>
 
-          {showForm && (
-              <div className="mt-4 rounded border border-gray-200 bg-gray-50 p-4">
-                  {/* Dropdown for Cross-Store Admin if no branch is selected yet */}
-                  {user?.store_id == null && !selectedStoreId && (
-                      <div className="space-y-3">
-                          <label className="block text-sm font-medium text-gray-700">Select Target Operating Branch:</label>
-                          <select
-                              className="w-full max-w-sm rounded border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 focus:border-blue-500 focus:outline-none"
-                              onChange={(e) => setSelectedStoreId(Number(e.target.value) || null)}
-                              defaultValue=""
-                          >
-                              <option value="" disabled>-- Choose a Location Branch --</option>
-                              {availableStores.map(store => (
-                                  <option key={store.id} value={store.id}>{store.name}</option>
-                              ))}
-                          </select>
-                          <div>
-                              <button
-                                  onClick={() => setShowForm(false)}
-                                  className="text-sm font-medium text-gray-600 hover:text-gray-800"
-                              >
-                                  Cancel
-                              </button>
-                          </div>
-                      </div>
-                  )}
-
-                  {/* Render ProductForm once a valid store ID context is resolved */}
-                  {(user?.store_id != null || selectedStoreId != null) && (
-                      <ProductForm
-                          storeId={user?.store_id ?? selectedStoreId!}
-                          onCreated={() => {
-                              setShowForm(false)
-                              setSelectedStoreId(null)
-                              load()
-                          }}
-                          onCancel={() => {
-                              setShowForm(false)
-                              setSelectedStoreId(null)
-                          }}
-                      />
-                  )}
+      {showForm && (
+        <div className="mt-4 rounded border border-gray-200 bg-gray-50 p-4">
+          {/* Dropdown for Cross-Store Admin if no branch is selected yet */}
+          {user?.store_id == null && !selectedStoreId && (
+            <div className="space-y-3">
+              <label className="block text-sm font-medium text-gray-700">
+                Select Target Operating Branch:
+              </label>
+              <select
+                className="w-full max-w-sm rounded border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 focus:border-blue-500 focus:outline-none"
+                onChange={(e) => setSelectedStoreId(Number(e.target.value) || null)}
+                defaultValue=""
+              >
+                <option value="" disabled>
+                  -- Choose a Location Branch --
+                </option>
+                {availableStores.map((store) => (
+                  <option key={store.id} value={store.id}>
+                    {store.name}
+                  </option>
+                ))}
+              </select>
+              <div>
+                <button
+                  onClick={() => setShowForm(false)}
+                  className="text-sm font-medium text-gray-600 hover:text-gray-800"
+                >
+                  Cancel
+                </button>
               </div>
+            </div>
           )}
+
+          {/* Render ProductForm once a valid store ID context is resolved */}
+          {(user?.store_id != null || selectedStoreId != null) && (
+            <ProductForm
+              storeId={user?.store_id ?? selectedStoreId!}
+              onCreated={() => {
+                setShowForm(false)
+                setSelectedStoreId(null)
+                load()
+              }}
+              onCancel={() => {
+                setShowForm(false)
+                setSelectedStoreId(null)
+              }}
+            />
+          )}
+        </div>
+      )}
 
       <input
         placeholder="Search by name or SKU…"

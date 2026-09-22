@@ -357,7 +357,7 @@ def _enforce_store_access_via_current_assignment(
     current_assignment = get_current_assignment(db, employee_id)
     if current_assignment is None:
         raise ForbiddenError(
-            f"Employee {employee_id} has no current store assignment to verify access " "against",
+            f"Employee {employee_id} has no current store assignment to verify access against",
             error_code="STORE_ACCESS_DENIED",
         )
     _enforce_store_access(caller_store_id, current_assignment.store_id, "employee")

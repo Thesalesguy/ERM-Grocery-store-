@@ -68,6 +68,7 @@ if [ -z "${BACKUP_AGE_PUBLIC_KEY:-}" ]; then
     exit 1
 fi
 age -r "$BACKUP_AGE_PUBLIC_KEY" -o "$ENCRYPTED_FILE" "$DUMP_FILE"
+chmod 600 "$ENCRYPTED_FILE"
 MANIFEST_FILE="${DUMP_FILE}.manifest.json"
 python3 -c "
 import json, sys
@@ -78,6 +79,7 @@ print(json.dumps({
     'created_at': '$(date -u +%Y-%m-%dT%H:%M:%SZ)',
 }, indent=2))
 " "$(basename "$DUMP_FILE")" "$CHECKSUM" > "$MANIFEST_FILE"
+chmod 600 "$MANIFEST_FILE"
 echo "Encrypted: $ENCRYPTED_FILE ($(du -h "$ENCRYPTED_FILE" | cut -f1))"
 
 echo "=== 3/5: transport off-box (rclone -> ${RCLONE_REMOTE}) ==="

@@ -109,6 +109,12 @@ export interface SaleReturnCreateInput {
   refund_method: PaymentInput['payment_method']
   reason?: string
   lines: SaleReturnLineInput[]
+  /** M14: only consulted server-side if the computed refund total is at or
+   * above the store's configured approval threshold. Omit on the first
+   * attempt; the server rejects with error code APPROVAL_REQUIRED (and
+   * names the threshold) if these turn out to be needed. */
+  approver_username?: string
+  approver_password?: string
 }
 
 export interface VoidSaleInput {
@@ -117,6 +123,8 @@ export interface VoidSaleInput {
   client_transaction_id: string
   refund_method: PaymentInput['payment_method']
   reason?: string
+  approver_username?: string
+  approver_password?: string
 }
 
 export interface SaleReturnItem {
@@ -143,6 +151,8 @@ export interface SaleReturn {
   refund_method: string
   refund_amount: string
   processed_by: number | null
+  approval_required: boolean
+  approved_by: number | null
   created_at: string
   items: SaleReturnItem[]
 }

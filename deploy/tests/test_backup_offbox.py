@@ -74,7 +74,11 @@ def _bootstrap_app_role(db_name: str) -> None:
 def _migrate_to_head(db_name: str) -> None:
     env = {**os.environ, "MIGRATIONS_DATABASE_URL": _owner_url(db_name)}
     result = subprocess.run(
-        ["alembic", "upgrade", "head"], cwd=str(BACKEND_DIR), env=env, capture_output=True, text=True
+        ["alembic", "upgrade", "head"],
+        cwd=str(BACKEND_DIR),
+        env=env,
+        capture_output=True,
+        text=True,
     )
     assert result.returncode == 0, f"migration failed:\n{result.stdout}\n{result.stderr}"
 
@@ -140,7 +144,7 @@ def offbox_env():
         )
 
         rclone_conf = tmp_path / "rclone.conf"
-        rclone_conf.write_text(f"[offbox_test]\ntype = local\n")
+        rclone_conf.write_text("[offbox_test]\ntype = local\n")
 
         yield {
             "db_url": _owner_url(_TEST_DB_NAME),
@@ -185,7 +189,9 @@ def test_full_offbox_backup_and_restore_cycle_preserves_integrity(offbox_env: di
 
     encrypted_files = list(offbox_env["remote_dir"].glob("*.dump.age"))
     manifest_files = list(offbox_env["remote_dir"].glob("*.manifest.json"))
-    assert len(encrypted_files) == 1, f"expected exactly one encrypted backup, got {encrypted_files}"
+    assert len(encrypted_files) == 1, (
+        f"expected exactly one encrypted backup, got {encrypted_files}"
+    )
     assert len(manifest_files) == 1
 
     status_file = offbox_env["local_backup_dir"] / "backup_status.prom"
@@ -284,13 +290,96 @@ def test_a_corrupted_remote_backup_is_detected_and_restore_is_refused(
     # The target database must never have been created/populated from
     # corrupted data.
     check = subprocess.run(
-        [*SUDO_POSTGRES, "psql", "-d", "postgres", "-tAc",
-         f"SELECT 1 FROM pg_database WHERE datname = '{_RESTORE_DB_NAME}'"],
+        [
+            *SUDO_POSTGRES,
+            "psql",
+            "-d",
+            "postgres",
+            "-tAc",
+            f"SELECT 1 FROM pg_database WHERE datname = '{_RESTORE_DB_NAME}'",
+        ],
         capture_output=True,
         text=True,
     )
     assert check.stdout.strip() != "1", (
         "the restore target database must not exist after a refused corrupt restore"
+    )
+
+
+def test_a_tampered_manifest_checksum_is_detected_and_restore_is_refused(
+    offbox_env: dict,
+) -> None:
+    """M13 Phase 19 (mutation testing): the previous test's byte-flip
+    corruption is always caught by `age`'s own authenticated encryption
+    failing to decrypt at all, before the manual checksum comparison in
+    restore_offbox.sh ever runs -- so disabling that checksum comparison
+    entirely was NOT detected by the existing suite (a real mutation-
+    testing finding, not a bug). This isolates the checksum step on its
+    own: the encrypted file decrypts perfectly cleanly (untouched), but
+    the MANIFEST's recorded checksum is tampered, so only the checksum
+    comparison itself -- not `age` -- can catch it."""
+    backup_result = subprocess.run(
+        [
+            str(DEPLOY_DIR / "scripts" / "backup_offbox.sh"),
+            str(offbox_env["local_backup_dir"]),
+            offbox_env["rclone_remote"],
+            "14",
+        ],
+        env=_backup_env(offbox_env),
+        capture_output=True,
+        text=True,
+    )
+    assert backup_result.returncode == 0
+
+    manifest_files = list(offbox_env["remote_dir"].glob("*.manifest.json"))
+    assert len(manifest_files) == 1
+    manifest_file = manifest_files[0]
+
+    manifest = json.loads(manifest_file.read_text())
+    manifest["sha256_plaintext"] = "0" * 64
+    manifest_file.write_text(json.dumps(manifest))
+
+    encrypted_files = list(offbox_env["remote_dir"].glob("*.dump.age"))
+    assert len(encrypted_files) == 1
+
+    restore_result = subprocess.run(
+        [
+            str(DEPLOY_DIR / "scripts" / "restore_offbox.sh"),
+            offbox_env["rclone_remote"],
+            encrypted_files[0].name,
+            str(offbox_env["local_backup_dir"] / "restore_staging_tampered_manifest"),
+            _RESTORE_DB_NAME,
+        ],
+        env={
+            **os.environ,
+            "RCLONE_CONFIG": str(offbox_env["rclone_conf"]),
+            "AGE_IDENTITY_FILE": str(offbox_env["age_identity_file"]),
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert restore_result.returncode != 0, (
+        "restore_offbox.sh must refuse a backup whose manifest checksum doesn't match"
+    )
+    combined_output = restore_result.stdout + restore_result.stderr
+    assert "CHECKSUM MISMATCH" in combined_output, (
+        f"expected the checksum-comparison step itself to catch this, got:\n{combined_output}"
+    )
+
+    check = subprocess.run(
+        [
+            *SUDO_POSTGRES,
+            "psql",
+            "-d",
+            "postgres",
+            "-tAc",
+            f"SELECT 1 FROM pg_database WHERE datname = '{_RESTORE_DB_NAME}'",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert check.stdout.strip() != "1", (
+        "the restore target database must not exist after a refused checksum-mismatch restore"
     )
 
 
@@ -322,7 +411,9 @@ def test_retention_cleanup_removes_backups_older_than_the_window(offbox_env: dic
         f"backup failed:\n{backup_result.stdout}\n{backup_result.stderr}"
     )
 
-    assert not old_encrypted.exists(), "a 30-day-old backup must be cleaned up under a 14-day retention"
+    assert not old_encrypted.exists(), (
+        "a 30-day-old backup must be cleaned up under a 14-day retention"
+    )
     assert not old_manifest.exists()
     # The fresh backup this run just made must still be present.
     assert list(offbox_env["remote_dir"].glob("*.dump.age"))

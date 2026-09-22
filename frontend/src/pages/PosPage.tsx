@@ -182,15 +182,19 @@ export function PosPage() {
   return (
     <div
       onClick={(e) => {
-      const target = e.target as HTMLElement
-       // Stop the page from hijacking your cursor if clicking inside input or select boxes
-      if (target.tagName === 'INPUT' || target.tagName === 'SELECT' || target.tagName === 'BUTTON') {
-        return
-      }
-      scannerInputRef.current?.focus()
-     }}
-     className="min-h-screen" // Keep your existing styles here
-   >
+        const target = e.target as HTMLElement
+        // Stop the page from hijacking your cursor if clicking inside input or select boxes
+        if (
+          target.tagName === 'INPUT' ||
+          target.tagName === 'SELECT' ||
+          target.tagName === 'BUTTON'
+        ) {
+          return
+        }
+        scannerInputRef.current?.focus()
+      }}
+      className="min-h-screen" // Keep your existing styles here
+    >
       <h1 className="text-2xl font-semibold text-gray-900">Point of Sale</h1>
 
       <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
