@@ -49,6 +49,13 @@ class StockAdjustmentCreate(BaseModel):
     )
     reason_code: str = Field(pattern="^(DAMAGE|THEFT|EXPIRY|STOCKTAKE_CORRECTION|OTHER)$")
     notes: str | None = Field(default=None, max_length=2000)
+    # M15 pre-milestone hardening (docs/M15_DESIGN.md "Pre-M15
+    # hardening"): optional, mirroring SaleCreate.client_transaction_id.
+    # Omitted entirely (the field's default) behaves exactly as before
+    # this hardening — no idempotency check at all; supplied, a retried
+    # request with the same key returns the original adjustment instead
+    # of creating a second one and double-posting its inventory/GL effect.
+    client_transaction_id: str | None = Field(default=None, min_length=1, max_length=100)
 
     @field_validator("quantity_delta")
     @classmethod
@@ -70,6 +77,7 @@ class StockAdjustmentRead(BaseModel):
     created_by: int | None
     approved_by: int | None
     stock_count_id: int | None
+    client_transaction_id: str | None
     created_at: datetime
 
 

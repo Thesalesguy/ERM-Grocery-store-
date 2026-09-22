@@ -143,6 +143,7 @@ def create_adjustment(
         created_by=current_user.id,
         ip_address=request.client.host if request.client else None,
         user_agent=request.headers.get("user-agent"),
+        client_transaction_id=payload.client_transaction_id,
     )
     db.commit()
     db.refresh(adjustment)
