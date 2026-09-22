@@ -18,6 +18,7 @@ folded into the fast `pytest -q` default run's assumptions.
 
 import os
 import subprocess
+import sys
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -99,9 +100,28 @@ def _detect_admin_mode() -> str:
     """Probed once, at collection time, rather than assumed from an
     environment variable or CI-specific flag -- keeps this file honest
     about which environment it's actually running in without any extra
-    configuration a future environment would have to remember to set."""
+    configuration a future environment would have to remember to set.
+
+    Deliberately probes actual connectivity (`psql -c "SELECT 1"` against
+    the local socket as the `postgres` OS user), not just sudo
+    *permission* -- a first version of this probe checked only
+    `sudo -n -u postgres true`, which returns success on GitHub Actions'
+    `ubuntu-latest` runner (passwordless sudo to a `postgres` OS user
+    that merely exists there, likely from an apt dependency) even though
+    no local PostgreSQL SERVER is listening on that runner at all --
+    Postgres runs in a separate `services:` Docker container, reachable
+    only over TCP. That false positive was caught by the very next CI
+    run this fix shipped in (see docs/M14_HARDENING_AUDIT.md): the
+    dropdb call still went down the sudo path and failed with the exact
+    same "no such file or directory" socket error as before. A real
+    `SELECT 1` is the only way to tell "sudo works" apart from "sudo AND
+    a local server are both present."
+    """
     try:
-        probe = subprocess.run(["sudo", "-n", "-u", "postgres", "true"], capture_output=True)
+        probe = subprocess.run(
+            [*_SUDO_POSTGRES, "psql", "-d", "postgres", "-tAc", "SELECT 1"],
+            capture_output=True,
+        )
     except FileNotFoundError:
         return "tcp"
     return "sudo" if probe.returncode == 0 else "tcp"
@@ -154,8 +174,16 @@ def _bootstrap_app_role(db_name: str) -> None:
 def _migrate_to_head(db_name: str) -> None:
     env = {**os.environ, "MIGRATIONS_DATABASE_URL": _owner_url(db_name)}
     backend_dir = Path(__file__).resolve().parent.parent
+    # sys.executable, not a hardcoded ".venv/bin/python3" -- this sandbox
+    # runs pytest via a local .venv, but GitHub Actions CI installs
+    # dependencies straight into actions/setup-python's system
+    # interpreter with no virtualenv at all (see
+    # .github/workflows/ci.yml's "Install backend dependencies" step),
+    # so a hardcoded venv path doesn't exist there. sys.executable is
+    # always the exact interpreter pytest itself is already running
+    # under, which has alembic installed in both environments.
     _run(
-        [".venv/bin/python3", "-m", "alembic", "upgrade", "head"],
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
         cwd=str(backend_dir),
         env=env,
     )
