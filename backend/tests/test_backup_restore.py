@@ -18,6 +18,7 @@ folded into the fast `pytest -q` default run's assumptions.
 
 import os
 import subprocess
+import sys
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -173,8 +174,16 @@ def _bootstrap_app_role(db_name: str) -> None:
 def _migrate_to_head(db_name: str) -> None:
     env = {**os.environ, "MIGRATIONS_DATABASE_URL": _owner_url(db_name)}
     backend_dir = Path(__file__).resolve().parent.parent
+    # sys.executable, not a hardcoded ".venv/bin/python3" -- this sandbox
+    # runs pytest via a local .venv, but GitHub Actions CI installs
+    # dependencies straight into actions/setup-python's system
+    # interpreter with no virtualenv at all (see
+    # .github/workflows/ci.yml's "Install backend dependencies" step),
+    # so a hardcoded venv path doesn't exist there. sys.executable is
+    # always the exact interpreter pytest itself is already running
+    # under, which has alembic installed in both environments.
     _run(
-        [".venv/bin/python3", "-m", "alembic", "upgrade", "head"],
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
         cwd=str(backend_dir),
         env=env,
     )
