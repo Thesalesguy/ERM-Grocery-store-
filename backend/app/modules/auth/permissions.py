@@ -73,6 +73,15 @@ AP_PAY = "ap.pay"
 # code rather than folded into ap.post so a role could plausibly have one
 # without the other, though M7's own matrix always grants them together.
 AP_CREDIT = "ap.credit"
+# M16 (docs/M16_DESIGN.md "AP payment/credit-note correction path"):
+# reversing a supplier payment or credit note is a genuinely new,
+# separate capability from creating one (ap.pay/ap.credit) — it corrects
+# a real cash/AP movement that already happened, mirroring
+# accounting.reverse's own scope (a correction action, not a routine
+# write). One permission covers both payment and credit-note reversal,
+# mirroring accounting.reverse's own single-permission scope for "reverse
+# a financial posting" rather than splitting per source type.
+AP_REVERSE = "ap.reverse"
 # M8 (docs/M8_ADVANCED_INVENTORY_DESIGN.md "Design Decision 2"): stock
 # counting is split into three tiers exactly like AP's write/post/pay
 # split — data entry (count.write covers create/open/count-entry/recount/
@@ -228,6 +237,7 @@ ALL_PERMISSIONS: dict[str, str] = {
     ),
     AP_PAY: "Record a supplier payment, settling Accounts Payable",
     AP_CREDIT: "Create a supplier credit note, reducing Accounts Payable",
+    AP_REVERSE: "Reverse a supplier payment or credit note with a compensating entry",
     INVENTORY_COUNT_WRITE: "Create, open, count, recount, and cancel a stock count",
     INVENTORY_COUNT_REVIEW: "Review a counted stock count before posting",
     INVENTORY_COUNT_POST: "Post a reviewed stock count, committing its variance to the GL",
@@ -306,6 +316,7 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         AP_POST,
         AP_PAY,
         AP_CREDIT,
+        AP_REVERSE,
         INVENTORY_COUNT_WRITE,
         INVENTORY_COUNT_REVIEW,
         INVENTORY_COUNT_POST,

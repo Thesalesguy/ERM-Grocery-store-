@@ -978,6 +978,7 @@ def create_sale_return(
         approval_required=approval_required,
         approved_by=approved_by,
         shift_id=active_shift.id if active_shift is not None else None,
+        return_date=return_date,
     )
     db.add(sale_return)
     try:

@@ -15,10 +15,10 @@ columns, so the stored value can never silently drift from what it's
 supposed to represent.
 """
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Numeric, String, Text
+from sqlalchemy import CheckConstraint, Date, DateTime, ForeignKey, Index, Numeric, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base_class import Base, TimestampMixin
@@ -231,6 +231,18 @@ class SaleReturn(TimestampMixin, Base):
     # derived through sale_id -- see docs/M15_DESIGN.md "Shift
     # association" for the full reasoning.
     shift_id: Mapped[int | None] = mapped_column(ForeignKey("cashier_shifts.id"))
+    # M16 pre-implementation hardening (docs/M16_DESIGN.md "Operational vs.
+    # GL return-date divergence"): the same caller-supplied business date
+    # already passed to accounting_service.post_sale_return_journal's
+    # posting_date -- previously computed but never persisted anywhere on
+    # this row itself, so an operational reader (e.g. reports/service.py)
+    # had no way to bucket a return by the same date the GL used and fell
+    # back to created_at (insertion time), which a backdated return could
+    # silently disagree with. Nullable and NOT backfilled for pre-M16
+    # rows -- reporting code coalesces to created_at's date for any row
+    # where this is NULL, preserving every existing return's historical
+    # reporting bucket exactly as it already was.
+    return_date: Mapped[date | None] = mapped_column(Date)
 
     items: Mapped[list["SaleReturnItem"]] = relationship(back_populates="sale_return")
 

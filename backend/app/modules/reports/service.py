@@ -144,15 +144,44 @@ def _apply_sale_scope(
     return query
 
 
+def _return_business_date() -> Any:
+    """`SaleReturn.return_date` (M16 pre-implementation hardening) is the
+    SAME client-supplied, GL-authoritative business date
+    `post_sale_return_journal` posts against (accounting/service.py's
+    `posting_date=return_date`) — before this fix, a backdated return
+    (recorded today for a return_date in an already-reported prior
+    period) would land in different reporting periods on the operational
+    report (bucketed by insertion time) versus the GL-derived P&L
+    (bucketed by return_date), producing two disagreeing `gross_profit`
+    figures for the same nominal period. Sales themselves have no
+    equivalent divergence — `Sale.completed_at` is already the single
+    date used both for GL posting and for every operational report —
+    this brings returns in line with that same one-authoritative-
+    business-date principle, not a new one.
+
+    `return_date` is nullable and NOT backfilled for returns created
+    before this column existed (docs/M16_DESIGN.md), so every reporting
+    use coalesces to `created_at`'s date for those rows — their
+    historical reporting bucket is unchanged by this fix; only returns
+    created from here on get the corrected, GL-matching behavior."""
+    return func.coalesce(SaleReturn.return_date, func.date(SaleReturn.created_at))
+
+
 def _apply_return_scope(
     query: Any, *, store_ids: list[int] | None, start: datetime | None, end: datetime | None
 ) -> Any:
+    """Filters by `_return_business_date()`, not raw `created_at` — see
+    that function's docstring. `start`/`end` are the half-open datetime
+    bounds `_day_range_bounds` produces for a timestamp column; `.date()`
+    recovers the inclusive [date_from, date_to] day range for this
+    plain-date comparison (a return's business date has no time-of-day
+    component to align against)."""
     if store_ids is not None:
         query = query.where(SaleReturn.store_id.in_(store_ids))
     if start is not None:
-        query = query.where(SaleReturn.created_at >= start)
+        query = query.where(_return_business_date() >= start.date())
     if end is not None:
-        query = query.where(SaleReturn.created_at < end)
+        query = query.where(_return_business_date() < end.date())
     return query
 
 
@@ -558,7 +587,11 @@ def sales_trend_by_day(
 
     returns_query = (
         select(
-            func.date(SaleReturn.created_at),
+            # M16 pre-implementation hardening: grouped by the same
+            # coalesced business date _apply_return_scope now filters by
+            # (see _return_business_date's docstring) — was
+            # func.date(created_at).
+            _return_business_date(),
             func.coalesce(
                 func.sum(
                     SaleReturnItem.unit_price_refunded * SaleReturnItem.quantity
@@ -572,7 +605,7 @@ def sales_trend_by_day(
         .join(SaleReturn, SaleReturn.id == SaleReturnItem.sale_return_id)
         .join(Sale, Sale.id == SaleReturn.sale_id)
         .where(Sale.status != "VOIDED")
-        .group_by(func.date(SaleReturn.created_at))
+        .group_by(_return_business_date())
     )
     returns_query = _apply_return_scope(returns_query, store_ids=store_ids, start=start, end=end)
     returns_by_day = {row[0]: Decimal(row[1]) for row in db.execute(returns_query)}

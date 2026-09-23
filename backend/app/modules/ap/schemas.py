@@ -47,6 +47,15 @@ class VoidPurchaseInvoiceRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=2000)
 
 
+class SupplierReversalRequest(BaseModel):
+    """M16: reason is mandatory (unlike a void's optional reason) —
+    mirrors app.modules.payroll.schemas.PayrollPeriodReverseInput
+    exactly, since reversing a settled payment/credit note is a
+    correction action, not a routine cancellation."""
+
+    reason: str = Field(min_length=1, max_length=2000)
+
+
 class PurchaseInvoiceReceiptMatchRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

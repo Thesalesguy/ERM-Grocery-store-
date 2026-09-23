@@ -43,6 +43,7 @@ M12_HEAD_REVISION = "17fb9afe8d39"  # M12: + grant erp_app SELECT-only on alembi
 M14_HEAD_REVISION = "e0d2359bb08a"  # M14: return/void approval threshold
 M15_PRE_HARDENING_REVISION = "1a4bae98d246"  # pre-M15: stock adjustment idempotency
 M15_HEAD_REVISION = "db482a11ee31"  # M15: cashier/till shift sessions
+M16_HARDENING_REVISION = "e1a681c4aba3"  # M16: pre-implementation hardening
 
 
 def _alembic_config() -> Config:
@@ -152,15 +153,19 @@ def test_full_upgrade_downgrade_upgrade_cycle(migrations_db: str) -> None:
     # privilege; M14 adds two COLUMNS, not tables -- unchanged at 61
     # through M14. The pre-M15 hardening migration adds one COLUMN, not a
     # table. M15 itself adds exactly two new tables (cashier_shifts,
-    # cash_movements): 61 + 2 = 63.
-    assert _table_count(migrations_db) == 63
+    # cash_movements): 61 + 2 = 63. The M16 pre-implementation hardening
+    # migration adds two more (supplier_payment_reversals,
+    # supplier_credit_note_reversals; sale_returns.return_date and the
+    # sales/sale_returns shift_id indexes are a column/index change, not
+    # tables): 63 + 2 = 65.
+    assert _table_count(migrations_db) == 65
 
     command.downgrade(cfg, M0_REVISION)
     assert _table_count(migrations_db) == 8
 
     command.upgrade(cfg, "head")
-    assert _table_count(migrations_db) == 63
-    assert _current_revision(migrations_db) == M15_HEAD_REVISION
+    assert _table_count(migrations_db) == 65
+    assert _current_revision(migrations_db) == M16_HARDENING_REVISION
 
 
 def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
@@ -179,8 +184,9 @@ def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
     # M14 adds one new permission (sales.return.approve) on top of M12's
     # 44 = 45. M15 adds three more (shift.manage, shift.read,
     # shift.override) = 48. The pre-M15 hardening migration adds no
-    # permissions (a column only).
-    assert permission_count == 48
+    # permissions (a column only). The M16 pre-implementation hardening
+    # migration adds one more (ap.reverse) = 49.
+    assert permission_count == 49
 
 
 def test_m7_downgrade_refuses_when_credit_note_data_exists(migrations_db: str) -> None:

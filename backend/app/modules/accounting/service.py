@@ -698,6 +698,75 @@ def post_supplier_credit_note_journal(
     )
 
 
+def post_supplier_payment_reversal_journal(
+    db: Session,
+    *,
+    supplier_payment: "SupplierPayment",
+    created_by: int | None,
+) -> JournalEntry:
+    """The dedicated supplier-payment reversal (docs/M16_DESIGN.md "AP
+    payment/credit-note correction path") — NEVER through
+    reverse_journal_entry's generic mechanism (SUPPLIER_PAYMENT is an
+    AUTOMATED_SOURCE_TYPES member specifically so that generic path stays
+    blocked for it). Posts a NEW STANDARD entry
+    (source_type='SUPPLIER_PAYMENT_REVERSAL', source_id=the ORIGINAL
+    payment's id — mirrors post_payroll_reversal_journal's own
+    source_id=period.id convention) with the original payment's two
+    lines exactly swapped, recomputed from the payment's own stored
+    `amount`/`payment_method` rather than read back from the original
+    JournalLine rows, so the reversal can never accidentally diverge
+    from what was actually posted."""
+    account_code = SUPPLIER_PAYMENT_METHOD_ACCOUNT_CODE[supplier_payment.payment_method]
+    memo = f"Reversal of supplier payment {supplier_payment.id}"
+    lines = [
+        _debit(account_code, supplier_payment.amount, description=memo),
+        _credit(ACCOUNT_ACCOUNTS_PAYABLE, supplier_payment.amount, description=memo),
+    ]
+    return _post_journal(
+        db,
+        store_id=supplier_payment.store_id,
+        posting_date=datetime.now(UTC).date(),
+        source_type="SUPPLIER_PAYMENT_REVERSAL",
+        source_id=supplier_payment.id,
+        memo=memo,
+        created_by=created_by,
+        lines=lines,
+    )
+
+
+def post_supplier_credit_note_reversal_journal(
+    db: Session,
+    *,
+    credit_note: "SupplierCreditNote",
+    created_by: int | None,
+) -> JournalEntry:
+    """The dedicated supplier-credit-note reversal — mirrors
+    post_supplier_payment_reversal_journal exactly (see that function's
+    docstring). The credit account reversed is the SAME one the original
+    posting used (Inventory for GOODS_RETURN, Purchase Discounts for
+    COMMERCIAL_DISCOUNT) — `reason` never changes after creation
+    (SupplierCreditNote is immutable), so this reads it directly from the
+    original row rather than requiring the caller to pass it again."""
+    credit_account = (
+        ACCOUNT_INVENTORY if credit_note.reason == "GOODS_RETURN" else ACCOUNT_PURCHASE_DISCOUNTS
+    )
+    memo = f"Reversal of supplier credit note {credit_note.id} ({credit_note.credit_number})"
+    lines = [
+        _debit(credit_account, credit_note.grand_total, description=memo),
+        _credit(ACCOUNT_ACCOUNTS_PAYABLE, credit_note.grand_total, description=memo),
+    ]
+    return _post_journal(
+        db,
+        store_id=credit_note.store_id,
+        posting_date=datetime.now(UTC).date(),
+        source_type="SUPPLIER_CREDIT_NOTE_REVERSAL",
+        source_id=credit_note.id,
+        memo=memo,
+        created_by=created_by,
+        lines=lines,
+    )
+
+
 # --- Inventory adjustments --------------------------------------------------
 
 

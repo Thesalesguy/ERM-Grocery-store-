@@ -285,7 +285,19 @@ def record_cash_movement(
         action="CASH_MOVEMENT_CREATED",
         entity_type="cashier_shift",
         entity_id=shift.id,
-        after={"movement_type": movement_type, "amount": amount, "reason": reason},
+        # M16 pre-implementation hardening: the movement's own id and
+        # client_transaction_id are included so this event can be tied
+        # deterministically to one cash_movements row — previously only
+        # movement_type/amount/reason were captured, which reconstructed
+        # the substance of a shift's cash-movement history but not an
+        # exact 1:1 mapping back to a specific row.
+        after={
+            "movement_id": movement.id,
+            "movement_type": movement_type,
+            "amount": amount,
+            "reason": reason,
+            "client_transaction_id": client_transaction_id,
+        },
         ip_address=ip_address,
         user_agent=user_agent,
     )
@@ -508,9 +520,20 @@ def close_shift(
     return shift
 
 
-def get_shift(db: Session, shift_id: int) -> CashierShift:
+def get_shift(db: Session, shift_id: int, *, caller_store_id: int | None = None) -> CashierShift:
+    """`caller_store_id` (M16 pre-implementation hardening): optional,
+    defaults to None so every pre-existing internal caller (e.g.
+    record_cash_movement/close_shift resolving a shift they already hold
+    a lock on) is unaffected. When given, a cross-store mismatch raises
+    NotFoundError — not ForbiddenError — matching the information-hiding
+    convention this endpoint's own (still-present) check already used;
+    this is defense-in-depth for a future direct caller, not a behavior
+    change for the existing endpoint, which continues to enforce the
+    same check itself."""
     shift = db.get(CashierShift, shift_id)
     if shift is None:
+        raise NotFoundError(f"Cashier shift {shift_id} not found")
+    if caller_store_id is not None and shift.store_id != caller_store_id:
         raise NotFoundError(f"Cashier shift {shift_id} not found")
     return shift
 
@@ -523,7 +546,16 @@ def list_shifts(
     status: str | None = None,
     limit: int = 50,
     offset: int = 0,
+    caller_store_id: int | None = None,
 ) -> list[CashierShift]:
+    """`caller_store_id` (M16 pre-implementation hardening): optional,
+    defaults to None to preserve every existing call's behavior. When
+    given, the query is additionally filtered to that store regardless
+    of `store_id`, so a store-scoped caller can never see another
+    store's shifts even if `store_id` were passed incorrectly — the
+    endpoint already resolves this via `scoped_store_filter` before
+    calling in, this is the service-layer backstop for a future direct
+    caller that doesn't."""
     query = (
         select(CashierShift)
         .order_by(CashierShift.opened_at.desc(), CashierShift.id.desc())
@@ -536,6 +568,8 @@ def list_shifts(
         query = query.where(CashierShift.cashier_id == cashier_id)
     if status is not None:
         query = query.where(CashierShift.status == status)
+    if caller_store_id is not None:
+        query = query.where(CashierShift.store_id == caller_store_id)
     return list(db.execute(query).scalars().all())
 
 

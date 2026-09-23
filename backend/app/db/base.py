@@ -13,8 +13,10 @@ from app.modules.ap.models import (  # noqa: F401
     SupplierCreditAllocation,
     SupplierCreditNote,
     SupplierCreditNoteLine,
+    SupplierCreditNoteReversal,
     SupplierPayment,
     SupplierPaymentAllocation,
+    SupplierPaymentReversal,
 )
 from app.modules.audit.models import AuditLog  # noqa: F401
 from app.modules.auth.models import (  # noqa: F401

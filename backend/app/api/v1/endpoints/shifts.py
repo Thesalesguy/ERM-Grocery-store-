@@ -11,7 +11,6 @@ from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
-from app.core.exceptions import NotFoundError
 from app.modules.auth.permissions import SHIFT_MANAGE, SHIFT_READ
 from app.modules.auth.service import CurrentUser, require_permission, scoped_store_filter
 from app.modules.shifts import service
@@ -82,6 +81,7 @@ def list_shifts(
         status=status,
         limit=limit,
         offset=offset,
+        caller_store_id=current_user.store_id,
     )
     return [ShiftRead.model_validate(s) for s in shifts]
 
@@ -92,9 +92,7 @@ def get_shift(
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_read_permission),
 ) -> ShiftRead:
-    shift = service.get_shift(db, shift_id)
-    if current_user.store_id is not None and shift.store_id != current_user.store_id:
-        raise NotFoundError(f"Cashier shift {shift_id} not found")
+    shift = service.get_shift(db, shift_id, caller_store_id=current_user.store_id)
     return ShiftRead.model_validate(shift)
 
 
@@ -104,9 +102,9 @@ def list_cash_movements(
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_read_permission),
 ) -> list[CashMovementRead]:
-    shift = service.get_shift(db, shift_id)
-    if current_user.store_id is not None and shift.store_id != current_user.store_id:
-        raise NotFoundError(f"Cashier shift {shift_id} not found")
+    # Called only for its store-isolation check (raises NotFoundError on
+    # cross-store); the shift row itself isn't otherwise needed here.
+    service.get_shift(db, shift_id, caller_store_id=current_user.store_id)
     movements = service.list_cash_movements(db, shift_id)
     return [CashMovementRead.model_validate(m) for m in movements]
 

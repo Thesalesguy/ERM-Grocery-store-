@@ -60,8 +60,10 @@ from app.modules.ap.models import (
     SupplierCreditAllocation,
     SupplierCreditNote,
     SupplierCreditNoteLine,
+    SupplierCreditNoteReversal,
     SupplierPayment,
     SupplierPaymentAllocation,
+    SupplierPaymentReversal,
 )
 from app.modules.audit import service as audit_service
 from app.modules.auth.models import Store
@@ -1251,6 +1253,131 @@ def get_payment_allocations(
     )
 
 
+def reverse_supplier_payment(
+    db: Session,
+    *,
+    supplier_payment_id: int,
+    reason: str,
+    caller_store_id: int | None,
+    reversed_by: int | None,
+) -> SupplierPayment:
+    """Corrects a mis-recorded supplier payment (docs/M16_DESIGN.md "AP
+    payment/credit-note correction path") — mirrors
+    app.modules.payroll.service.reverse_payroll_period's exact structure:
+    idempotent-by-existence (a SupplierPaymentReversal row referencing
+    this payment is a domain fact, never created twice — the DB's own
+    UNIQUE(supplier_payment_id) constraint is the race-safety backstop),
+    no separate client_transaction_id (there is nothing to retry against
+    — a genuinely new reversal ATTEMPT against an already-reversed
+    payment is itself the idempotent case, exactly as payroll's own
+    reversal treats it).
+
+    Every invoice this payment allocated to has its `amount_paid`
+    decremented by the reversed allocation and its status recomputed via
+    `_recompute_invoice_status` — the SAME function `record_supplier_payment`
+    itself uses, so every derived figure that reads amount_paid/status
+    (outstanding balance, supplier AP summary, aging, statement) reflects
+    the correction automatically with no separate update needed anywhere.
+
+    Locking mirrors record_supplier_payment: the payment row itself is
+    locked first (serializes two concurrent reversal attempts for the
+    SAME payment), then every allocated PurchaseInvoice in ascending id
+    order (serializes against a concurrent new payment/credit-note
+    touching the same invoices).
+
+    Does not commit — the caller commits once, matching this module's
+    OWN dominant convention (record_supplier_payment/
+    create_supplier_credit_note never self-commit either); this
+    deliberately does NOT mirror payroll's post_payroll_period/
+    reverse_payroll_period self-commit, which the M16 discovery audit
+    flagged as an inconsistency with the rest of the codebase — this
+    function does not propagate that inconsistency into AP."""
+    if not reason or not reason.strip():
+        raise ValidationAppError(
+            "A reversal reason is required", error_code="REVERSAL_REASON_REQUIRED"
+        )
+    payment = db.execute(
+        select(SupplierPayment).where(SupplierPayment.id == supplier_payment_id).with_for_update()
+    ).scalar_one_or_none()
+    if payment is None:
+        raise NotFoundError(f"Supplier payment {supplier_payment_id} not found")
+    _enforce_store_access(caller_store_id, payment.store_id, "this supplier payment")
+
+    existing_reversal = db.execute(
+        select(SupplierPaymentReversal).where(
+            SupplierPaymentReversal.supplier_payment_id == payment.id
+        )
+    ).scalar_one_or_none()
+    if existing_reversal is not None:
+        return payment
+    if reversed_by is None:
+        raise ValidationAppError(
+            "Reversal requires an authenticated actor", error_code="ACTOR_REQUIRED"
+        )
+
+    allocations = (
+        db.execute(
+            select(SupplierPaymentAllocation)
+            .where(SupplierPaymentAllocation.supplier_payment_id == payment.id)
+            .order_by(SupplierPaymentAllocation.purchase_invoice_id)
+        )
+        .scalars()
+        .all()
+    )
+    invoice_ids = sorted({a.purchase_invoice_id for a in allocations})
+    invoices = (
+        db.execute(
+            select(PurchaseInvoice)
+            .where(PurchaseInvoice.id.in_(invoice_ids))
+            .order_by(PurchaseInvoice.id)
+            .with_for_update()
+        )
+        .scalars()
+        .all()
+    )
+    invoices_by_id = {inv.id: inv for inv in invoices}
+    for allocation in allocations:
+        invoice = invoices_by_id[allocation.purchase_invoice_id]
+        invoice.amount_paid = invoice.amount_paid - allocation.amount
+        _recompute_invoice_status(invoice)
+
+    reversal_entry = accounting_service.post_supplier_payment_reversal_journal(
+        db, supplier_payment=payment, created_by=reversed_by
+    )
+
+    db.add(
+        SupplierPaymentReversal(
+            supplier_payment_id=payment.id,
+            reversal_journal_entry_id=reversal_entry.id,
+            reason=reason,
+            reversed_by=reversed_by,
+            reversed_at=datetime.now(UTC),
+        )
+    )
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ConflictError(
+            f"Supplier payment {supplier_payment_id} has already been reversed",
+            error_code="ALREADY_REVERSED",
+        ) from exc
+
+    audit_service.log_event(
+        db,
+        user_id=reversed_by,
+        action="SUPPLIER_PAYMENT_REVERSED",
+        entity_type="supplier_payment",
+        entity_id=payment.id,
+        after={
+            "reversal_journal_entry_id": reversal_entry.id,
+            "reason": reason,
+            "amount": str(payment.amount),
+        },
+    )
+    return payment
+
+
 def list_supplier_payments(
     db: Session,
     *,
@@ -1634,6 +1761,118 @@ def create_supplier_credit_note(
     return credit_note
 
 
+def reverse_supplier_credit_note(
+    db: Session,
+    *,
+    supplier_credit_note_id: int,
+    reason: str,
+    caller_store_id: int | None,
+    reversed_by: int | None,
+) -> SupplierCreditNote:
+    """Corrects a mis-recorded supplier credit note — mirrors
+    reverse_supplier_payment exactly (see that function's docstring for
+    the full structure/locking/idempotency rationale). The one genuine
+    difference from a payment reversal (docs/M16_DESIGN.md "AP payment/
+    credit-note correction path"): a GOODS_RETURN credit note's original
+    posting credits Inventory, not a cash/bank account, because the
+    physical goods movement was already recorded by the referenced
+    PurchaseReturn — reversing the AP-side journal here does NOT
+    resurrect that inventory (no second movement is created or undone;
+    PurchaseReturn itself has no reversal in this codebase, a
+    pre-existing M3/M7 scope boundary this milestone does not remove).
+    This reversal is the AP financial correction only, exactly mirroring
+    what the original posting itself already scoped to."""
+    if not reason or not reason.strip():
+        raise ValidationAppError(
+            "A reversal reason is required", error_code="REVERSAL_REASON_REQUIRED"
+        )
+    credit_note = db.execute(
+        select(SupplierCreditNote)
+        .where(SupplierCreditNote.id == supplier_credit_note_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if credit_note is None:
+        raise NotFoundError(f"Supplier credit note {supplier_credit_note_id} not found")
+    _enforce_store_access(caller_store_id, credit_note.store_id, "this supplier credit note")
+
+    existing_reversal = db.execute(
+        select(SupplierCreditNoteReversal).where(
+            SupplierCreditNoteReversal.supplier_credit_note_id == credit_note.id
+        )
+    ).scalar_one_or_none()
+    if existing_reversal is not None:
+        return credit_note
+    if reversed_by is None:
+        raise ValidationAppError(
+            "Reversal requires an authenticated actor", error_code="ACTOR_REQUIRED"
+        )
+
+    allocations = (
+        db.execute(
+            select(SupplierCreditAllocation)
+            .where(SupplierCreditAllocation.supplier_credit_note_id == credit_note.id)
+            .order_by(SupplierCreditAllocation.purchase_invoice_id)
+        )
+        .scalars()
+        .all()
+    )
+    invoice_ids = sorted({a.purchase_invoice_id for a in allocations})
+    invoices = (
+        db.execute(
+            select(PurchaseInvoice)
+            .where(PurchaseInvoice.id.in_(invoice_ids))
+            .order_by(PurchaseInvoice.id)
+            .with_for_update()
+        )
+        .scalars()
+        .all()
+    )
+    invoices_by_id = {inv.id: inv for inv in invoices}
+    total_reversed = Decimal("0")
+    for allocation in allocations:
+        invoice = invoices_by_id[allocation.purchase_invoice_id]
+        invoice.amount_credited = invoice.amount_credited - allocation.amount
+        _recompute_invoice_status(invoice)
+        total_reversed += allocation.amount
+    credit_note.amount_allocated = credit_note.amount_allocated - total_reversed
+
+    reversal_entry = accounting_service.post_supplier_credit_note_reversal_journal(
+        db, credit_note=credit_note, created_by=reversed_by
+    )
+
+    db.add(
+        SupplierCreditNoteReversal(
+            supplier_credit_note_id=credit_note.id,
+            reversal_journal_entry_id=reversal_entry.id,
+            reason=reason,
+            reversed_by=reversed_by,
+            reversed_at=datetime.now(UTC),
+        )
+    )
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ConflictError(
+            f"Supplier credit note {supplier_credit_note_id} has already been reversed",
+            error_code="ALREADY_REVERSED",
+        ) from exc
+
+    audit_service.log_event(
+        db,
+        user_id=reversed_by,
+        action="SUPPLIER_CREDIT_NOTE_REVERSED",
+        entity_type="supplier_credit_note",
+        entity_id=credit_note.id,
+        after={
+            "reversal_journal_entry_id": reversal_entry.id,
+            "reason": reason,
+            "grand_total": str(credit_note.grand_total),
+        },
+    )
+    return credit_note
+
+
 def get_supplier_credit_note(db: Session, supplier_credit_note_id: int) -> SupplierCreditNote:
     credit_note = db.get(SupplierCreditNote, supplier_credit_note_id)
     if credit_note is None:
@@ -1800,7 +2039,8 @@ def get_supplier_transaction_history(db: Session, supplier_id: int) -> list[Supp
 @dataclass(frozen=True)
 class SupplierStatementLine:
     date_: date
-    transaction_type: str  # INVOICE | PAYMENT | CREDIT_NOTE
+    # INVOICE | PAYMENT | CREDIT_NOTE | PAYMENT_REVERSAL | CREDIT_NOTE_REVERSAL (M16)
+    transaction_type: str
     reference: str
     amount: Decimal  # signed effect on the balance owed to the supplier
     running_balance: Decimal
@@ -1852,6 +2092,29 @@ def get_supplier_statement(
         .scalars()
         .all()
     )
+    # M16 (docs/M16_DESIGN.md "AP payment/credit-note correction path"):
+    # a reversed payment/credit note's ORIGINAL event above is
+    # deliberately left unchanged (it really happened, historically) --
+    # its reversal is a new, separate, dated event that reverses the
+    # ORIGINAL's balance effect, exactly mirroring how the reversal
+    # journal itself is a new entry, never a mutation of the original.
+    # Without this, the statement's closing_balance would silently
+    # diverge from get_supplier_ap_summary/ap_aging (both of which read
+    # the live, already-corrected PurchaseInvoice.amount_paid/
+    # amount_credited) the moment any reversal exists.
+    payment_reversals = db.execute(
+        select(SupplierPaymentReversal, SupplierPayment)
+        .join(SupplierPayment, SupplierPayment.id == SupplierPaymentReversal.supplier_payment_id)
+        .where(SupplierPayment.supplier_id == supplier_id)
+    ).all()
+    credit_note_reversals = db.execute(
+        select(SupplierCreditNoteReversal, SupplierCreditNote)
+        .join(
+            SupplierCreditNote,
+            SupplierCreditNote.id == SupplierCreditNoteReversal.supplier_credit_note_id,
+        )
+        .where(SupplierCreditNote.supplier_id == supplier_id)
+    ).all()
 
     # The tiebreaker for same-day events CANNOT be each row's own primary
     # key: PurchaseInvoice/SupplierPayment/SupplierCreditNote are three
@@ -1874,6 +2137,26 @@ def get_supplier_statement(
         + [
             (cn.credit_date, "CREDIT_NOTE", cn.credit_number, -cn.grand_total, cn.created_at)
             for cn in credit_notes
+        ]
+        + [
+            (
+                reversal.reversed_at.date(),
+                "PAYMENT_REVERSAL",
+                f"Reversal of payment {payment.id}",
+                payment.amount,
+                reversal.reversed_at,
+            )
+            for reversal, payment in payment_reversals
+        ]
+        + [
+            (
+                reversal.reversed_at.date(),
+                "CREDIT_NOTE_REVERSAL",
+                f"Reversal of credit note {credit_note.credit_number}",
+                credit_note.grand_total,
+                reversal.reversed_at,
+            )
+            for reversal, credit_note in credit_note_reversals
         ]
     )
     events.sort(key=lambda e: (e[0], e[4]))

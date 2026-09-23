@@ -231,6 +231,7 @@ def create_stock_adjustment(
     user_agent: str | None = None,
     stock_count_id: int | None = None,
     client_transaction_id: str | None = None,
+    caller_store_id: int | None = None,
 ) -> StockAdjustment:
     """The full authenticated, transactional, audited stock-adjustment
     flow (M2 task Section 6): the API can never overwrite
@@ -261,6 +262,15 @@ def create_stock_adjustment(
     already provided by StockCount's own status-based checks), so a
     caller that omits it gets exactly the pre-M15 behavior — no key, no
     fast path, no uniqueness check, unchanged from before this hardening.
+
+    `caller_store_id` (M16 pre-implementation hardening): unlike every
+    other financially-significant mutation in this codebase, this
+    function previously relied solely on its HTTP endpoint to enforce
+    store isolation — a direct service-layer call had no defense-in-depth
+    check. Optional and defaults to None so `post_stock_count`'s internal
+    per-line calls (which already validated the caller's store access once,
+    at their own entry point, before locking every affected product) are
+    unaffected; the route handler now passes the acting user's store_id.
     """
     if client_transaction_id is not None:
         existing = db.execute(
@@ -270,6 +280,8 @@ def create_stock_adjustment(
         ).scalar_one_or_none()
         if existing is not None:
             return existing
+
+    _enforce_store_access(caller_store_id, store_id, "stock adjustments")
 
     adjustment = StockAdjustment(
         store_id=store_id,

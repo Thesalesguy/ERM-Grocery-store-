@@ -10,10 +10,12 @@ import threading
 from dataclasses import dataclass
 from decimal import Decimal
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.exceptions import ForbiddenError
 from app.db.session import SessionLocal
 from app.modules.accounting.models import JournalEntry
 from app.modules.auth.permissions import INVENTORY_CLERK
@@ -299,3 +301,34 @@ def test_concurrent_duplicate_adjustment_requests_create_only_one_adjustment() -
         assert product.current_qty_on_hand == Decimal("19.000")
     finally:
         verify_session.close()
+
+
+def test_cross_store_direct_service_call_cannot_mutate_another_stores_stock(db: Session) -> None:
+    """M16 Phase 0 item 4: create_stock_adjustment previously relied
+    solely on its HTTP endpoint for store isolation -- a direct
+    service-layer call (a script, a test, a future internal tool) had no
+    defense-in-depth check, unlike every other financially-significant
+    mutation in this codebase. Proves a caller scoped to one store cannot
+    use a direct service call to mutate a DIFFERENT store's stock just by
+    naming its product_id, even though the HTTP layer is bypassed
+    entirely here."""
+    store = make_store(db)
+    other_store = make_store(db)
+    product = make_product(db, other_store, current_qty_on_hand=Decimal("10"))
+    db.commit()
+
+    with pytest.raises(ForbiddenError) as exc_info:
+        inventory_service.create_stock_adjustment(
+            db,
+            store_id=other_store.id,
+            product_id=product.id,
+            quantity_delta=Decimal("-5"),
+            reason_code="THEFT",
+            notes=None,
+            created_by=1,
+            caller_store_id=store.id,
+        )
+    assert exc_info.value.error_code == "STORE_ACCESS_DENIED"
+
+    db.refresh(product)
+    assert product.current_qty_on_hand == Decimal("10.000")

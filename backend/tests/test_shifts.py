@@ -16,6 +16,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.exceptions import ConflictError, NotFoundError
+from app.modules.accounting import service as accounting_service
 from app.modules.accounting.models import JournalEntry, JournalLine
 from app.modules.audit.models import AuditLog
 from app.modules.auth.permissions import CASHIER, INVENTORY_CLERK, MANAGER
@@ -221,6 +223,43 @@ def test_cash_movement_paid_in_and_paid_out(client: TestClient, db: Session) -> 
     assert len(movements.json()) == 2
 
 
+def test_cash_movement_audit_event_identifies_the_exact_movement_row(
+    client: TestClient, db: Session
+) -> None:
+    """M16 Phase 0 item 6: the audit event for CASH_MOVEMENT_CREATED
+    previously captured only movement_type/amount/reason, keyed to the
+    parent shift's entity_id -- a shift's cash-movement history was
+    reconstructable in substance from audit_logs alone, but not tied
+    deterministically to one specific cash_movements row. Proves the
+    movement's own id and client_transaction_id are now present."""
+    store = make_store(db)
+    username = _cashier(db, store)
+    headers = auth_headers(client, username, DEFAULT_TEST_PASSWORD)
+    shift = _open_shift(client, headers, store.id)
+
+    key = f"mv-{unique_suffix()}"
+    paid_in = client.post(
+        f"/api/v1/shifts/{shift['id']}/cash-movements",
+        headers=headers,
+        json={
+            "movement_type": "PAID_IN",
+            "amount": "20.00",
+            "reason": "manager top-up",
+            "client_transaction_id": key,
+        },
+    )
+    assert paid_in.status_code == 201
+    movement_id = paid_in.json()["id"]
+
+    audit_row = db.execute(
+        select(AuditLog).where(
+            AuditLog.action == "CASH_MOVEMENT_CREATED", AuditLog.entity_id == shift["id"]
+        )
+    ).scalar_one()
+    assert audit_row.after_state["movement_id"] == movement_id
+    assert audit_row.after_state["client_transaction_id"] == key
+
+
 def test_cash_movement_rejected_on_closed_shift(client: TestClient, db: Session) -> None:
     store = make_store(db)
     username = _cashier(db, store)
@@ -363,6 +402,47 @@ def test_close_shift_positive_variance_overage_posts_gl(client: TestClient, db: 
     )
     assert sum(line.debit for line in lines) == sum(line.credit for line in lines)
     assert sum(line.debit for line in lines) == Decimal("10.000000")
+
+
+def test_cash_shift_variance_cannot_be_reversed_via_generic_journal_reversal(
+    client: TestClient, db: Session
+) -> None:
+    """M16 Phase 0 item 2: the discovery audit claimed CASH_SHIFT_VARIANCE
+    was missing from AUTOMATED_SOURCE_TYPES; re-validating against the
+    current code (accounting/models.py) showed it was already present and
+    the generic reverse_journal_entry gate already refused it correctly.
+    This is the regression coverage proving that invariant directly,
+    since no prior test exercised this specific path."""
+    store = make_store(db)
+    username = _cashier(db, store)
+    headers = auth_headers(client, username, DEFAULT_TEST_PASSWORD)
+    shift = _open_shift(client, headers, store.id, "100.00")
+
+    close = client.post(
+        f"/api/v1/shifts/{shift['id']}/close",
+        headers=headers,
+        json={
+            "closing_counted_amount": "110.00",
+            "client_transaction_id": f"close-{unique_suffix()}",
+        },
+    )
+    assert close.status_code == 200
+
+    entry = db.execute(
+        select(JournalEntry).where(
+            JournalEntry.source_type == "CASH_SHIFT_VARIANCE", JournalEntry.source_id == shift["id"]
+        )
+    ).scalar_one()
+
+    with pytest.raises(ConflictError) as exc_info:
+        accounting_service.reverse_journal_entry(
+            db,
+            journal_entry_id=entry.id,
+            reason="Attempting to reverse a shift variance entry directly",
+            reversed_by=1,
+            caller_store_id=None,
+        )
+    assert exc_info.value.error_code == "OPERATIONAL_REVERSAL_REQUIRED"
 
 
 def test_close_shift_negative_variance_shortage_posts_gl(client: TestClient, db: Session) -> None:
@@ -527,6 +607,65 @@ def test_expected_cash_includes_cash_refund_reduction(client: TestClient, db: Se
     assert body["variance_amount"] == "0.00"
 
 
+def test_expected_cash_still_reflects_original_cash_tender_when_refund_is_noncash(
+    client: TestClient, db: Session
+) -> None:
+    """M16 Phase 0 item 7: the discovery audit flagged a plausible edge
+    case -- a CASH sale later returned/voided via a NON-CASH refund_method
+    leaves the original cash tender counted with nothing to subtract it,
+    since _compute_expected_cash's cash_refunded term only fires for
+    refund_method == 'CASH'.
+
+    Traced end to end (docs/M16_DESIGN.md "Expected-cash/status
+    investigation"): this is CORRECT, not a bug. `expected_cash_amount`
+    models the physical till only -- when a customer paid $20 cash, that
+    $20 genuinely entered the drawer. If the refund is later issued via
+    bank transfer (not from the drawer), no cash physically leaves the
+    till, so the till legitimately still holds that $20. The apparent
+    "overstatement" is the till accurately reflecting reality: the
+    physical cash was never given back. This test proves that intended
+    behavior directly, rather than assuming the audit's suspicion was a
+    confirmed defect."""
+    store = make_store(db)
+    product = make_product(
+        db, store, current_price=Decimal("20.00"), current_qty_on_hand=Decimal("10")
+    )
+    username = _cashier(db, store)
+    headers = auth_headers(client, username, DEFAULT_TEST_PASSWORD)
+    shift = _open_shift(client, headers, store.id, "0.00")
+
+    sale = _ring_cash_sale(client, headers, store.id, product.id, price="20.00", tendered="20.00")
+
+    return_resp = client.post(
+        f"/api/v1/sales/{sale['id']}/returns",
+        headers=headers,
+        json={
+            "store_id": store.id,
+            "return_date": "2024-01-01",
+            "client_transaction_id": f"ret-{unique_suffix()}",
+            "refund_method": "BANK_TRANSFER",
+            "lines": [{"sale_item_id": sale["items"][0]["id"], "quantity": "1"}],
+        },
+    )
+    assert return_resp.status_code == 201
+
+    close = client.post(
+        f"/api/v1/shifts/{shift['id']}/close",
+        headers=headers,
+        json={
+            "closing_counted_amount": "20.00",
+            "client_transaction_id": f"close-{unique_suffix()}",
+        },
+    )
+    body = close.json()
+    # +20 from the cash sale; the bank-transfer refund never touches the
+    # till, so expected cash is still 20 -- and the physical count of
+    # 20.00 (the cashier genuinely still has that $20 in the drawer)
+    # matches it exactly, zero variance.
+    assert body["expected_cash_amount"] == "20.00"
+    assert body["variance_amount"] == "0.00"
+
+
 def test_audit_log_records_shift_opened_and_closed(client: TestClient, db: Session) -> None:
     store = make_store(db)
     username = _cashier(db, store)
@@ -662,6 +801,32 @@ def test_cross_store_cashier_cannot_view_another_stores_shift(
 
     resp = client.get(f"/api/v1/shifts/{shift['id']}", headers=headers_b)
     assert resp.status_code == 404
+
+
+def test_direct_service_call_to_get_shift_and_list_shifts_enforces_store_isolation(
+    client: TestClient, db: Session
+) -> None:
+    """M16 Phase 0 item 5: get_shift/list_shifts previously enforced
+    store isolation only at their (still-present) endpoint layer, unlike
+    open_shift/record_cash_movement/close_shift which all check in the
+    service function itself. Proves the service layer now backstops a
+    direct caller too, without changing either endpoint's observable
+    behavior (both still 404, per the pre-existing test above)."""
+    store_a = make_store(db)
+    store_b = make_store(db)
+    cashier_a = _cashier(db, store_a)
+    headers_a = auth_headers(client, cashier_a, DEFAULT_TEST_PASSWORD)
+    shift = _open_shift(client, headers_a, store_a.id)
+
+    with pytest.raises(NotFoundError):
+        shifts_service.get_shift(db, shift["id"], caller_store_id=store_b.id)
+
+    results = shifts_service.list_shifts(db, caller_store_id=store_b.id)
+    assert all(s.id != shift["id"] for s in results)
+
+    # A caller correctly scoped to the shift's own store still sees it.
+    own_store_results = shifts_service.list_shifts(db, caller_store_id=store_a.id)
+    assert any(s.id == shift["id"] for s in own_store_results)
 
 
 def test_cross_store_manager_cannot_override_close(client: TestClient, db: Session) -> None:
