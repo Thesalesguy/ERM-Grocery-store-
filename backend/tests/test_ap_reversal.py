@@ -117,6 +117,16 @@ def _line_amount(db: Session, entry: JournalEntry, code: str) -> Decimal:
     return sum((line.debit - line.credit for line in lines), Decimal("0"))
 
 
+def _actor_id(db: Session, store) -> int:
+    """A real, committed user for `reversed_by` -- journal_entries.created_by
+    has a real FK to users, so a hardcoded literal id (coincidentally
+    present in a developer's local database, absent on a clean CI
+    database) is never safe here."""
+    user = make_user_with_role(db, store, MANAGER, username=f"reverser_{unique_suffix()}")
+    db.flush()
+    return user.id
+
+
 # --- Supplier payment reversal ----------------------------------------------
 
 
@@ -153,7 +163,7 @@ def test_valid_payment_reversal_restores_invoice_balance_and_status(db: Session)
         supplier_payment_id=payment.id,
         reason="Recorded against the wrong invoice",
         caller_store_id=None,
-        reversed_by=1,
+        reversed_by=_actor_id(db, store),
     )
     db.commit()
     db.refresh(invoice)
@@ -192,7 +202,7 @@ def test_duplicate_reversal_is_idempotent(db: Session) -> None:
         supplier_payment_id=payment.id,
         reason="Wrong amount",
         caller_store_id=None,
-        reversed_by=1,
+        reversed_by=_actor_id(db, store),
     )
     db.commit()
     reversal_count_after_first = (
@@ -214,7 +224,7 @@ def test_duplicate_reversal_is_idempotent(db: Session) -> None:
         supplier_payment_id=payment.id,
         reason="A different reason string on the retry",
         caller_store_id=None,
-        reversed_by=1,
+        reversed_by=_actor_id(db, store),
     )
     db.commit()
     reversal_count_after_second = (
@@ -255,7 +265,11 @@ def test_reason_is_required(db: Session) -> None:
 
     with pytest.raises(ValidationAppError) as exc_info:
         ap_service.reverse_supplier_payment(
-            db, supplier_payment_id=payment.id, reason="   ", caller_store_id=None, reversed_by=1
+            db,
+            supplier_payment_id=payment.id,
+            reason="   ",
+            caller_store_id=None,
+            reversed_by=_actor_id(db, store),
         )
     assert exc_info.value.error_code == "REVERSAL_REASON_REQUIRED"
 
@@ -291,7 +305,7 @@ def test_cross_store_reversal_denied(db: Session) -> None:
             supplier_payment_id=payment.id,
             reason="Attempted cross-store reversal",
             caller_store_id=other_store.id,
-            reversed_by=1,
+            reversed_by=_actor_id(db, store),
         )
     assert exc_info.value.error_code == "STORE_ACCESS_DENIED"
 
@@ -372,7 +386,7 @@ def test_journal_balance_and_audit_trail(db: Session) -> None:
         supplier_payment_id=payment.id,
         reason="Test reason",
         caller_store_id=None,
-        reversed_by=1,
+        reversed_by=_actor_id(db, store),
     )
     db.commit()
 
@@ -430,7 +444,7 @@ def test_reversal_journal_entry_cannot_itself_be_reversed_via_generic_mechanism(
         supplier_payment_id=payment.id,
         reason="Test reason",
         caller_store_id=None,
-        reversed_by=1,
+        reversed_by=_actor_id(db, store),
     )
     db.commit()
 
@@ -446,7 +460,7 @@ def test_reversal_journal_entry_cannot_itself_be_reversed_via_generic_mechanism(
             db,
             journal_entry_id=reversal_entry.id,
             reason="Attempting to reverse the reversal",
-            reversed_by=1,
+            reversed_by=_actor_id(db, store),
             caller_store_id=None,
         )
     assert exc_info.value.error_code == "OPERATIONAL_REVERSAL_REQUIRED"
@@ -489,7 +503,7 @@ def test_failure_during_gl_posting_leaves_invoice_balance_unchanged(
             supplier_payment_id=payment.id,
             reason="Should roll back entirely",
             caller_store_id=None,
-            reversed_by=1,
+            reversed_by=_actor_id(db, store),
         )
     db.rollback()
 
@@ -513,7 +527,12 @@ class _Outcome:
 
 
 def _attempt_reversal(
-    *, supplier_payment_id: int, reason: str, barrier: threading.Barrier, result: _Outcome
+    *,
+    supplier_payment_id: int,
+    reason: str,
+    barrier: threading.Barrier,
+    result: _Outcome,
+    reversed_by: int,
 ) -> None:
     session = SessionLocal()
     try:
@@ -523,7 +542,7 @@ def _attempt_reversal(
             supplier_payment_id=supplier_payment_id,
             reason=reason,
             caller_store_id=None,
-            reversed_by=1,
+            reversed_by=reversed_by,
         )
         session.commit()
         result.succeeded = True
@@ -564,6 +583,7 @@ def test_two_concurrent_reversal_attempts_exactly_one_creates_a_reversal_row() -
             client_transaction_id=f"ptxn-{uuid.uuid4().hex}",
             caller_store_id=None,
         )
+        actor_id = _actor_id(setup_session, store)
         setup_session.commit()
         payment_id = payment.id
         invoice_id = invoice.id
@@ -575,13 +595,21 @@ def test_two_concurrent_reversal_attempts_exactly_one_creates_a_reversal_row() -
     thread_a = threading.Thread(
         target=_attempt_reversal,
         kwargs=dict(
-            supplier_payment_id=payment_id, reason="Attempt A", barrier=barrier, result=result_a
+            supplier_payment_id=payment_id,
+            reason="Attempt A",
+            barrier=barrier,
+            result=result_a,
+            reversed_by=actor_id,
         ),
     )
     thread_b = threading.Thread(
         target=_attempt_reversal,
         kwargs=dict(
-            supplier_payment_id=payment_id, reason="Attempt B", barrier=barrier, result=result_b
+            supplier_payment_id=payment_id,
+            reason="Attempt B",
+            barrier=barrier,
+            result=result_b,
+            reversed_by=actor_id,
         ),
     )
     thread_a.start()
@@ -653,7 +681,7 @@ def test_supplier_ap_summary_and_aging_reflect_reversal(db: Session) -> None:
         supplier_payment_id=payment.id,
         reason="Test reason",
         caller_store_id=None,
-        reversed_by=1,
+        reversed_by=_actor_id(db, store),
     )
     db.commit()
 
@@ -722,7 +750,7 @@ def test_valid_credit_note_reversal_restores_invoice_balance(db: Session) -> Non
         supplier_credit_note_id=credit_note.id,
         reason="Discount should not have applied",
         caller_store_id=None,
-        reversed_by=1,
+        reversed_by=_actor_id(db, store),
     )
     db.commit()
     db.refresh(invoice)
@@ -776,7 +804,7 @@ def test_credit_note_reversal_uses_correct_account_for_goods_return_reason(db: S
         supplier_credit_note_id=credit_note.id,
         reason="Wrong return referenced",
         caller_store_id=None,
-        reversed_by=1,
+        reversed_by=_actor_id(db, store),
     )
     db.commit()
 
@@ -811,7 +839,7 @@ def test_credit_note_reversal_is_idempotent(db: Session) -> None:
         supplier_credit_note_id=credit_note.id,
         reason="First",
         caller_store_id=None,
-        reversed_by=1,
+        reversed_by=_actor_id(db, store),
     )
     db.commit()
     ap_service.reverse_supplier_credit_note(
@@ -819,7 +847,7 @@ def test_credit_note_reversal_is_idempotent(db: Session) -> None:
         supplier_credit_note_id=credit_note.id,
         reason="Second",
         caller_store_id=None,
-        reversed_by=1,
+        reversed_by=_actor_id(db, store),
     )
     db.commit()
 
@@ -872,7 +900,7 @@ def test_payment_and_credit_note_reversal_on_the_same_invoice_are_independent(
         supplier_payment_id=payment.id,
         reason="Payment correction",
         caller_store_id=None,
-        reversed_by=1,
+        reversed_by=_actor_id(db, store),
     )
     db.commit()
     db.refresh(invoice)
@@ -888,7 +916,7 @@ def test_payment_and_credit_note_reversal_on_the_same_invoice_are_independent(
         supplier_credit_note_id=credit_note.id,
         reason="Credit note correction",
         caller_store_id=None,
-        reversed_by=1,
+        reversed_by=_actor_id(db, store),
     )
     db.commit()
     db.refresh(invoice)
