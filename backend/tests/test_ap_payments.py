@@ -20,7 +20,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.exceptions import ConflictError
+from app.core.exceptions import ConflictError, ForbiddenError
 from app.modules.accounting.constants import (
     ACCOUNT_ACCOUNTS_PAYABLE,
     ACCOUNT_BANK_ACCOUNT,
@@ -380,3 +380,63 @@ def test_allocations_must_sum_to_payment_amount(db: Session) -> None:
             caller_store_id=None,
         )
     assert getattr(exc_info.value, "error_code", None) == "ALLOCATION_MUST_EQUAL_PAYMENT_AMOUNT"
+
+
+def test_cross_store_supplier_payment_is_rejected(db: Session) -> None:
+    """M19: record_supplier_payment's own _enforce_store_access, proven
+    at the service layer directly -- the enforcement code was already
+    correct (verified by M19 discovery); this test proves it, matching
+    the dedicated-isolation-test pattern already used elsewhere in this
+    module for PO/invoice operations."""
+    store_a = make_store(db)
+    store_b = make_store(db)
+    supplier = make_supplier(db)
+    product = make_product(db, store_b)
+    db.commit()
+    invoice = _make_posted_invoice(
+        db, store_b, supplier, product, qty=Decimal("10"), cost=Decimal("10.00")
+    )
+
+    with pytest.raises(ForbiddenError):
+        ap_service.record_supplier_payment(
+            db,
+            store_id=store_b.id,
+            supplier_id=supplier.id,
+            payment_date=date(2024, 1, 10),
+            payment_method="CASH",
+            amount=Decimal("50.00"),
+            allocations=[PaymentAllocationInput(invoice.id, Decimal("50.00"))],
+            client_transaction_id=f"ptxn-{unique_suffix()}",
+            caller_store_id=store_a.id,
+        )
+
+
+def test_cross_store_supplier_credit_note_is_rejected(db: Session) -> None:
+    """M19: create_supplier_credit_note's own _enforce_store_access,
+    proven at the service layer directly, matching the pattern above."""
+    store_a = make_store(db)
+    store_b = make_store(db)
+    supplier = make_supplier(db)
+    product = make_product(db, store_b)
+    db.commit()
+    invoice = _make_posted_invoice(
+        db, store_b, supplier, product, qty=Decimal("10"), cost=Decimal("10.00")
+    )
+
+    with pytest.raises(ForbiddenError):
+        ap_service.create_supplier_credit_note(
+            db,
+            store_id=store_b.id,
+            supplier_id=supplier.id,
+            credit_number=f"CN-{unique_suffix()}",
+            credit_date=date(2024, 1, 10),
+            reason="COMMERCIAL_DISCOUNT",
+            lines=[
+                ap_service.SupplierCreditNoteLineInput(
+                    description="Discount", amount=Decimal("5.00")
+                )
+            ],
+            allocations=[PaymentAllocationInput(invoice.id, Decimal("5.00"))],
+            client_transaction_id=f"ctxn-{unique_suffix()}",
+            caller_store_id=store_a.id,
+        )

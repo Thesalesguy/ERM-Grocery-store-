@@ -6,6 +6,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.exceptions import ConflictError
 from app.modules.inventory import service as inventory_service
 from app.modules.inventory.models import InventoryMovement
 from tests.factories import make_product, make_store
@@ -34,6 +35,41 @@ def test_record_movement_creates_ledger_row_and_updates_cache(db: Session) -> No
     assert movement.resulting_quantity_on_hand == Decimal("25")
     assert product.current_qty_on_hand == Decimal("25")
     assert product.current_cost == Decimal("4.50")
+
+
+def test_record_movement_itself_refuses_to_go_negative(db: Session) -> None:
+    """M19 mutation-testing finding: BR-7's negative-stock guard (raise
+    ConflictError/INSUFFICIENT_STOCK before going negative) lives INSIDE
+    record_movement itself, but every existing caller (finalize_sale,
+    create_purchase_return) already has its own earlier, equivalent
+    check -- so no test anywhere previously exercised this specific
+    guard directly; every existing INSUFFICIENT_STOCK test was actually
+    proving a CALLER's pre-check, not this shared backstop. This is the
+    codebase's actual defense-in-depth for BR-7 (docs/
+    TECHNICAL_BLUEPRINT.md), not a gap -- this test proves the innermost
+    layer independently, the same way a caller-level check being removed
+    or buggy wouldn't silently allow negative stock."""
+    store = make_store(db)
+    product = make_product(db, store, current_qty_on_hand=Decimal("5"))
+    db.commit()
+
+    locked = inventory_service.lock_product_for_update(db, product.id)
+    with pytest.raises(ConflictError) as exc_info:
+        inventory_service.record_movement(
+            db,
+            product=locked,
+            store_id=store.id,
+            movement_type="STOCK_ADJUSTMENT_OUT",
+            quantity_delta=Decimal("-10"),
+            unit_cost_at_movement=Decimal("0"),
+            reference_type="stock_adjustment",
+            reference_id=None,
+        )
+    assert exc_info.value.error_code == "INSUFFICIENT_STOCK"
+    db.rollback()
+
+    db.refresh(product)
+    assert product.current_qty_on_hand == Decimal("5")  # unchanged
 
 
 def test_qty_on_hand_matches_ledger_sum(db: Session) -> None:
