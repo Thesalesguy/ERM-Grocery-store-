@@ -19,7 +19,13 @@ from app.modules.purchasing import service as purchasing_service
 from app.modules.replenishment import service as replenishment_service
 from app.modules.transfers import service as transfer_service
 from app.modules.transfers.service import ShipLineInput, TransferLineInput
-from tests.factories import make_product, make_store, make_supplier, make_supplier_product
+from tests.factories import (
+    make_product,
+    make_store,
+    make_supplier,
+    make_supplier_product,
+    unique_suffix,
+)
 
 
 def test_inbound_po_appearing_after_approval_reduces_or_staleifies_execution(db: Session) -> None:
@@ -49,6 +55,7 @@ def test_inbound_po_appearing_after_approval_reduces_or_staleifies_execution(db:
         store_id=store.id,
         supplier_id=supplier.id,
         order_date=date.today(),
+        client_transaction_id=f"po-{unique_suffix()}",
         lines=[
             purchasing_service.PurchaseOrderItemInput(
                 product_id=product.id, quantity_ordered=Decimal("8"), unit_cost=Decimal("1.00")

@@ -45,6 +45,7 @@ M15_PRE_HARDENING_REVISION = "1a4bae98d246"  # pre-M15: stock adjustment idempot
 M15_HEAD_REVISION = "db482a11ee31"  # M15: cashier/till shift sessions
 M16_HARDENING_REVISION = "e1a681c4aba3"  # M16: pre-implementation hardening
 M16_HEAD_REVISION = "4a83c462dbff"  # M16: store settings permissions
+M19_HEAD_REVISION = "3a0d50ccc909"  # M19: purchase order idempotency key
 
 
 def _alembic_config() -> Config:
@@ -158,15 +159,17 @@ def test_full_upgrade_downgrade_upgrade_cycle(migrations_db: str) -> None:
     # migration adds two more (supplier_payment_reversals,
     # supplier_credit_note_reversals; sale_returns.return_date and the
     # sales/sale_returns shift_id indexes are a column/index change, not
-    # tables): 63 + 2 = 65.
+    # tables): 63 + 2 = 65. M19 adds one COLUMN (purchase_orders.
+    # client_transaction_id), not a table -- unchanged at 65.
     assert _table_count(migrations_db) == 65
+    assert _current_revision(migrations_db) == M19_HEAD_REVISION
 
     command.downgrade(cfg, M0_REVISION)
     assert _table_count(migrations_db) == 8
 
     command.upgrade(cfg, "head")
     assert _table_count(migrations_db) == 65
-    assert _current_revision(migrations_db) == M16_HEAD_REVISION
+    assert _current_revision(migrations_db) == M19_HEAD_REVISION
 
 
 def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:

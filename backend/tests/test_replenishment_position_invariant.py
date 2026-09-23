@@ -20,7 +20,7 @@ from app.modules.purchasing.models import PurchaseOrderItem
 from app.modules.replenishment import service as replenishment_service
 from app.modules.transfers import service as transfer_service
 from app.modules.transfers.service import ReceiveLineInput, ShipLineInput, TransferLineInput
-from tests.factories import make_product, make_store, make_supplier
+from tests.factories import make_product, make_store, make_supplier, unique_suffix
 
 
 def _assert_m8_m9_agree(db: Session, product, expected_position: Decimal | None = None) -> Decimal:
@@ -59,6 +59,7 @@ def test_partially_received_po_counts_only_the_remainder(db: Session) -> None:
         store_id=store.id,
         supplier_id=supplier.id,
         order_date=date(2024, 1, 1),
+        client_transaction_id=f"po-{unique_suffix()}",
         lines=[
             purchasing_service.PurchaseOrderItemInput(
                 product_id=product.id, quantity_ordered=Decimal("20"), unit_cost=Decimal("1.00")
@@ -99,6 +100,7 @@ def test_cancelled_po_contributes_nothing_to_position(db: Session) -> None:
         store_id=store.id,
         supplier_id=supplier.id,
         order_date=date(2024, 1, 1),
+        client_transaction_id=f"po-{unique_suffix()}",
         lines=[
             purchasing_service.PurchaseOrderItemInput(
                 product_id=product.id, quantity_ordered=Decimal("20"), unit_cost=Decimal("1.00")
