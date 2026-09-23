@@ -226,9 +226,9 @@ def test_exact_duplicate_po_creation_request_returns_the_same_purchase_order(
     assert second.json()["id"] == first.json()["id"]
 
     count = db.execute(
-        select(func.count()).select_from(PurchaseOrder).where(
-            PurchaseOrder.client_transaction_id == key
-        )
+        select(func.count())
+        .select_from(PurchaseOrder)
+        .where(PurchaseOrder.client_transaction_id == key)
     ).scalar_one()
     assert count == 1
 
@@ -274,8 +274,8 @@ def test_retry_after_po_creation_business_failure_is_a_fresh_attempt(
     assert corrected_response.status_code == 201
 
     count = db.execute(
-        select(func.count()).select_from(PurchaseOrder).where(
-            PurchaseOrder.client_transaction_id == key
-        )
+        select(func.count())
+        .select_from(PurchaseOrder)
+        .where(PurchaseOrder.client_transaction_id == key)
     ).scalar_one()
     assert count == 1

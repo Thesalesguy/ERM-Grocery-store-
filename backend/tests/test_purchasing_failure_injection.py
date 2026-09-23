@@ -29,7 +29,13 @@ from app.modules.purchasing.models import (
     PurchaseReturn,
 )
 from app.modules.purchasing.service import GoodsReceiptLineInput, PurchaseReturnLineInput
-from tests.factories import make_product, make_purchase_order, make_store, make_supplier, unique_suffix
+from tests.factories import (
+    make_product,
+    make_purchase_order,
+    make_store,
+    make_supplier,
+    unique_suffix,
+)
 
 
 def _receive(db: Session, store, supplier, product, *, qty: Decimal, cost: Decimal):
@@ -102,7 +108,9 @@ def test_failure_during_receiving_accounting_rolls_back_everything(
                 InventoryMovement.reference_type == "purchase_order",
                 InventoryMovement.reference_id == po.id,
             )
-        ).scalars().first()
+        )
+        .scalars()
+        .first()
         is None
     )
     # The PO's running-total (quantity_received) never advanced.
@@ -188,8 +196,8 @@ def test_failure_during_purchase_return_accounting_rolls_back_everything(
     # The return's inventory-removal never applied.
     assert product.current_qty_on_hand == on_hand_before
     assert (
-        db.execute(
-            select(JournalEntry).where(JournalEntry.source_type == "PURCHASE_RETURN")
-        ).scalars().first()
+        db.execute(select(JournalEntry).where(JournalEntry.source_type == "PURCHASE_RETURN"))
+        .scalars()
+        .first()
         is None
     )

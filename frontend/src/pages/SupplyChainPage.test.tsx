@@ -204,7 +204,11 @@ describe('SupplyChainPage', () => {
           } as Response
         }
         if (url.includes('/replenishment/plans') && method === 'GET') {
-          return { ok: true, status: 200, json: async () => [approved ? approvedPlan : SAMPLE_PLAN] } as Response
+          return {
+            ok: true,
+            status: 200,
+            json: async () => [approved ? approvedPlan : SAMPLE_PLAN],
+          } as Response
         }
         if (url.includes('/replenishment/metrics')) {
           return { ok: true, status: 200, json: async () => NO_METRICS.json } as Response
@@ -224,9 +228,7 @@ describe('SupplyChainPage', () => {
     // Both the list row's badge and the detail panel's badge now say
     // APPROVED after the refetch -- assert on the button transition
     // instead of a text match that's ambiguous once there are two badges.
-    await waitFor(() =>
-      expect(screen.queryByRole('button', { name: /^approve$/i })).toBeNull(),
-    )
+    await waitFor(() => expect(screen.queryByRole('button', { name: /^approve$/i })).toBeNull())
     expect(screen.getAllByText('APPROVED').length).toBeGreaterThan(0)
   })
 })

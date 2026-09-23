@@ -581,9 +581,7 @@ def test_g_concurrent_duplicate_purchase_order_creation_creates_only_one_po() ->
         from app.modules.purchasing.models import PurchaseOrder
 
         count = (
-            verify_session.query(PurchaseOrder)
-            .filter_by(client_transaction_id=shared_key)
-            .count()
+            verify_session.query(PurchaseOrder).filter_by(client_transaction_id=shared_key).count()
         )
         assert count == 1
     finally:

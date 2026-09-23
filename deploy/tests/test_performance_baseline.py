@@ -231,6 +231,7 @@ def test_performance_baseline_through_the_real_production_topology(production_st
             store_id=store.id,
             supplier_id=supplier.id,
             order_date=date.today(),
+            client_transaction_id=f"perf-po-{unique_suffix()}",
             lines=[
                 PurchaseOrderItemInput(
                     product_id=products[0].id,
@@ -281,6 +282,7 @@ def test_performance_baseline_through_the_real_production_topology(production_st
             store_id=store.id,
             supplier_id=supplier.id,
             order_date=date.today(),
+            client_transaction_id=f"perf-po-{unique_suffix()}",
             lines=[
                 PurchaseOrderItemInput(
                     product_id=products[0].id,
