@@ -218,6 +218,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Make the checkout readable by the native postgres OS user
+        # `sudo -u postgres psql -f <path>` runs psql AS the postgres
+        # system user, which must itself have read+traverse access to
+        # every directory from / down to the checked-out file (this repo's
+        # own .sql bootstrap scripts, read by several deploy/tests/ files)
+        # -- GitHub's default runner-owned checkout is not world-readable
+        # all the way down. `chmod o+rX` only ADDS read/traverse for
+        # "other", changing no existing permission and granting nothing
+        # this ephemeral, single-job runner doesn't already fully own.
+        run: |
+          d="$GITHUB_WORKSPACE"
+          while [ "$d" != "/" ]; do sudo chmod o+rx "$d" || true; d=$(dirname "$d"); done
+          sudo chmod -R o+rX "$GITHUB_WORKSPACE"
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
