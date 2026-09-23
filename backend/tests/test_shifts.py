@@ -829,6 +829,42 @@ def test_direct_service_call_to_get_shift_and_list_shifts_enforces_store_isolati
     assert any(s.id == shift["id"] for s in own_store_results)
 
 
+def test_direct_service_call_to_list_cash_movements_enforces_store_isolation(
+    client: TestClient, db: Session
+) -> None:
+    """M17 item 1 (docs/M17_DISCOVERY.md "D. Cash movement accounting
+    and audit linkage"): list_cash_movements previously had no
+    caller_store_id parameter at all -- the HTTP endpoint's own
+    get_shift pre-check was the ONLY isolation for this data, unlike
+    get_shift/list_shifts (M16 Phase 0 item 5), which this test mirrors.
+    Proves the service layer now backstops a direct caller too, without
+    changing the endpoint's own observable behavior."""
+    store_a = make_store(db)
+    store_b = make_store(db)
+    cashier_a = _cashier(db, store_a)
+    headers_a = auth_headers(client, cashier_a, DEFAULT_TEST_PASSWORD)
+    shift = _open_shift(client, headers_a, store_a.id)
+    client.post(
+        f"/api/v1/shifts/{shift['id']}/cash-movements",
+        headers=headers_a,
+        json={
+            "movement_type": "PAID_IN",
+            "amount": "10.00",
+            "reason": "test movement",
+            "client_transaction_id": f"mv-{unique_suffix()}",
+        },
+    )
+
+    with pytest.raises(NotFoundError):
+        shifts_service.list_cash_movements(db, shift["id"], caller_store_id=store_b.id)
+
+    # A caller correctly scoped to the shift's own store still sees it.
+    own_store_results = shifts_service.list_cash_movements(
+        db, shift["id"], caller_store_id=store_a.id
+    )
+    assert len(own_store_results) == 1
+
+
 def test_cross_store_manager_cannot_override_close(client: TestClient, db: Session) -> None:
     store_a = make_store(db)
     store_b = make_store(db)

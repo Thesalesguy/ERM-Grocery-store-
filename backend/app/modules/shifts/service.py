@@ -573,7 +573,20 @@ def list_shifts(
     return list(db.execute(query).scalars().all())
 
 
-def list_cash_movements(db: Session, shift_id: int) -> list[CashMovement]:
+def list_cash_movements(
+    db: Session, shift_id: int, *, caller_store_id: int | None = None
+) -> list[CashMovement]:
+    """`caller_store_id` (M17 item 1): optional, defaults to None so
+    every pre-existing internal caller is unaffected. When given, a
+    cross-store mismatch raises NotFoundError — matching
+    get_shift/list_shifts' own information-hiding convention exactly.
+    Before this, the HTTP endpoint's own get_shift pre-check was the
+    ONLY isolation for this data; a direct service-layer call had none —
+    the one inconsistency with this module's own M16 defense-in-depth
+    standard (docs/M17_DISCOVERY.md "D. Cash movement accounting and
+    audit linkage")."""
+    if caller_store_id is not None:
+        get_shift(db, shift_id, caller_store_id=caller_store_id)
     return list(
         db.execute(
             select(CashMovement)

@@ -102,10 +102,11 @@ def list_cash_movements(
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_read_permission),
 ) -> list[CashMovementRead]:
-    # Called only for its store-isolation check (raises NotFoundError on
-    # cross-store); the shift row itself isn't otherwise needed here.
-    service.get_shift(db, shift_id, caller_store_id=current_user.store_id)
-    movements = service.list_cash_movements(db, shift_id)
+    # M17 item 1: the store-isolation check now lives inside
+    # service.list_cash_movements itself (mirroring get_shift/
+    # list_shifts), so a separate pre-check call is no longer needed
+    # here.
+    movements = service.list_cash_movements(db, shift_id, caller_store_id=current_user.store_id)
     return [CashMovementRead.model_validate(m) for m in movements]
 
 
