@@ -107,18 +107,23 @@ jobs:
     # limiting, connectivity failure, observability correlation, and
     # the performance baseline -- 22 of the suite's 73 tests.
     #
-    # Deliberately NOT wired in here: test_monitoring.py (needs a full
-    # Prometheus/Alertmanager/node_exporter/postgres_exporter stack),
-    # test_backup_offbox.py and the rclone/gpg-dependent parts of
-    # test_adversarial_security_audit.py and
-    # test_failure_injection_disaster_recovery.py (need rclone + a
-    # native `postgres` OS user via `sudo -u postgres`, which this
-    # job's Docker-container Postgres service does not provide), and
-    # test_deploy_procedure.py (assumes a backend/.venv/ this repo's CI
-    # does not create). Standing these up safely is a separate,
-    # larger infrastructure task -- see docs/M16_HARDENING_AUDIT.md
-    # "CI coverage for deploy/tests/" for the full reasoning, so this
-    # gap is documented rather than silently left unaddressed.
+    # M18 Phase 4: test_deploy_procedure.py's only CI blocker (a
+    # hardcoded backend/.venv/bin/python path) is fixed -- it now falls
+    # back to sys.executable, same as test_backup_restore.py already
+    # does -- so it is wired in here too (needs the same erp_test
+    # database as the backend job's migration-cycle test, bootstrapped
+    # below).
+    #
+    # The remaining 49 tests (test_db_security.py, test_backup_offbox.py,
+    # test_monitoring.py, test_adversarial_security_audit.py,
+    # test_failure_injection_disaster_recovery.py,
+    # test_integrated_production_session.py) all need a native
+    # `postgres` OS user via `sudo -u postgres`, which this job's
+    # Docker-container Postgres service does not provide -- a
+    # genuinely different Postgres deployment model, not just a missing
+    # package. They run in the separate `deploy-infra-native` job below
+    # instead, which installs PostgreSQL natively rather than sharing
+    # this job's Docker-container Postgres service pattern.
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -156,12 +161,17 @@ jobs:
       - name: Install nginx
         run: sudo apt-get update && sudo apt-get install -y nginx
 
-      - name: Bootstrap erp_app role
+      - name: Bootstrap erp_app role and erp_test database
+        # The erp_test database mirrors the backend job's own bootstrap
+        # step -- test_deploy_procedure.py's migration-failure scenario
+        # needs a database it can safely break a migration against,
+        # never erp_dev (which the rest of this job's tests use).
         env:
           PGPASSWORD: erp_password
         run: |
           psql -h localhost -U erp_user -d erp_dev -f backend/scripts/bootstrap_db_roles.sql
           psql -h localhost -U erp_user -d erp_dev -c "ALTER ROLE erp_app WITH PASSWORD 'erp_app_password';"
+          psql -h localhost -U erp_user -d postgres -c "CREATE DATABASE erp_test OWNER erp_user;"
 
       - name: Run migrations
         working-directory: backend
@@ -174,7 +184,89 @@ jobs:
             deploy/tests/test_rate_limiting.py \
             deploy/tests/test_connectivity_failure.py \
             deploy/tests/test_observability_correlation.py \
-            deploy/tests/test_performance_baseline.py
+            deploy/tests/test_performance_baseline.py \
+            deploy/tests/test_deploy_procedure.py
+
+  deploy-infra-native:
+    # M18 Phase 4: the remaining 49 of 73 deploy/tests tests all need a
+    # NATIVE `postgres` OS user reachable via `sudo -u postgres` (for
+    # `service postgresql stop/start`, reading Postgres's own log file,
+    # and role/database bootstrap as the postgres superuser) -- a
+    # Docker-container Postgres service, which the `backend` and
+    # `deploy-infra` jobs above both use, cannot provide that. This job
+    # installs PostgreSQL as a native package instead (a genuinely
+    # different, heavier deployment model, not a missing package on top
+    # of the existing jobs), plus the other real dependencies these
+    # files need: rclone + age (off-box backup encryption/transport)
+    # and the Prometheus/Alertmanager/node_exporter/postgres_exporter
+    # stack (monitoring). All are standard Ubuntu apt packages -- no
+    # mocked services, no invented infrastructure. Empirically verified
+    # locally (a sandbox with the same native-Postgres + apt-installed
+    # monitoring/backup tooling) before wiring in: all 49 tests pass.
+    #
+    # Deliberately still separate from the `deploy-infra` job above
+    # rather than replacing it: that job's Docker-container Postgres
+    # pattern is lighter, faster, and already proven, matching the
+    # `backend` job's own pattern for consistency -- there is no reason
+    # to make its tests depend on this heavier native install too.
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgresql+psycopg://erp_app:erp_app_password@localhost:5432/erp_dev
+      MIGRATIONS_DATABASE_URL: postgresql+psycopg://erp_user:erp_password@localhost:5432/erp_dev
+      SECRET_KEY: ci-only-not-a-real-secret-but-at-least-32-bytes-long
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: pip install -r requirements-dev.txt
+
+      - name: Install native PostgreSQL, nginx, and backup/monitoring tooling
+        # postgresql-16 (not the generic "postgresql" metapackage) to
+        # match the postgres:16 image the other two jobs use, so this
+        # job's Postgres behaves identically to theirs.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            postgresql-16 postgresql-contrib nginx rclone age \
+            prometheus prometheus-alertmanager prometheus-node-exporter \
+            prometheus-postgres-exporter
+          sudo service postgresql start
+
+      - name: Bootstrap erp_user role and erp_dev/erp_test databases
+        # A native install has only the "postgres" superuser -- unlike
+        # the postgres:16 Docker image, which auto-creates POSTGRES_USER
+        # as a superuser and POSTGRES_DB via its own entrypoint. Recreate
+        # that same starting state by hand so every later step (this
+        # repo's own bootstrap_db_roles.sql, Alembic, the test suite)
+        # sees an identical environment to the other two jobs.
+        run: |
+          sudo -u postgres psql -c "CREATE ROLE erp_user WITH LOGIN SUPERUSER PASSWORD 'erp_password';"
+          sudo -u postgres createdb -O erp_user erp_dev
+          sudo -u postgres createdb -O erp_user erp_test
+          PGPASSWORD=erp_password psql -h localhost -U erp_user -d erp_dev -f backend/scripts/bootstrap_db_roles.sql
+          PGPASSWORD=erp_password psql -h localhost -U erp_user -d erp_dev -c "ALTER ROLE erp_app WITH PASSWORD 'erp_app_password';"
+
+      - name: Run migrations
+        working-directory: backend
+        run: alembic upgrade head
+
+      - name: Tests (pytest, native postgres + backup/monitoring infrastructure)
+        run: |
+          pytest -v \
+            deploy/tests/test_db_security.py \
+            deploy/tests/test_backup_offbox.py \
+            deploy/tests/test_monitoring.py \
+            deploy/tests/test_adversarial_security_audit.py \
+            deploy/tests/test_failure_injection_disaster_recovery.py \
+            deploy/tests/test_integrated_production_session.py
 
   frontend:
     runs-on: ubuntu-latest

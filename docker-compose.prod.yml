@@ -34,6 +34,17 @@ services:
   db:
     ports: !reset []
     restart: always
+    # M18: conservative defaults sized for a single small-to-mid-business
+    # VPS deployment (docs/TECHNICAL_BLUEPRINT.md's own stated target),
+    # not a load-tested sizing recommendation — override in a local
+    # compose override file (or via a real capacity/load-test exercise)
+    # for a larger deployment. Purpose is to stop ONE runaway container
+    # from starving the host, not to tune Postgres performance.
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.0"
 
   backend:
     build:
@@ -41,6 +52,11 @@ services:
     restart: always
     env_file:
       - .env.prod
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "1.0"
     environment:
       DATABASE_URL: postgresql+psycopg://erp_app:${ERP_APP_PASSWORD:?ERP_APP_PASSWORD must be set in .env.prod}@db:5432/${POSTGRES_DB:-erp_prod}
       MIGRATIONS_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-erp_user}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env.prod}@db:5432/${POSTGRES_DB:-erp_prod}
@@ -70,6 +86,11 @@ services:
   nginx:
     image: nginx:1.27-alpine
     restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+          cpus: "0.5"
     ports:
       - "80:80"
       - "443:443"
@@ -81,7 +102,11 @@ services:
       - frontend_dist:/srv/erp/frontend-dist:ro
       - certbot_webroot:/var/www/certbot:ro
     depends_on:
-      - backend
+      # M18: was a plain ordering dependency (nginx could start proxying
+      # before the backend was actually ready to serve traffic). Now
+      # waits for the backend's own HEALTHCHECK (backend/Dockerfile).
+      backend:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:80/"]
       interval: 10s
