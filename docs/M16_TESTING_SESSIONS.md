@@ -259,3 +259,89 @@ accommodate M16.
 - Frontend gates: `npx tsc -b` (build mode — see Session J), `npm run
   lint` (oxlint), `npm run format:check` (prettier), `npm run build` —
   all clean after the Session J fix.
+
+## Session L — CI verification, and a second locally-coincidental-ID defect
+
+Pushing the four M16 commits triggered GitHub Actions run 35815829497,
+which ran against a clean database with no pre-existing rows. Backend
+job: **10 failed, 920 passed** —
+`fk_journal_entries_created_by_users` violations, all in
+`test_ap_reversal.py`. Root cause: 15 call sites (across 10 test
+functions, including the genuine-concurrency test's `_attempt_reversal`
+helper) passed `reversed_by=1` — the exact same anti-pattern as the
+earlier "Fix CI failure: hardcoded created_by=1" commit on this branch
+(`test_inventory_idempotency.py`, found and fixed before this session's
+work began): a literal user id that happened to exist in this sandbox's
+long-lived local database (from earlier, unrelated test runs) but does
+not exist on a fresh database, and `journal_entries.created_by` has a
+real foreign key to `users`.
+
+**The general lesson, now demonstrated twice in this milestone's own
+history**: a hardcoded integer id for any column with a foreign key is
+never safe in a test, regardless of how many times it passes locally —
+local databases accumulate state across runs in ways a fresh CI
+database never does, so the test is only ever proven correct by CI, not
+by a local run. The fix (this branch's own `test_inventory_idempotency.py`
+precedent, applied here) is always the same: create and commit a real
+row via the existing factory (`make_user_with_role`) and use its real
+`.id`.
+
+Fixed by adding a `_actor_id(db, store)` helper to
+`test_ap_reversal.py` that creates a real Manager user, and replacing
+every `reversed_by=1` with it — including threading a real id through
+`_attempt_reversal`'s two threads via a new `reversed_by` parameter
+(previously hardcoded inside the helper itself, invisible to a
+plain `grep` of the calling test). Verified locally (930/930), then
+pushed as its own dedicated commit (not squashed into or rewriting the
+earlier M16 history) and re-verified independently via the GitHub
+Actions API:
+
+- Run 35816504597 ("Fix CI failure: hardcoded reversed_by=1 in AP
+  reversal tests"), commit `2aea029`: **status=completed,
+  conclusion=success**, all three jobs green —
+  - `backend`: ruff/black/mypy clean, **930 passed**.
+  - `frontend`: oxlint/prettier/`tsc -b` clean, **49 passed** (14
+    files), `npm run build` succeeded.
+  - `deploy-infra`: **22 passed** in 82.13s — the same 22
+    proxy/TLS/rate-limiting/connectivity/observability/performance
+    tests validated locally in Session K's CI-wiring work, now proven
+    to actually execute in GitHub Actions, not merely runnable
+    locally.
+
+This is the actual, independently-verified CI-green state this
+milestone's Phase 8 gate requires — not a local "CI-looking" pytest
+run.
+
+## Session M — Migration re-verification (post Session L)
+
+Re-ran after the Session L fix, against the final `HEAD`:
+
+- `alembic heads` → exactly one head, `4a83c462dbff`.
+- `pytest tests/test_migrations.py` → **13 passed** (full
+  upgrade/downgrade/upgrade cycle from `base` through every milestone
+  and back; every M-N downgrade guard that must refuse when real data
+  exists; the M11 index add/remove cycle; the M12
+  alembic_version-privilege revoke/restore cycle).
+
+## Session N — Final repository audit
+
+- `git status` — clean working tree, no untracked files.
+- Diff against the M16 starting checkpoint (`87d3a99`, the last commit
+  before any M16 work): **43 files changed**, all expected (backend
+  modules/tests/migrations, frontend pages/api/tests, `ci.yml`, the
+  three `docs/M16_*.md` files) — no unrelated file touched.
+- Searched every file in that diff for: leftover `MUTATION TEST`
+  markers (none), debug statements (`console.log`, `debugger;`,
+  `pdb.set_trace`, `breakpoint()` — none), and secret-shaped strings
+  (AWS keys, private-key headers, inline passwords — none; the two
+  `SECRET_KEY`/DB-password values in `ci.yml` are the same
+  already-accepted CI-only placeholder pattern the pre-existing
+  `backend` job already used).
+- Inspected `ReportsPage.tsx`/`UsersPage.tsx`/`SettingsPage.tsx` for
+  stale placeholder text (none — the old `PlaceholderPage`/`milestone=`
+  references are gone), hardcoded role names (none — `UsersPage.tsx`
+  renders roles from `GET /roles`, never a literal `'Admin'`/`'Manager'`
+  string), and frontend-side money arithmetic (none — every
+  `Number(...)` call in `ReportsPage.tsx` is a display-only comparison,
+  e.g. `Number(r.discrepancy) === 0` for coloring, never a sum or
+  product of two monetary fields).

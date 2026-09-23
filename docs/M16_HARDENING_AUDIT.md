@@ -19,6 +19,7 @@ supporting infrastructure, is still incomplete.
 | 8 | Operational-vs-GL return-date divergence | **Fixed** — `SaleReturn.return_date` (a genuinely new column; none existed before) is now the single date both GL posting and reporting read, mirroring `Sale.completed_at`'s existing role. `COALESCE(return_date, DATE(created_at))` preserves historical rows' reporting behavior. | `test_reports_sales.py::test_backdated_return_lands_in_return_date_period_matching_gl` |
 | 9 | CI coverage for `deploy/tests/` | **Partially fixed** — see §4 below; not a full close. | 22/73 tests now run in CI. |
 | 10 | Migration safety | **Satisfied continuously**, not a discrete fix — every migration in this milestone follows the established nullable-additive-column (no downgrade guard needed) vs. real-data (guard-first downgrade) pattern per column. | `test_migrations.py` upgrade/downgrade cycle. |
+| 11 | `reversed_by=1` hardcoded in `test_ap_reversal.py` (found by CI, not locally) | **Fixed** — 15 call sites across 10 test functions (including the genuine-concurrency test's `_attempt_reversal` thread helper) hardcoded a user id that only "existed" by coincidence in this sandbox's long-lived local database; `journal_entries.created_by` has a real FK to `users`, so GitHub Actions' clean database caught it immediately (10 failed, 920 passed on the first push). Not a design defect — a test-fixture defect, the same class already found once this milestone in `test_inventory_idempotency.py` before M16 Phase 3+4 work began. See `M16_TESTING_SESSIONS.md` Session L for the full account. | `test_ap_reversal.py`'s own 14 tests, now passing against a real, freshly-created actor via the new `_actor_id(db, store)` helper; independently reverified via GitHub Actions run 35816504597 (930 passed). |
 
 ## 2. Investigated and found to be intentional — no code change
 
@@ -99,6 +100,13 @@ monitoring/alerting stack, the off-box backup encryption/verification
 path, or the native-Postgres-specific security controls would currently
 only be caught by someone running `deploy/tests/` by hand, exactly as
 before this milestone for those three areas.
+
+**Independently confirmed actually executing in CI, not just locally**:
+GitHub Actions run 35816504597 (commit `2aea029`), job `deploy-infra` —
+status=completed, conclusion=success, 22 passed in 82.13s. This is the
+real bar for "CI coverage" — a job definition that has never actually
+run in GitHub Actions is not coverage, it's an untested assumption
+about one.
 
 ## 5. Frontend tooling gap found and fixed during this milestone
 
