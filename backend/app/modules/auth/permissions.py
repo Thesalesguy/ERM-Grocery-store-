@@ -23,6 +23,13 @@ REPORTS_READ = "reports.read"
 USERS_MANAGE = "users.manage"
 AUDIT_READ = "audit.read"
 ACCOUNTING_READ = "accounting.read"
+# M16 (docs/M16_DESIGN.md "Settings screen"): store configuration
+# (return_approval_threshold_amount, attendance_day_boundary_hour, and
+# the basic identity fields name/address/timezone) previously had no API
+# surface at all -- these two mirror the read/write split every other
+# module in this permission matrix already follows.
+STORE_SETTINGS_READ = "store.settings.read"
+STORE_SETTINGS_WRITE = "store.settings.write"
 # Reserved for a future manual-journal-posting endpoint (M4 task Section
 # 27 explicitly asks manual posting endpoints to exist "only if users
 # genuinely need" them — they don't yet: every M4 journal entry is posted
@@ -215,6 +222,8 @@ ALL_PERMISSIONS: dict[str, str] = {
     SALES_READ: "View sales history and receipts",
     REPORTS_READ: "View reports (P&L, stock movement, ...)",
     USERS_MANAGE: "Create users and assign roles",
+    STORE_SETTINGS_READ: "View a store's configuration (return threshold, attendance rules)",
+    STORE_SETTINGS_WRITE: "Change a store's configuration",
     AUDIT_READ: "View the audit log",
     ACCOUNTING_READ: "View the chart of accounts, journal entries, and financial reports",
     ACCOUNTING_POST: "Manually post a journal entry (reserved; no endpoint uses this yet)",
@@ -341,6 +350,8 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         SHIFT_MANAGE,
         SHIFT_READ,
         SHIFT_OVERRIDE,
+        STORE_SETTINGS_READ,
+        STORE_SETTINGS_WRITE,
     ],
     CASHIER: [
         PRODUCTS_READ,
@@ -398,6 +409,7 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         HR_READ,
         ATTENDANCE_READ,
         PAYROLL_READ,
+        STORE_SETTINGS_READ,
         SHIFT_READ,
     ],
     # M10 design decision #3's exact scope: employee master data,

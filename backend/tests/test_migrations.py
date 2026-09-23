@@ -44,6 +44,7 @@ M14_HEAD_REVISION = "e0d2359bb08a"  # M14: return/void approval threshold
 M15_PRE_HARDENING_REVISION = "1a4bae98d246"  # pre-M15: stock adjustment idempotency
 M15_HEAD_REVISION = "db482a11ee31"  # M15: cashier/till shift sessions
 M16_HARDENING_REVISION = "e1a681c4aba3"  # M16: pre-implementation hardening
+M16_HEAD_REVISION = "4a83c462dbff"  # M16: store settings permissions
 
 
 def _alembic_config() -> Config:
@@ -165,7 +166,7 @@ def test_full_upgrade_downgrade_upgrade_cycle(migrations_db: str) -> None:
 
     command.upgrade(cfg, "head")
     assert _table_count(migrations_db) == 65
-    assert _current_revision(migrations_db) == M16_HARDENING_REVISION
+    assert _current_revision(migrations_db) == M16_HEAD_REVISION
 
 
 def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
@@ -184,9 +185,9 @@ def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
     # M14 adds one new permission (sales.return.approve) on top of M12's
     # 44 = 45. M15 adds three more (shift.manage, shift.read,
     # shift.override) = 48. The pre-M15 hardening migration adds no
-    # permissions (a column only). The M16 pre-implementation hardening
-    # migration adds one more (ap.reverse) = 49.
-    assert permission_count == 49
+    # permissions (a column only). M16 adds one more (ap.reverse) = 49,
+    # then two more (store.settings.read, store.settings.write) = 51.
+    assert permission_count == 51
 
 
 def test_m7_downgrade_refuses_when_credit_note_data_exists(migrations_db: str) -> None:

@@ -22,6 +22,7 @@ from app.api.v1.endpoints import (
     reports,
     sales,
     shifts,
+    stores,
     transfers,
 )
 
@@ -40,3 +41,4 @@ api_router.include_router(hr.router)
 api_router.include_router(payroll.router)
 api_router.include_router(reports.router)
 api_router.include_router(audit.router)
+api_router.include_router(stores.router)

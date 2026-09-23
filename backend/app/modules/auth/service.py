@@ -10,16 +10,24 @@ model/schema/service/route separation established in M1.
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import jwt
 from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import select
+from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
 from app.core.config import get_settings
-from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError, UnauthorizedError
+from app.core.exceptions import (
+    ConflictError,
+    ForbiddenError,
+    NotFoundError,
+    UnauthorizedError,
+    ValidationAppError,
+)
 from app.core.security import (
     create_access_token,
     decode_access_token,
@@ -29,7 +37,16 @@ from app.core.security import (
     verify_password,
 )
 from app.modules.audit import service as audit_service
-from app.modules.auth.models import Permission, RefreshToken, RolePermission, User, UserRole
+from app.modules.auth.models import (
+    Permission,
+    RefreshToken,
+    Role,
+    RolePermission,
+    Store,
+    User,
+    UserRole,
+)
+from app.modules.auth.permissions import ALL_ROLES, ROLE_PERMISSIONS
 
 # A real argon2 hash of an unguessable, never-used password. Verifying
 # against this when no matching user exists keeps the login endpoint's
@@ -299,6 +316,268 @@ def deactivate_user(
     )
     db.commit()
     return user
+
+
+# --- M16: user administration (Users/RBAC screen) --------------------------
+#
+# `users.manage` was provisioned in M12 ("Create users and assign roles")
+# but no endpoint implemented list/create/reactivate/role-assignment until
+# now — deactivate_user above was M12's one operator-facing capability.
+# Every mutating function here re-validates that the assigned/changed
+# role holds no permission the ACTING user doesn't themselves hold
+# (PRIVILEGE_ESCALATION_DENIED) — users.manage is Admin-only today (no
+# other role is granted it), so this is defense-in-depth rather than a
+# currently-reachable gap, but it makes the check meaningful the moment
+# any future milestone ever grants users.manage more broadly, exactly
+# the same discipline M14/M15/M16's own reversal/override checks follow.
+
+
+def list_users(db: Session, *, store_id: int | None = None) -> list[User]:
+    query = select(User).order_by(User.username)
+    if store_id is not None:
+        query = query.where(User.store_id == store_id)
+    return list(db.execute(query).scalars().all())
+
+
+def get_user_role_name(db: Session, user_id: int) -> str | None:
+    return db.execute(
+        select(Role.name)
+        .join(UserRole, UserRole.role_id == Role.id)
+        .where(UserRole.user_id == user_id)
+    ).scalar_one_or_none()
+
+
+def _validate_role_within_actor_permissions(
+    role_name: str, actor_permissions: frozenset[str]
+) -> None:
+    if role_name not in ALL_ROLES:
+        raise ValidationAppError(f"Unknown role {role_name!r}", error_code="INVALID_ROLE")
+    role_permission_set = frozenset(ROLE_PERMISSIONS.get(role_name, []))
+    if not role_permission_set.issubset(actor_permissions):
+        raise ForbiddenError(
+            f"Cannot assign role {role_name!r}: it holds a permission you do not have",
+            error_code="PRIVILEGE_ESCALATION_DENIED",
+        )
+
+
+def create_user(
+    db: Session,
+    *,
+    username: str,
+    email: str,
+    password: str,
+    full_name: str,
+    store_id: int | None,
+    role_name: str,
+    actor_id: int,
+    actor_permissions: frozenset[str],
+) -> User:
+    _validate_role_within_actor_permissions(role_name, actor_permissions)
+    user = User(
+        store_id=store_id,
+        username=username,
+        email=email,
+        password_hash=hash_password(password),
+        full_name=full_name,
+        is_active=True,
+    )
+    db.add(user)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ConflictError(
+            f"Username {username!r} or email {email!r} is already in use",
+            error_code="DUPLICATE_USER",
+        ) from exc
+
+    role = db.execute(select(Role).where(Role.name == role_name)).scalar_one()
+    db.add(UserRole(user_id=user.id, role_id=role.id))
+
+    audit_service.log_event(
+        db,
+        user_id=actor_id,
+        action="USER_CREATED",
+        entity_type="user",
+        entity_id=user.id,
+        after={"username": username, "role": role_name, "store_id": store_id},
+    )
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def reactivate_user(db: Session, *, target_user_id: int, actor_id: int) -> User:
+    """The counterpart deactivate_user's own docstring named as missing
+    from M12 ("there being no reactivation capability in this
+    milestone")."""
+    user = db.get(User, target_user_id)
+    if user is None:
+        raise NotFoundError(f"User {target_user_id} not found")
+    was_active = user.is_active
+    user.is_active = True
+    audit_service.log_event(
+        db,
+        user_id=actor_id,
+        action="USER_REACTIVATED",
+        entity_type="user",
+        entity_id=target_user_id,
+        before={"is_active": was_active},
+        after={"is_active": True},
+    )
+    db.commit()
+    return user
+
+
+def update_user_role(
+    db: Session,
+    *,
+    target_user_id: int,
+    role_name: str,
+    actor_id: int,
+    actor_permissions: frozenset[str],
+) -> User:
+    """Self-role-change is refused (mirrors deactivate_user's own
+    self-deactivation refusal exactly): a lone Admin downgrading their
+    own role would have no way back in through the API at all."""
+    if target_user_id == actor_id:
+        raise ConflictError("You cannot change your own role.", error_code="CANNOT_CHANGE_OWN_ROLE")
+    _validate_role_within_actor_permissions(role_name, actor_permissions)
+    user = db.get(User, target_user_id)
+    if user is None:
+        raise NotFoundError(f"User {target_user_id} not found")
+    role = db.execute(select(Role).where(Role.name == role_name)).scalar_one()
+
+    previous_role_name = get_user_role_name(db, target_user_id)
+    db.execute(delete(UserRole).where(UserRole.user_id == target_user_id))
+    db.add(UserRole(user_id=target_user_id, role_id=role.id))
+
+    audit_service.log_event(
+        db,
+        user_id=actor_id,
+        action="USER_ROLE_CHANGED",
+        entity_type="user",
+        entity_id=target_user_id,
+        before={"role": previous_role_name},
+        after={"role": role_name},
+    )
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+# --- M16: store settings (Settings screen) ----------------------------
+#
+# Exposes exactly the Store columns that already existed with documented
+# semantics before this milestone (attendance_day_boundary_hour, M10;
+# return_approval_threshold_amount, M14) plus the store's basic identity
+# fields (name/address/timezone) -- nothing invented. `is_active` is
+# deliberately NOT editable here: deactivating a store is a far more
+# consequential operation than a settings change (no evidence anywhere
+# in this repository of what should cascade from it), so it stays
+# read-only via this surface.
+
+
+def get_store(db: Session, store_id: int) -> Store:
+    store = db.get(Store, store_id)
+    if store is None:
+        raise NotFoundError(f"Store {store_id} not found")
+    return store
+
+
+def update_store_settings(
+    db: Session,
+    *,
+    store_id: int,
+    name: str | None = None,
+    address: str | None = None,
+    timezone: str | None = None,
+    attendance_day_boundary_hour: int | None = None,
+    return_approval_threshold_amount: Decimal | None = None,
+    clear_return_approval_threshold: bool = False,
+    actor_id: int,
+    caller_store_id: int | None,
+) -> Store:
+    """Only the fields explicitly passed are changed. `None` is itself a
+    MEANINGFUL value for `return_approval_threshold_amount` (clears the
+    threshold, disabling M14's approval gate for this store) -- since a
+    plain `None` default can't distinguish "not passed" from "explicitly
+    clear it", `clear_return_approval_threshold` disambiguates: only when
+    it is True does a `None`/omitted `return_approval_threshold_amount`
+    actually clear the column; otherwise omitting it leaves the existing
+    threshold untouched.
+
+    `caller_store_id` mirrors every other module's own duplicated
+    `_enforce_store_access(caller_store_id, target_store_id, noun)`
+    service-layer check (raw ids, not a `CurrentUser` -- this module's
+    own `enforce_store_access` above takes the latter and is an
+    endpoint-layer helper, not meant for direct service-layer reuse, per
+    that function's own docstring)."""
+    if caller_store_id is not None and caller_store_id != store_id:
+        raise ForbiddenError(
+            f"Your account is scoped to store {caller_store_id} and cannot access "
+            f"this store's settings in store {store_id}",
+            error_code="STORE_ACCESS_DENIED",
+        )
+    store = get_store(db, store_id)
+
+    before = {
+        "name": store.name,
+        "address": store.address,
+        "timezone": store.timezone,
+        "attendance_day_boundary_hour": store.attendance_day_boundary_hour,
+        "return_approval_threshold_amount": (
+            str(store.return_approval_threshold_amount)
+            if store.return_approval_threshold_amount is not None
+            else None
+        ),
+    }
+
+    if name is not None:
+        store.name = name
+    if address is not None:
+        store.address = address
+    if timezone is not None:
+        store.timezone = timezone
+    if attendance_day_boundary_hour is not None:
+        if not 0 <= attendance_day_boundary_hour <= 23:
+            raise ValidationAppError(
+                "attendance_day_boundary_hour must be between 0 and 23",
+                error_code="INVALID_ATTENDANCE_DAY_BOUNDARY_HOUR",
+            )
+        store.attendance_day_boundary_hour = attendance_day_boundary_hour
+    if clear_return_approval_threshold:
+        store.return_approval_threshold_amount = None
+    elif return_approval_threshold_amount is not None:
+        if return_approval_threshold_amount < 0:
+            raise ValidationAppError(
+                "return_approval_threshold_amount must be non-negative",
+                error_code="INVALID_RETURN_APPROVAL_THRESHOLD",
+            )
+        store.return_approval_threshold_amount = return_approval_threshold_amount
+
+    audit_service.log_event(
+        db,
+        user_id=actor_id,
+        action="STORE_SETTINGS_UPDATED",
+        entity_type="store",
+        entity_id=store.id,
+        before=before,
+        after={
+            "name": store.name,
+            "address": store.address,
+            "timezone": store.timezone,
+            "attendance_day_boundary_hour": store.attendance_day_boundary_hour,
+            "return_approval_threshold_amount": (
+                str(store.return_approval_threshold_amount)
+                if store.return_approval_threshold_amount is not None
+                else None
+            ),
+        },
+    )
+    db.commit()
+    db.refresh(store)
+    return store
 
 
 def logout(db: Session, *, raw_refresh_token: str) -> None:
