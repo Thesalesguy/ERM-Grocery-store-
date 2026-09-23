@@ -59,17 +59,31 @@ def _receive(db: Session, store, supplier, product, *, qty: Decimal, cost: Decim
     return po, item
 
 
-def test_mutation_removing_invoice_idempotency_check_breaks_retry_transparency(
+def test_mutation_removing_invoice_idempotency_fast_path_still_dedupes_via_integrityerror_recovery(
     db: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Baseline: retrying create_purchase_invoice with the same
     client_transaction_id and the same payload transparently returns the
-    original invoice. Neutering
-    _match_or_reject_idempotent_invoice makes the retry instead reach the
-    (supplier_id, invoice_number) unique constraint and raise
-    DUPLICATE_SUPPLIER_INVOICE_NUMBER — proving the check is load-bearing
-    for retry safety, not just an optimization (the same class of finding
-    M5 made for sale returns)."""
+    original invoice.
+
+    M19 hardening: this used to break when
+    `_match_or_reject_idempotent_invoice`'s fast-path lookup was
+    neutered, because the IntegrityError recovery block below it checked
+    WHICH unique constraint fired and, under a same-invoice_number retry,
+    reached (supplier_id, invoice_number) before it ever checked for a
+    client_transaction_id match — a real, reproducible gap found by
+    tests/test_ap_concurrency.py's
+    test_f_two_concurrent_invoice_creations_with_same_idempotency_key_create_exactly_one
+    (a genuinely concurrent duplicate lost this exact race deterministically,
+    not just a sequential retry). Fixed by checking for a
+    client_transaction_id match FIRST in that recovery block, regardless
+    of which constraint the IntegrityError named — matching the priority
+    every other module's identical recovery block already gives
+    idempotency (receive_goods/create_purchase_return/
+    create_purchase_order). This test now proves that fix: retry
+    transparency survives even with the fast path disabled, because the
+    UNIQUE-constraint recovery path is now a real second line of
+    defense, not just a duplicate-invoice-number rejection."""
     store = make_store(db)
     supplier = make_supplier(db)
     product = make_product(db, store)
@@ -96,10 +110,8 @@ def test_mutation_removing_invoice_idempotency_check_breaks_retry_transparency(
     assert retry.id == first.id  # baseline: transparent
 
     monkeypatch.setattr(ap_service, "_match_or_reject_idempotent_invoice", lambda *a, **kw: None)
-    with pytest.raises(ConflictError) as exc_info:
-        _create()
-    assert exc_info.value.error_code == "DUPLICATE_SUPPLIER_INVOICE_NUMBER"
-    db.rollback()
+    fast_path_disabled_retry = _create()
+    assert fast_path_disabled_retry.id == first.id  # still transparent (IntegrityError recovery)
 
     monkeypatch.undo()
     restored_retry = _create()

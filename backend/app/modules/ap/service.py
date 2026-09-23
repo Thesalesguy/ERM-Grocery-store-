@@ -377,22 +377,35 @@ def create_purchase_invoice(
         db.flush()
     except IntegrityError as exc:
         db.rollback()
+        # M19: check idempotency FIRST, regardless of which of the two
+        # UNIQUE constraints Postgres happened to report — a genuinely
+        # concurrent duplicate submission (identical client_transaction_id,
+        # which in practice also means an identical invoice_number, since a
+        # real retry resubmits the same values) trips
+        # uq_purchase_invoices_supplier_invoice_number just as often as the
+        # client_transaction_id constraint, depending on index-check order,
+        # so checking the constraint name first was silently surfacing
+        # DUPLICATE_SUPPLIER_INVOICE_NUMBER to the losing thread of its OWN
+        # retry instead of transparently returning the winner (found by
+        # test_ap_concurrency.py's
+        # test_f_two_concurrent_invoice_creations_with_same_idempotency_key_create_exactly_one).
+        # Idempotency dedup takes priority, matching every other module's
+        # identical recovery block (receive_goods/create_purchase_return/
+        # create_purchase_order).
+        winner = db.execute(
+            select(PurchaseInvoice).where(
+                PurchaseInvoice.client_transaction_id == client_transaction_id
+            )
+        ).scalar_one_or_none()
+        if winner is not None:
+            return winner
         constraint = getattr(getattr(exc.orig, "diag", None), "constraint_name", None)
         if constraint == "uq_purchase_invoices_supplier_invoice_number":
             raise ConflictError(
                 f"Supplier {supplier_id} already has an invoice numbered {invoice_number!r}",
                 error_code="DUPLICATE_SUPPLIER_INVOICE_NUMBER",
             ) from exc
-        # Otherwise assume a genuinely concurrent duplicate client_transaction_id
-        # submission — see finalize_sale's identical recovery block.
-        winner = db.execute(
-            select(PurchaseInvoice).where(
-                PurchaseInvoice.client_transaction_id == client_transaction_id
-            )
-        ).scalar_one_or_none()
-        if winner is None:
-            raise
-        return winner
+        raise
 
     product_ids = {item.product_id for item in po_items_by_id.values()}
     products_by_id = {

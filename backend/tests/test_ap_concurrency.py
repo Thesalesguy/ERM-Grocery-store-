@@ -97,6 +97,77 @@ def _setup_posted_invoice(*, qty: Decimal, cost: Decimal) -> tuple[int, int, int
         session.close()
 
 
+def _setup_received_po(*, qty: Decimal, cost: Decimal) -> tuple[int, int, int, int]:
+    """Returns (store_id, supplier_id, po_id, po_item_id) -- a receipt
+    with no invoice created against it yet, for M19's invoice-creation
+    idempotency concurrency test below."""
+    session = SessionLocal()
+    try:
+        store = make_store(session)
+        supplier = make_supplier(session)
+        product = make_product(session, store)
+        session.commit()
+        po = make_purchase_order(session, store, supplier)
+        item = PurchaseOrderItem(
+            purchase_order_id=po.id, product_id=product.id, quantity_ordered=qty, unit_cost=cost
+        )
+        session.add(item)
+        session.commit()
+        purchasing_service.receive_goods(
+            session,
+            purchase_order_id=po.id,
+            received_date=date(2024, 1, 1),
+            lines=[GoodsReceiptLineInput(item.id, qty, cost)],
+            client_transaction_id=f"txn-{uuid.uuid4().hex}",
+            caller_store_id=None,
+        )
+        session.commit()
+        return store.id, supplier.id, po.id, item.id
+    finally:
+        session.close()
+
+
+def _attempt_invoice_creation(
+    *,
+    store_id: int,
+    supplier_id: int,
+    po_id: int,
+    item_id: int,
+    qty: Decimal,
+    cost: Decimal,
+    invoice_number: str,
+    barrier: threading.Barrier,
+    result: _Outcome,
+    client_transaction_id: str,
+) -> None:
+    session = SessionLocal()
+    try:
+        barrier.wait(timeout=10)
+        invoice = ap_service.create_purchase_invoice(
+            session,
+            store_id=store_id,
+            supplier_id=supplier_id,
+            purchase_order_id=po_id,
+            invoice_number=invoice_number,
+            invoice_date=date(2024, 1, 5),
+            lines=[PurchaseInvoiceLineInput(item_id, qty, cost)],
+            client_transaction_id=client_transaction_id,
+            caller_store_id=None,
+        )
+        result.succeeded = True
+        result.result_id = invoice.id
+    except ConflictError as exc:
+        session.rollback()
+        result.succeeded = False
+        result.error_code = exc.error_code
+    except Exception as exc:  # noqa: BLE001 - want a real deadlock/error to surface, not vanish
+        session.rollback()
+        result.succeeded = False
+        result.unexpected_error = f"{type(exc).__name__}: {exc}"
+    finally:
+        session.close()
+
+
 def _attempt_payment(
     *,
     invoice_id: int,
@@ -551,5 +622,71 @@ def test_e_two_concurrent_payments_with_same_idempotency_key_create_exactly_one(
             assert count == 1
             invoice = verify_session.get(PurchaseInvoice, invoice_id)
             assert invoice.amount_paid == Decimal("50.00")  # not double-applied to 100
+        finally:
+            verify_session.close()
+
+
+def test_f_two_concurrent_invoice_creations_with_same_idempotency_key_create_exactly_one() -> None:
+    """M19 Design §4: create_purchase_invoice's own idempotency, proven
+    against two real threads at CREATION time (test_e above already
+    covers the payment case; the invoice-creation DRAFT step had no
+    equivalent proof)."""
+    for _ in range(5):
+        store_id, supplier_id, po_id, item_id = _setup_received_po(
+            qty=Decimal("5"), cost=Decimal("10.00")
+        )
+        shared_key = f"itxn-{uuid.uuid4().hex}"
+        shared_invoice_number = f"INV-{uuid.uuid4().hex}"
+
+        barrier = threading.Barrier(2)
+        result_a, result_b = _Outcome(), _Outcome()
+        thread_a = threading.Thread(
+            target=_attempt_invoice_creation,
+            kwargs=dict(
+                store_id=store_id,
+                supplier_id=supplier_id,
+                po_id=po_id,
+                item_id=item_id,
+                qty=Decimal("5"),
+                cost=Decimal("10.00"),
+                invoice_number=shared_invoice_number,
+                barrier=barrier,
+                result=result_a,
+                client_transaction_id=shared_key,
+            ),
+        )
+        thread_b = threading.Thread(
+            target=_attempt_invoice_creation,
+            kwargs=dict(
+                store_id=store_id,
+                supplier_id=supplier_id,
+                po_id=po_id,
+                item_id=item_id,
+                qty=Decimal("5"),
+                cost=Decimal("10.00"),
+                invoice_number=shared_invoice_number,
+                barrier=barrier,
+                result=result_b,
+                client_transaction_id=shared_key,
+            ),
+        )
+        thread_a.start()
+        thread_b.start()
+        thread_a.join(timeout=15)
+        thread_b.join(timeout=15)
+
+        assert result_a.unexpected_error is None, result_a
+        assert result_b.unexpected_error is None, result_b
+        assert result_a.succeeded and result_b.succeeded, (result_a, result_b)
+        assert result_a.result_id == result_b.result_id
+
+        verify_session = SessionLocal()
+        try:
+            count = (
+                verify_session.query(PurchaseInvoice)
+                .filter_by(client_transaction_id=shared_key)
+                .count()
+            )
+            assert count == 1
         finally:
             verify_session.close()
