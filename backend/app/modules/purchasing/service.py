@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -78,6 +78,7 @@ class SupplierInput:
     email: str | None = None
     address: str | None = None
     tax_id: str | None = None
+    default_payment_terms_days: int | None = None
 
 
 def create_supplier(db: Session, data: SupplierInput, *, actor_id: int | None = None) -> Supplier:
@@ -89,6 +90,7 @@ def create_supplier(db: Session, data: SupplierInput, *, actor_id: int | None = 
         email=data.email,
         address=data.address,
         tax_id=data.tax_id,
+        default_payment_terms_days=data.default_payment_terms_days,
     )
     db.add(supplier)
     try:
@@ -229,6 +231,7 @@ def _create_purchase_order_inner(
     supplier_id: int,
     order_date: date,
     lines: list[PurchaseOrderItemInput],
+    client_transaction_id: str,
     expected_date: date | None = None,
     notes: str | None = None,
     created_by: int | None = None,
@@ -245,8 +248,21 @@ def _create_purchase_order_inner(
 
     `replenishment_plan_id` (M9): set only when this PO is being generated
     BY replenishment-plan execution, tracing it back to the plan that
-    produced it — never set by the ordinary manual-creation route."""
+    produced it — never set by the ordinary manual-creation route.
+
+    `client_transaction_id` (M19): the idempotency key, same pattern as
+    `receive_goods`/`create_purchase_return` — a retried/duplicated
+    request must not silently create two separate DRAFT purchase
+    orders. Fast-path lookup first (same key returns the existing PO
+    unchanged); a genuinely concurrent duplicate that loses that race is
+    caught via the DB UNIQUE constraint below."""
     _enforce_store_access(caller_store_id, store_id, "purchase orders")
+
+    existing = db.execute(
+        select(PurchaseOrder).where(PurchaseOrder.client_transaction_id == client_transaction_id)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
 
     store = db.get(Store, store_id)
     if store is None or not store.is_active:
@@ -262,6 +278,7 @@ def _create_purchase_order_inner(
         store_id=store_id,
         supplier_id=supplier_id,
         purchase_number=_generate_purchase_number(store_id),
+        client_transaction_id=client_transaction_id,
         status="DRAFT",
         order_date=order_date,
         expected_date=expected_date,
@@ -270,7 +287,18 @@ def _create_purchase_order_inner(
         replenishment_plan_id=replenishment_plan_id,
     )
     db.add(purchase_order)
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        winner = db.execute(
+            select(PurchaseOrder).where(
+                PurchaseOrder.client_transaction_id == client_transaction_id
+            )
+        ).scalar_one_or_none()
+        if winner is None:
+            raise
+        return winner
     for line in lines:
         db.add(
             PurchaseOrderItem(
@@ -305,6 +333,7 @@ def create_purchase_order(
     supplier_id: int,
     order_date: date,
     lines: list[PurchaseOrderItemInput],
+    client_transaction_id: str,
     expected_date: date | None = None,
     notes: str | None = None,
     created_by: int | None = None,
@@ -321,6 +350,7 @@ def create_purchase_order(
         supplier_id=supplier_id,
         order_date=order_date,
         lines=lines,
+        client_transaction_id=client_transaction_id,
         expected_date=expected_date,
         notes=notes,
         created_by=created_by,
@@ -737,6 +767,57 @@ def create_purchase_return(
         )
 
     distinct_product_ids = sorted(requested_qty)
+
+    # M19: a return can only ever give back stock this PO actually
+    # delivered — without this check, a product with enough on-hand
+    # stock from OTHER purchase orders (or other stores' receipts prior
+    # to a transfer) could be "returned" against a PO that never
+    # supplied it, silently corrupting that PO's received/returned
+    # traceability. Received-per-product is summed from this PO's own
+    # PurchaseOrderItem rows (locked FOR UPDATE — the same lock
+    # receive_goods/post_purchase_invoice already take on these rows, so
+    # a receipt/invoice/return racing against this PO's items always
+    # serializes correctly); already-returned is summed across every
+    # PRIOR PurchaseReturn against this same PO.
+    received_rows = db.execute(
+        select(PurchaseOrderItem.product_id, PurchaseOrderItem.quantity_received)
+        .where(
+            PurchaseOrderItem.purchase_order_id == purchase_order_id,
+            PurchaseOrderItem.product_id.in_(distinct_product_ids),
+        )
+        .with_for_update()
+    ).all()
+    received_by_product: dict[int, Decimal] = {}
+    for product_id, quantity_received in received_rows:
+        received_by_product[product_id] = (
+            received_by_product.get(product_id, Decimal("0")) + quantity_received
+        )
+
+    already_returned_rows = db.execute(
+        select(PurchaseReturnItem.product_id, func.sum(PurchaseReturnItem.quantity))
+        .join(PurchaseReturn, PurchaseReturn.id == PurchaseReturnItem.purchase_return_id)
+        .where(
+            PurchaseReturn.purchase_order_id == purchase_order_id,
+            PurchaseReturnItem.product_id.in_(distinct_product_ids),
+        )
+        .group_by(PurchaseReturnItem.product_id)
+    ).all()
+    already_returned_by_product: dict[int, Decimal] = {
+        product_id: total for product_id, total in already_returned_rows
+    }
+
+    for product_id, requested in requested_qty.items():
+        received = received_by_product.get(product_id, Decimal("0"))
+        already_returned = already_returned_by_product.get(product_id, Decimal("0"))
+        if already_returned + requested > received:
+            raise ConflictError(
+                f"Cannot return {requested} of product {product_id} against "
+                f"purchase order {purchase_order_id}: only "
+                f"{received - already_returned} remaining returnable "
+                f"(received {received}, already returned {already_returned})",
+                error_code="RETURN_EXCEEDS_RECEIVED_QUANTITY",
+            )
+
     locked_products: dict[int, Product] = {}
     for product_id in distinct_product_ids:
         product = inventory_service.lock_product_for_update(db, product_id)
