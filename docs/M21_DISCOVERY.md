@@ -1,5 +1,18 @@
 # M21 Discovery — Mission Traceability & Gap Analysis
 
+**Implementation status update (post-discovery):** Findings F1 (HR
+employment/compensation history isolation) and F5/F6 (AP supplier-financial
+and invoice-matching-status isolation) — the CRITICAL/HIGH/MEDIUM
+cross-store isolation gaps identified below — have since been remediated.
+See `docs/M21_TESTING_SESSIONS.md` for the full implementation record
+(service-layer fixes, mutation testing, regression results). F7 and F8
+remain explicitly unresolved/out of scope, exactly as this document
+originally found — this update does not alter any discovery conclusion
+below; it only records that the remediation milestone happened. All other
+findings, gaps, and the proposed roadmap in this document are unchanged
+and still reflect the state of the repository as of its original HEAD
+(`98570fd`).
+
 **Status: Discovery only. No production code, migrations, or tests were changed to
 produce this document.** This audit was conducted entirely by reading the
 current repository at HEAD `98570fd` (M20's closing commit) and the full

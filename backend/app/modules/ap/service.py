@@ -510,14 +510,21 @@ class PurchaseOrderItemMatchStatus:
 
 
 def get_invoice_matching_status(
-    db: Session, purchase_order_id: int
+    db: Session, purchase_order_id: int, *, caller_store_id: int | None
 ) -> list[PurchaseOrderItemMatchStatus]:
     """Read-only three-way-match preview for ONE PO — mirrors
     app.modules.sales.service.get_return_eligibility's read-only-helper
     shape. `quantity_invoiceable` is the exact ceiling
-    post_purchase_invoice enforces: never received, ordered."""
+    post_purchase_invoice enforces: never received, ordered.
+
+    M21 F6 fix: a store-scoped caller gets the same 404-not-403 (never
+    confirm existence elsewhere) that `get_invoice`/purchasing.py's
+    `_get_po_with_store_check` already give for a direct-by-ID read of
+    another store's resource."""
     purchase_order = db.get(PurchaseOrder, purchase_order_id)
     if purchase_order is None:
+        raise NotFoundError(f"Purchase order {purchase_order_id} not found")
+    if caller_store_id is not None and purchase_order.store_id != caller_store_id:
         raise NotFoundError(f"Purchase order {purchase_order_id} not found")
     return [
         PurchaseOrderItemMatchStatus(
@@ -534,15 +541,19 @@ def get_invoice_matching_status(
 
 
 def get_invoice_matching_status_multi(
-    db: Session, purchase_order_ids: list[int]
+    db: Session, purchase_order_ids: list[int], *, caller_store_id: int | None
 ) -> list[PurchaseOrderItemMatchStatus]:
     """M7: the multi-PO equivalent of get_invoice_matching_status, for the
     "one invoice across multiple POs" workflow (docs/M7_ADVANCED_AP_SETTLEMENT.md
     Section 1) — the frontend calls this once instead of stitching together
-    several single-PO calls itself."""
+    several single-PO calls itself.
+
+    M21 F6 fix: threads caller_store_id into every single-PO call so a
+    store-scoped caller cannot smuggle another store's PO id into the
+    comma-separated list and get it back unfiltered."""
     rows: list[PurchaseOrderItemMatchStatus] = []
     for po_id in purchase_order_ids:
-        rows.extend(get_invoice_matching_status(db, po_id))
+        rows.extend(get_invoice_matching_status(db, po_id, caller_store_id=caller_store_id))
     return rows
 
 
@@ -1929,19 +1940,30 @@ class SupplierApSummary:
 
 
 def get_supplier_ap_summary(
-    db: Session, supplier_id: int, *, as_of: date | None = None
+    db: Session, supplier_id: int, *, as_of: date | None = None, store_id: int | None = None
 ) -> SupplierApSummary:
     """Answers the M6/M7 task checklist for one supplier. Every figure
     here is derived directly from PurchaseInvoice/SupplierPayment/
     SupplierCreditNote rows (the AP subledger) — never from a separately-
     maintained running total, so it always reconciles to what the rows
-    actually say."""
+    actually say.
+
+    M21 F5 fix: `Supplier` itself is deliberately company-wide reference
+    data (docs/M19 discovery), but `PurchaseInvoice`/`PurchaseOrder` are
+    store-scoped operational data everywhere else in this module. `store_id`
+    filters this summary to one store's own rows for a store-scoped caller
+    (mirroring `scoped_store_filter`'s omitted-filter default of "just my
+    own store"); an unrestricted caller passing `store_id=None` still sees
+    the true, all-store total. Passed identically to
+    `get_supplier_transaction_history`/`get_supplier_statement` so a
+    store-scoped caller's statement `closing_balance` keeps equaling their
+    own summary's `total_owed`, exactly as this docstring and
+    `get_supplier_statement`'s already document for the unfiltered case."""
     as_of = as_of or date.today()
-    invoices = list(
-        db.execute(select(PurchaseInvoice).where(PurchaseInvoice.supplier_id == supplier_id))
-        .scalars()
-        .all()
-    )
+    invoice_query = select(PurchaseInvoice).where(PurchaseInvoice.supplier_id == supplier_id)
+    if store_id is not None:
+        invoice_query = invoice_query.where(PurchaseInvoice.store_id == store_id)
+    invoices = list(db.execute(invoice_query).scalars().all())
     total_owed = Decimal("0")
     total_overdue = Decimal("0")
     total_paid = Decimal("0")
@@ -1956,11 +1978,10 @@ def get_supplier_ap_summary(
                 total_overdue += balance
     total_current = total_owed - total_overdue
 
-    purchase_orders = list(
-        db.execute(select(PurchaseOrder).where(PurchaseOrder.supplier_id == supplier_id))
-        .scalars()
-        .all()
-    )
+    po_query = select(PurchaseOrder).where(PurchaseOrder.supplier_id == supplier_id)
+    if store_id is not None:
+        po_query = po_query.where(PurchaseOrder.store_id == store_id)
+    purchase_orders = list(db.execute(po_query).scalars().all())
     outstanding_clearing = Decimal("0")
     for po in purchase_orders:
         for item in po.items:
@@ -1994,22 +2015,25 @@ class SupplierTransaction:
     status: str
 
 
-def get_supplier_transaction_history(db: Session, supplier_id: int) -> list[SupplierTransaction]:
-    invoices = (
-        db.execute(select(PurchaseInvoice).where(PurchaseInvoice.supplier_id == supplier_id))
-        .scalars()
-        .all()
+def get_supplier_transaction_history(
+    db: Session, supplier_id: int, *, store_id: int | None = None
+) -> list[SupplierTransaction]:
+    """M21 F5 fix: see `get_supplier_ap_summary`'s docstring — `store_id`
+    is applied identically here (invoices/payments/credit-notes are all
+    store-scoped operational rows) so a store-scoped caller's transaction
+    list never includes another store's itemized AP activity."""
+    invoice_query = select(PurchaseInvoice).where(PurchaseInvoice.supplier_id == supplier_id)
+    payment_query = select(SupplierPayment).where(SupplierPayment.supplier_id == supplier_id)
+    credit_note_query = select(SupplierCreditNote).where(
+        SupplierCreditNote.supplier_id == supplier_id
     )
-    payments = (
-        db.execute(select(SupplierPayment).where(SupplierPayment.supplier_id == supplier_id))
-        .scalars()
-        .all()
-    )
-    credit_notes = (
-        db.execute(select(SupplierCreditNote).where(SupplierCreditNote.supplier_id == supplier_id))
-        .scalars()
-        .all()
-    )
+    if store_id is not None:
+        invoice_query = invoice_query.where(PurchaseInvoice.store_id == store_id)
+        payment_query = payment_query.where(SupplierPayment.store_id == store_id)
+        credit_note_query = credit_note_query.where(SupplierCreditNote.store_id == store_id)
+    invoices = db.execute(invoice_query).scalars().all()
+    payments = db.execute(payment_query).scalars().all()
+    credit_notes = db.execute(credit_note_query).scalars().all()
     transactions = (
         [
             SupplierTransaction(
@@ -2075,6 +2099,7 @@ def get_supplier_statement(
     *,
     date_from: date | None = None,
     date_to: date | None = None,
+    store_id: int | None = None,
 ) -> SupplierStatement:
     """A chronological reconstruction of the supplier balance from
     invoices/payments/credit-notes — never from a cached total
@@ -2084,27 +2109,28 @@ def get_supplier_statement(
     is itself the sum of allocations from these SAME payments/credit
     notes, so summing (Σ non-draft/voided invoice grand_totals) - (Σ
     payments) - (Σ credit notes) telescopes to (Σ outstanding invoice
-    balances)."""
-    invoices = (
-        db.execute(
-            select(PurchaseInvoice).where(
-                PurchaseInvoice.supplier_id == supplier_id,
-                PurchaseInvoice.status.notin_(_NON_ACCOUNTING_INVOICE_STATUSES),
-            )
-        )
-        .scalars()
-        .all()
+    balances).
+
+    M21 F5 fix: `store_id` is applied identically to `get_supplier_ap_summary`/
+    `get_supplier_transaction_history` -- including to the reversal joins
+    below -- so that equality keeps holding for a store-scoped caller too
+    (their statement's closing_balance must still equal their own
+    store-filtered summary's total_owed, not the company-wide one)."""
+    invoice_query = select(PurchaseInvoice).where(
+        PurchaseInvoice.supplier_id == supplier_id,
+        PurchaseInvoice.status.notin_(_NON_ACCOUNTING_INVOICE_STATUSES),
     )
-    payments = (
-        db.execute(select(SupplierPayment).where(SupplierPayment.supplier_id == supplier_id))
-        .scalars()
-        .all()
+    payment_query = select(SupplierPayment).where(SupplierPayment.supplier_id == supplier_id)
+    credit_note_query = select(SupplierCreditNote).where(
+        SupplierCreditNote.supplier_id == supplier_id
     )
-    credit_notes = (
-        db.execute(select(SupplierCreditNote).where(SupplierCreditNote.supplier_id == supplier_id))
-        .scalars()
-        .all()
-    )
+    if store_id is not None:
+        invoice_query = invoice_query.where(PurchaseInvoice.store_id == store_id)
+        payment_query = payment_query.where(SupplierPayment.store_id == store_id)
+        credit_note_query = credit_note_query.where(SupplierCreditNote.store_id == store_id)
+    invoices = db.execute(invoice_query).scalars().all()
+    payments = db.execute(payment_query).scalars().all()
+    credit_notes = db.execute(credit_note_query).scalars().all()
     # M16 (docs/M16_DESIGN.md "AP payment/credit-note correction path"):
     # a reversed payment/credit note's ORIGINAL event above is
     # deliberately left unchanged (it really happened, historically) --
@@ -2115,19 +2141,26 @@ def get_supplier_statement(
     # diverge from get_supplier_ap_summary/ap_aging (both of which read
     # the live, already-corrected PurchaseInvoice.amount_paid/
     # amount_credited) the moment any reversal exists.
-    payment_reversals = db.execute(
+    payment_reversal_query = (
         select(SupplierPaymentReversal, SupplierPayment)
         .join(SupplierPayment, SupplierPayment.id == SupplierPaymentReversal.supplier_payment_id)
         .where(SupplierPayment.supplier_id == supplier_id)
-    ).all()
-    credit_note_reversals = db.execute(
+    )
+    credit_note_reversal_query = (
         select(SupplierCreditNoteReversal, SupplierCreditNote)
         .join(
             SupplierCreditNote,
             SupplierCreditNote.id == SupplierCreditNoteReversal.supplier_credit_note_id,
         )
         .where(SupplierCreditNote.supplier_id == supplier_id)
-    ).all()
+    )
+    if store_id is not None:
+        payment_reversal_query = payment_reversal_query.where(SupplierPayment.store_id == store_id)
+        credit_note_reversal_query = credit_note_reversal_query.where(
+            SupplierCreditNote.store_id == store_id
+        )
+    payment_reversals = db.execute(payment_reversal_query).all()
+    credit_note_reversals = db.execute(credit_note_reversal_query).all()
 
     # The tiebreaker for same-day events CANNOT be each row's own primary
     # key: PurchaseInvoice/SupplierPayment/SupplierCreditNote are three

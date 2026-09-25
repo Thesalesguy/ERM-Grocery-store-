@@ -689,7 +689,7 @@ def test_get_invoice_matching_status_reflects_ordered_received_invoiced(db: Sess
     ap_service.post_purchase_invoice(db, purchase_invoice_id=invoice.id, caller_store_id=None)
     db.commit()
 
-    status = ap_service.get_invoice_matching_status(db, po.id)
+    status = ap_service.get_invoice_matching_status(db, po.id, caller_store_id=None)
     assert len(status) == 1
     row = status[0]
     assert row.quantity_ordered == Decimal("10")
