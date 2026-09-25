@@ -302,3 +302,45 @@ pushed for a fresh CI run per the M19 completion report.
 **Limitation**: none — this is the exact kind of gap an exhaustive,
 skeptical final pass is supposed to catch, and it was caught before
 being reported as complete.
+
+## Session Q — Final CI run on the fixed HEAD, and one confirmed flake
+
+**Command**: CI run [36091458525](https://github.com/Thesalesguy/ERM-Grocery-store-/actions/runs/36091458525) on HEAD `fa6de28`, all 4 jobs checked individually.
+**Expected**: backend/frontend/deploy-infra/deploy-infra-native all green.
+**Actual (attempt 1)**: backend, frontend, and deploy-infra all green.
+`deploy-infra-native` failed one test —
+`deploy/tests/test_failure_injection_disaster_recovery.py::test_monitoring_exporter_itself_going_down_fires_an_alert`
+— with `httpx.ConnectError: [Errno 111] Connection refused` while
+polling a freshly-`Popen`'d Prometheus subprocess's own `/api/v1/targets`
+endpoint before its HTTP listener had bound. This code is untouched by
+this branch's entire diff, and the same test suite had passed 3 minutes
+earlier on HEAD `c231260` with no relevant code changed in between; the
+test's own existing comment already documents a related variant of this
+exact "isolated stack" startup race (a `JSONDecodeError` case, found and
+handled at "full deploy/tests/ suite scale" under higher sandbox load) —
+this run hit an earlier phase of the identical race (connection refused
+before the port even opens, rather than a 503 after it does).
+Classified as a genuine environment-timing flake in unrelated deploy
+test infrastructure, not a defect in M19's work, per the standard rule
+that a check red on unrelated code with no intervening change, that
+reproduces once, warrants exactly one confirming re-run rather than a
+speculative code change.
+**Actual (attempt 2, `rerun_failed_jobs` on the same run)**: all 49
+deploy-infra-native tests passed, including the previously-failing one,
+on byte-identical code. Confirms the flake classification — the
+underlying race is a pre-existing, already-partially-documented gap in
+this test file's own subprocess-startup polling, not something this
+branch introduced or is responsible for fixing (it lies entirely
+outside the diff `6c04ed4..fa6de28`).
+**Evidence**: run 36091458525, attempt 1 job-by-job results and attempt
+2's all-green result, both retrieved independently via the GitHub
+Actions API (not inferred from the overall workflow conclusion alone).
+**Limitation**: `test_monitoring_exporter_itself_going_down_fires_an_alert`'s
+`_target_up` helper still calls `httpx.get(...)` unconditionally before
+confirming the Prometheus process has bound its port, so this exact
+flake can recur under sufficient load on a future, unrelated CI run.
+Not fixed here (out of this branch's scope — no M19 change touches
+this file); worth a small follow-up (wrap the request in `except
+httpx.ConnectError: return False`, mirroring the existing 503/
+`JSONDecodeError` tolerance two lines above it) whenever that file is
+next touched for its own reasons.
