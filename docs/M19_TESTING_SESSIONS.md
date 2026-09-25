@@ -262,3 +262,43 @@ reviewed M19 changes — zero leaked mutation edits.
 confirmations; final CI run (see the M19 completion report for the run
 ID and job results).
 **Limitation**: none.
+
+## Session P — CI-failure fix and exhaustive final-validation re-audit
+
+**Command**: manual re-verification per an explicit final-validation
+instruction: confirm HEAD/clean tree/single Alembic head, diff the
+CI-fix commit against the previous failed commit, grep the ENTIRE
+repository (not just `backend/`) for every purchase-order creation call
+site, re-run the complete backend suite/ruff/black/mypy, the complete
+frontend suite/tsc/prettier/oxlint/build, and re-verify the actual CI
+run job-by-job rather than trusting the overall workflow conclusion.
+**Expected**: the CI-fix commit (`c231260`) contains only formatting/
+import-order changes plus the two missed `deploy/tests/` call sites;
+every purchase-order creation call site in the repository (Python and
+TypeScript alike) satisfies the `client_transaction_id` requirement.
+**Actual**: the repository-wide grep (extended this time to
+`frontend/src/api/*.ts` and `frontend/src/pages/*.tsx`, not just
+`*.py`) found a real regression the earlier Python-only sweep had
+missed: `frontend/src/api/purchasing.ts`'s `PurchaseOrderCreateInput`
+type never declared `client_transaction_id`, and
+`PurchasingPage.tsx`'s `NewPurchaseOrderForm` never sent one — the
+actual browser app's "New purchase order" button would 422 on every
+real submission. Fixed (see `M19_DESIGN.md` §1 and
+`M19_HARDENING_AUDIT.md` defect #5) with the same `idempotencyKeyRef`
+pattern already used by this file's own receive-goods form, plus a new
+regression test asserting the real outgoing request body carries the
+field. Re-ran the complete backend suite (957 passed), migration tests
+(16 passed) ruff/black/mypy (all clean), and the complete frontend
+suite (55 passed, up from 54 — the new test), `tsc -b`, `oxlint`,
+`prettier --check`, and `npm run build` (all clean) against the fixed
+working tree.
+**Evidence**: full command output for every tool listed above; `git
+diff 3015fad c231260` reviewed line-by-line and confirmed to contain
+only reformatting/import-sorting plus the two `deploy/tests/` fixes (no
+logic weakened, no mutation-targeted code touched); the subsequent CI
+run (job-by-job, not just overall conclusion) confirmed green on all 4
+jobs before this session's fix was found, and the newly-fixed HEAD is
+pushed for a fresh CI run per the M19 completion report.
+**Limitation**: none — this is the exact kind of gap an exhaustive,
+skeptical final pass is supposed to catch, and it was caught before
+being reported as complete.

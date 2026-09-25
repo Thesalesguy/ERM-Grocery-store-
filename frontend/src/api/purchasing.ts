@@ -59,6 +59,7 @@ export interface PurchaseOrderCreateInput {
   order_date: string
   expected_date?: string
   notes?: string
+  client_transaction_id: string
   lines: PurchaseOrderItemInput[]
 }
 

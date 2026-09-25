@@ -16,12 +16,15 @@ because it is common in other ERPs.
 | 2 | Purchase returns validated only against current on-hand stock, never against what the specific PO actually received | `create_purchase_return` had no query against `PurchaseOrderItem.quantity_received`/prior `PurchaseReturnItem` rows for that PO | Added a `received`/`already_returned` computation (locked `FOR UPDATE`, closing a concurrency gap as a side effect) with a new `RETURN_EXCEEDS_RECEIVED_QUANTITY` rejection | Session C, H |
 | 3 | `Supplier.default_payment_terms_days` had no write path | Column existed since M6 and was already correctly consumed by AP's due-date calculation, but `SupplierCreate`/`SupplierUpdate`/`create_supplier`/`update_supplier` never exposed it | Added the field to both schemas (`ge=0` validated) and threaded it through both service functions | Session D |
 | 4 | `create_purchase_invoice`'s idempotency recovery could reject a genuine concurrent duplicate retry with `DUPLICATE_SUPPLIER_INVOICE_NUMBER` instead of transparently returning the winner | The `IntegrityError` handler branched on which of two UNIQUE constraints fired before checking for a `client_transaction_id` match — under an identical-values race, Postgres deterministically reported the invoice-number constraint first | Reordered the recovery block to check for the idempotent match first, unconditionally (matching every other module) | Session E (this defect was FOUND by the new concurrency test required for coverage item "real concurrency test for purchase-invoice-creation dedup" — not pre-scoped in `M19_DESIGN.md`'s original 3 items, added as §5 once discovered) |
+| 5 | `PurchasingPage.tsx`'s "New purchase order" form never sent `client_transaction_id`, and `PurchaseOrderCreateInput` didn't even declare the field | Fix #1 made the field required on the backend, but the one real frontend caller (the actual browser form) and its TypeScript request type were never updated to match — every real UI submission would 422 | Added `client_transaction_id: string` to `PurchaseOrderCreateInput`; `NewPurchaseOrderForm` now generates one via the same `idempotencyKeyRef` pattern this file's own receive-goods form already used (`useRef`, generated once per attempt, reused on retry, reset on success) | New test in `PurchasingPage.test.tsx` asserting the actual outgoing request body carries a non-empty `client_transaction_id` — found during the exhaustive final-validation call-site sweep (this file's Python-only earlier grep sweep had missed the one non-Python, non-backend, non-deploy caller) |
 
-All 4 fixes are narrow and mechanical: an added idempotency column +
+All 5 fixes are narrow and mechanical: an added idempotency column +
 check (matching an existing, proven pattern 5 times over), one new
 validation query before an existing lock, one schema/service field
-addition, and a 6-line exception-handler reordering. None redesigned
-stable financial logic; none introduced new business concepts.
+addition, a 6-line exception-handler reordering, and one frontend type/
+form update matching an existing frontend pattern in the same file.
+None redesigned stable financial logic; none introduced new business
+concepts.
 
 ## 2. Missing capabilities — intentionally deferred (not built)
 

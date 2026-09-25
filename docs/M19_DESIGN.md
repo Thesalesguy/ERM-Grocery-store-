@@ -47,6 +47,28 @@ meaning to preserve, unlike a financial ledger column).
 returns) and a real multi-thread concurrent-duplicate test (mirrors
 `test_purchasing_concurrency.py`'s `test_f_concurrent_duplicate_receipt_requests_create_only_one_receipt`).
 
+**Frontend regression found during final CI verification (not caught by
+the original test pass)**: making `client_transaction_id` a required
+backend field broke the ONE real caller that matters — the actual
+browser app. `frontend/src/api/purchasing.ts`'s `PurchaseOrderCreateInput`
+type never declared the field, and `PurchasingPage.tsx`'s
+`NewPurchaseOrderForm` never sent one; every real "New purchase order"
+submission through the UI would have received a 422 from the backend.
+This was invisible to the existing frontend test suite because
+`PurchasingPage.test.tsx` had no test at all for the create-PO form (only
+list/detail/submit/receive were covered) — the gap wasn't a wrong
+assertion, it was a missing one. Found and fixed while exhaustively
+searching every purchase-order creation call site in the repository
+(not just backend/deploy Python files) per the final-validation pass;
+fixed with the exact same `idempotencyKeyRef` pattern this file's own
+`ReceiveGoodsForm` already established (`useRef<string | null>(null)`,
+generate on first attempt, reuse across a retry of the same attempt,
+reset only after success). A new regression test
+(`PurchasingPage.test.tsx`'s "creates a new purchase order via the form
+with a client_transaction_id") asserts the actual outgoing request body
+carries a non-empty `client_transaction_id`, not just that the mocked
+call resolves.
+
 ## 2. Purchase return validates only against on-hand stock, not against what was actually received on that PO
 
 **Problem** (`M19_DISCOVERY.md` §8): `create_purchase_return` checks
