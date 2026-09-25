@@ -30,7 +30,15 @@ from sqlalchemy import create_engine, inspect
 from alembic import command
 
 DEPLOY_SCRIPT = DEPLOY_DIR / "scripts" / "deploy.sh"
-PYTHON_BIN = str(BACKEND_DIR / ".venv" / "bin" / "python")
+# M18: was a hardcoded backend/.venv/bin/python -- this sandbox runs
+# pytest via a local .venv, but GitHub Actions CI installs dependencies
+# directly (no venv), so that path never existed there, silently
+# excluding this file from CI (docs/M16_HARDENING_AUDIT.md's own
+# documented gap). sys.executable is the interpreter actually running
+# this test either way (same fix already applied to
+# backend/tests/test_backup_restore.py for the same reason).
+_LOCAL_VENV_PYTHON = BACKEND_DIR / ".venv" / "bin" / "python"
+PYTHON_BIN = str(_LOCAL_VENV_PYTHON) if _LOCAL_VENV_PYTHON.exists() else sys.executable
 
 TEST_MIGRATIONS_DATABASE_URL = "postgresql+psycopg://erp_user:erp_password@localhost:5432/erp_test"
 DEV_MIGRATIONS_DATABASE_URL = "postgresql+psycopg://erp_user:erp_password@localhost:5432/erp_dev"

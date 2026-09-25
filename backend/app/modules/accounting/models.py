@@ -111,6 +111,41 @@ AUTOMATED_SOURCE_TYPES = (
     # PayrollPeriod.status or the real pay obligation it represents).
     "PAYROLL_POSTING",
     "PAYROLL_REVERSAL",
+    # M15 (docs/M15_DESIGN.md "GL treatment"): posted once per shift close,
+    # only when the physical count differs from expected cash (a zero
+    # variance posts nothing — no financial event occurred). Blocked from
+    # generic reverse_journal_entry for the same reason every automated
+    # type above is: a bare journal reversal would not undo
+    # CashierShift.status/variance_amount or the real cash-handling event
+    # it represents. There is deliberately no CASH_SHIFT_VARIANCE_REVERSAL
+    # counterpart yet — M15 builds no shift-reopen/correction workflow
+    # (docs/M15_DESIGN.md "What M15 deliberately did not build"), so
+    # nothing in this milestone would ever call one.
+    # (M16 verified this entry is already present and the generic
+    # reverse_journal_entry gate already correctly refuses it — see
+    # docs/M16_DESIGN.md "Phase 0 item 2" for the regression test proving
+    # this invariant; the M16 discovery audit's claim that this was
+    # missing did not hold up against the actual code.)
+    "CASH_SHIFT_VARIANCE",
+    # M16 (docs/M16_DESIGN.md "AP payment/credit-note correction path"):
+    # SUPPLIER_PAYMENT_REVERSAL / SUPPLIER_CREDIT_NOTE_REVERSAL are posted
+    # once per reversal by app.modules.ap.service's dedicated
+    # reverse_supplier_payment/reverse_supplier_credit_note functions --
+    # never through reverse_journal_entry's generic mechanism, same
+    # reasoning as every automated type above: a bare journal reversal
+    # would not undo the invoice(s)' amount_paid/amount_credited or
+    # create the SupplierPaymentReversal/SupplierCreditNoteReversal row
+    # that records the correction. Reusing `source_id` = the ORIGINAL
+    # payment/credit note's id (mirroring PAYROLL_REVERSAL's own
+    # source_id=period.id convention) means the existing partial unique
+    # index on (source_type, source_id) also gives, for free, "this
+    # payment/credit note can only ever be reversed once" at the DB
+    # level -- the same backstop
+    # app.modules.ap.models.SupplierPaymentReversal's own
+    # UNIQUE(supplier_payment_id) constraint already provides at the
+    # domain-row level.
+    "SUPPLIER_PAYMENT_REVERSAL",
+    "SUPPLIER_CREDIT_NOTE_REVERSAL",
 )
 SOURCE_TYPES = AUTOMATED_SOURCE_TYPES + ("MANUAL",)
 ENTRY_TYPES = ("STANDARD", "REVERSAL")

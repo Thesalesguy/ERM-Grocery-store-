@@ -967,6 +967,13 @@ def execute_plan(
                     unit_cost=supplier_product.unit_cost,
                 )
             ],
+            # M19: deterministic, unique per plan -- a replenishment plan
+            # can only ever generate one PO (plan.generated_purchase_order_id
+            # is set exactly once, guarded by the plan's own status
+            # transition), so this key can never legitimately collide
+            # across two different plans, and re-deriving it for the same
+            # plan is exactly the idempotent-retry case this key exists for.
+            client_transaction_id=f"replenishment-plan-{plan.id}",
             created_by=actor_id,
             caller_store_id=caller_store_id,
             replenishment_plan_id=plan.id,

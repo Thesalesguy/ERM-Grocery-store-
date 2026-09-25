@@ -13,7 +13,7 @@ from decimal import Decimal
 import pytest
 from sqlalchemy.orm import Session
 
-from app.core.exceptions import ConflictError
+from app.core.exceptions import ConflictError, ForbiddenError
 from app.modules.inventory import service as inventory_service
 from app.modules.purchasing import service as purchasing_service
 from app.modules.purchasing.models import PurchaseOrderItem
@@ -317,3 +317,121 @@ def test_purchase_return_data_model(db: Session) -> None:
     db.commit()
 
     assert purchase_return.items[0].unit_cost == Decimal("12.00")
+
+
+def test_cross_store_purchase_return_is_rejected(db: Session) -> None:
+    """M19: create_purchase_return's own _enforce_store_access, proven
+    at the service layer directly (not just through the route) --
+    matching how test_purchasing.py already tests PO creation/receiving
+    isolation independently of the HTTP boundary."""
+    store_a = make_store(db)
+    store_b = make_store(db)
+    supplier = make_supplier(db)
+    product = make_product(db, store_b, current_qty_on_hand=Decimal("10"))
+    po = make_purchase_order(db, store_b, supplier)
+    item = PurchaseOrderItem(
+        purchase_order_id=po.id,
+        product_id=product.id,
+        quantity_ordered=Decimal("10"),
+        quantity_received=Decimal("10"),
+        unit_cost=Decimal("5.00"),
+    )
+    db.add(item)
+    db.commit()
+
+    with pytest.raises(ForbiddenError):
+        purchasing_service.create_purchase_return(
+            db,
+            purchase_order_id=po.id,
+            store_id=store_b.id,
+            return_date=date(2024, 1, 6),
+            lines=[
+                purchasing_service.PurchaseReturnLineInput(
+                    product_id=product.id, quantity=Decimal("2")
+                )
+            ],
+            client_transaction_id=f"ret-{unique_suffix()}",
+            caller_store_id=store_a.id,
+        )
+
+
+def test_wac_matches_worked_example_at_fractional_quantities(db: Session) -> None:
+    """M19: proves compute_new_wac's exact-Decimal formula holds at
+    fractional precision (a weighed product), not just whole units --
+    the arithmetic is identical, this only proves it wasn't silently
+    assuming integer quantities anywhere along the way."""
+    store, po, item, product = _make_po_with_item(
+        db, quantity_ordered=Decimal("2.375"), unit_cost=Decimal("10.00")
+    )
+    purchasing_service.receive_goods(
+        db,
+        client_transaction_id=f"txn-{unique_suffix()}",
+        caller_store_id=None,
+        purchase_order_id=po.id,
+        received_date=date(2024, 1, 1),
+        lines=[GoodsReceiptLineInput(item.id, Decimal("2.375"), Decimal("10.00"))],
+    )
+    db.commit()
+    db.refresh(product)
+    assert product.current_qty_on_hand == Decimal("2.375")
+    assert product.current_cost == Decimal("10.000000")
+
+    po2 = make_purchase_order(db, store, make_supplier(db))
+    item2 = PurchaseOrderItem(
+        purchase_order_id=po2.id,
+        product_id=product.id,
+        quantity_ordered=Decimal("1.625"),
+        unit_cost=Decimal("14.00"),
+    )
+    db.add(item2)
+    db.commit()
+    purchasing_service.receive_goods(
+        db,
+        client_transaction_id=f"txn-{unique_suffix()}",
+        caller_store_id=None,
+        purchase_order_id=po2.id,
+        received_date=date(2024, 1, 2),
+        lines=[GoodsReceiptLineInput(item2.id, Decimal("1.625"), Decimal("14.00"))],
+    )
+    db.commit()
+    db.refresh(product)
+    # (2.375*10 + 1.625*14) / (2.375+1.625) = (23.75 + 22.75) / 4 = 11.625
+    assert product.current_qty_on_hand == Decimal("4.000")
+    assert product.current_cost == Decimal("11.625000")
+
+
+def test_cancelling_a_partially_received_po_retains_the_inventory_already_received(
+    db: Session,
+) -> None:
+    """M19: PARTIALLY_RECEIVED is in _CANCELLABLE_PO_STATUSES -- proves
+    what happens to inventory that already physically arrived when the
+    remainder is cancelled: it is retained, matching this codebase's
+    append-only-ledger philosophy (cancellation stops FUTURE receiving,
+    it never reverses a receipt that already posted)."""
+    store, po, item, product = _make_po_with_item(
+        db, quantity_ordered=Decimal("10"), unit_cost=Decimal("5.00")
+    )
+    purchasing_service.receive_goods(
+        db,
+        client_transaction_id=f"txn-{unique_suffix()}",
+        caller_store_id=None,
+        purchase_order_id=po.id,
+        received_date=date(2024, 1, 1),
+        lines=[GoodsReceiptLineInput(item.id, Decimal("4"), Decimal("5.00"))],
+    )
+    db.commit()
+    db.refresh(po)
+    assert po.status == "PARTIALLY_RECEIVED"
+    db.refresh(product)
+    assert product.current_qty_on_hand == Decimal("4")
+
+    purchasing_service.cancel_purchase_order(
+        db, po.id, actor_id=None, reason="Remainder no longer needed", caller_store_id=None
+    )
+    db.commit()
+    db.refresh(po)
+    db.refresh(product)
+    assert po.status == "CANCELLED"
+    # The 4 units already received are retained -- cancellation is not a
+    # reversal of what already physically arrived.
+    assert product.current_qty_on_hand == Decimal("4")

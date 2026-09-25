@@ -17,14 +17,23 @@ from app.core.config import get_settings
 from app.core.exceptions import UnauthorizedError
 from app.core.rate_limit import login_rate_limiter, refresh_rate_limiter
 from app.modules.auth import service
-from app.modules.auth.permissions import USERS_MANAGE
+from app.modules.auth.permissions import ALL_ROLES, USERS_MANAGE
 from app.modules.auth.schemas import (
     AccessTokenResponse,
     CurrentUserResponse,
     LoginRequest,
+    RoleRead,
+    UserCreateRequest,
     UserDeactivateResponse,
+    UserRead,
+    UserRoleUpdateRequest,
 )
-from app.modules.auth.service import CurrentUser, get_current_user, require_permission
+from app.modules.auth.service import (
+    CurrentUser,
+    get_current_user,
+    require_permission,
+    scoped_store_filter,
+)
 
 
 def _client_ip(request: Request) -> str:
@@ -139,3 +148,80 @@ def deactivate_user(
         user_agent=request.headers.get("user-agent"),
     )
     return UserDeactivateResponse(id=user.id, username=user.username, is_active=user.is_active)
+
+
+@router.get("/roles", response_model=list[RoleRead])
+def list_roles(
+    current_user: CurrentUser = Depends(require_permission(USERS_MANAGE)),
+) -> list[RoleRead]:
+    return [RoleRead(name=name, description=description) for name, description in ALL_ROLES.items()]
+
+
+def _to_user_read(db: Session, user) -> UserRead:  # type: ignore[no-untyped-def]
+    return UserRead(
+        id=user.id,
+        username=user.username,
+        email=user.email,
+        full_name=user.full_name,
+        store_id=user.store_id,
+        is_active=user.is_active,
+        role=service.get_user_role_name(db, user.id),
+    )
+
+
+@router.get("/users", response_model=list[UserRead])
+def list_users(
+    store_id: int | None = None,
+    current_user: CurrentUser = Depends(require_permission(USERS_MANAGE)),
+    db: Session = Depends(get_db),
+) -> list[UserRead]:
+    effective_store_id = scoped_store_filter(current_user, store_id)
+    users = service.list_users(db, store_id=effective_store_id)
+    return [_to_user_read(db, u) for u in users]
+
+
+@router.post("/users", response_model=UserRead, status_code=status.HTTP_201_CREATED)
+def create_user(
+    payload: UserCreateRequest,
+    current_user: CurrentUser = Depends(require_permission(USERS_MANAGE)),
+    db: Session = Depends(get_db),
+) -> UserRead:
+    user = service.create_user(
+        db,
+        username=payload.username,
+        email=payload.email,
+        password=payload.password,
+        full_name=payload.full_name,
+        store_id=payload.store_id,
+        role_name=payload.role,
+        actor_id=current_user.id,
+        actor_permissions=current_user.permissions,
+    )
+    return _to_user_read(db, user)
+
+
+@router.post("/users/{user_id}/reactivate", response_model=UserDeactivateResponse)
+def reactivate_user(
+    user_id: int,
+    current_user: CurrentUser = Depends(require_permission(USERS_MANAGE)),
+    db: Session = Depends(get_db),
+) -> UserDeactivateResponse:
+    user = service.reactivate_user(db, target_user_id=user_id, actor_id=current_user.id)
+    return UserDeactivateResponse(id=user.id, username=user.username, is_active=user.is_active)
+
+
+@router.put("/users/{user_id}/role", response_model=UserRead)
+def update_user_role(
+    user_id: int,
+    payload: UserRoleUpdateRequest,
+    current_user: CurrentUser = Depends(require_permission(USERS_MANAGE)),
+    db: Session = Depends(get_db),
+) -> UserRead:
+    user = service.update_user_role(
+        db,
+        target_user_id=user_id,
+        role_name=payload.role,
+        actor_id=current_user.id,
+        actor_permissions=current_user.permissions,
+    )
+    return _to_user_read(db, user)

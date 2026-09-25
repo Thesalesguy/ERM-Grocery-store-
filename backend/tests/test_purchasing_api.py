@@ -20,11 +20,14 @@ from tests.factories import (
 from tests.helpers import auth_headers
 
 
-def _po_payload(store, supplier, product, *, quantity="10", unit_cost="5.00"):
+def _po_payload(
+    store, supplier, product, *, quantity="10", unit_cost="5.00", client_transaction_id=None
+):
     return {
         "store_id": store.id,
         "supplier_id": supplier.id,
         "order_date": "2024-01-01",
+        "client_transaction_id": client_transaction_id or f"po-{unique_suffix()}",
         "lines": [{"product_id": product.id, "quantity_ordered": quantity, "unit_cost": unit_cost}],
     }
 
@@ -53,6 +56,115 @@ def test_create_and_get_supplier(client: TestClient, db: Session) -> None:
     get_response = client.get(f"/api/v1/purchasing/suppliers/{supplier_id}", headers=headers)
     assert get_response.status_code == 200
     assert get_response.json()["name"] == "Acme Distributors"
+
+
+def test_default_payment_terms_days_round_trips_through_create_and_update(
+    client: TestClient, db: Session
+) -> None:
+    """M19: this field existed on the model since M6 (consumed by AP's
+    payment-due-date calculation) but had no write path until now."""
+    make_user_with_role(db, None, MANAGER, username="sup_mgr_terms")
+    db.commit()
+    headers = auth_headers(client, "sup_mgr_terms", DEFAULT_TEST_PASSWORD)
+
+    create_response = client.post(
+        "/api/v1/purchasing/suppliers",
+        headers=headers,
+        json={
+            "name": "Net-30 Distributors",
+            "code": f"NET30-{unique_suffix()}",
+            "default_payment_terms_days": 30,
+        },
+    )
+    assert create_response.status_code == 201
+    supplier_id = create_response.json()["id"]
+    assert create_response.json()["default_payment_terms_days"] == 30
+
+    get_response = client.get(f"/api/v1/purchasing/suppliers/{supplier_id}", headers=headers)
+    assert get_response.json()["default_payment_terms_days"] == 30
+
+    update_response = client.put(
+        f"/api/v1/purchasing/suppliers/{supplier_id}",
+        headers=headers,
+        json={"default_payment_terms_days": 45},
+    )
+    assert update_response.status_code == 200
+    assert update_response.json()["default_payment_terms_days"] == 45
+
+    get_after_update = client.get(f"/api/v1/purchasing/suppliers/{supplier_id}", headers=headers)
+    assert get_after_update.json()["default_payment_terms_days"] == 45
+
+
+def test_negative_default_payment_terms_days_rejected(client: TestClient, db: Session) -> None:
+    make_user_with_role(db, None, MANAGER, username="sup_mgr_terms_neg")
+    db.commit()
+    headers = auth_headers(client, "sup_mgr_terms_neg", DEFAULT_TEST_PASSWORD)
+
+    response = client.post(
+        "/api/v1/purchasing/suppliers",
+        headers=headers,
+        json={
+            "name": "Invalid Terms Co",
+            "code": f"NEG-{unique_suffix()}",
+            "default_payment_terms_days": -5,
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_deactivate_and_reactivate_supplier(client: TestClient, db: Session) -> None:
+    """M19: never exercised before -- the activate/deactivate routes
+    exist and are used by create_purchase_order's own supplier-active
+    check, but had no dedicated test."""
+    make_user_with_role(db, None, MANAGER, username="sup_mgr_active")
+    db.commit()
+    headers = auth_headers(client, "sup_mgr_active", DEFAULT_TEST_PASSWORD)
+
+    create_response = client.post(
+        "/api/v1/purchasing/suppliers",
+        headers=headers,
+        json={"name": "Toggle Co", "code": f"TOG-{unique_suffix()}"},
+    )
+    supplier_id = create_response.json()["id"]
+    assert create_response.json()["is_active"] is True
+
+    deactivate_response = client.post(
+        f"/api/v1/purchasing/suppliers/{supplier_id}/deactivate", headers=headers
+    )
+    assert deactivate_response.status_code == 200
+    assert deactivate_response.json()["is_active"] is False
+
+    get_after_deactivate = client.get(
+        f"/api/v1/purchasing/suppliers/{supplier_id}", headers=headers
+    )
+    assert get_after_deactivate.json()["is_active"] is False
+
+    reactivate_response = client.post(
+        f"/api/v1/purchasing/suppliers/{supplier_id}/activate", headers=headers
+    )
+    assert reactivate_response.status_code == 200
+    assert reactivate_response.json()["is_active"] is True
+
+
+def test_purchase_order_cannot_be_created_for_an_inactive_supplier(
+    client: TestClient, db: Session
+) -> None:
+    store = make_store(db)
+    supplier = make_supplier(db)
+    product = make_product(db, store)
+    make_user_with_role(db, store, MANAGER, username="sup_mgr_inactive_po")
+    db.commit()
+    headers = auth_headers(client, "sup_mgr_inactive_po", DEFAULT_TEST_PASSWORD)
+
+    client.post(f"/api/v1/purchasing/suppliers/{supplier.id}/deactivate", headers=headers)
+
+    response = client.post(
+        "/api/v1/purchasing/purchase-orders",
+        headers=headers,
+        json=_po_payload(store, supplier, product),
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "INVALID_SUPPLIER"
 
 
 def test_duplicate_supplier_code_rejected(client: TestClient, db: Session) -> None:
@@ -669,12 +781,31 @@ def test_purchase_return_reduces_stock_without_changing_wac(
 def test_purchase_return_cannot_exceed_current_stock(client: TestClient, db: Session) -> None:
     store = make_store(db)
     supplier = make_supplier(db)
-    product = make_product(db, store, current_qty_on_hand=Decimal("2"))
+    product = make_product(db, store, current_qty_on_hand=Decimal("0"))
     make_user_with_role(db, store, MANAGER, username="ret_mgr_2")
     db.commit()
     headers = auth_headers(client, "ret_mgr_2", DEFAULT_TEST_PASSWORD)
 
-    po = _create_and_submit_po(client, headers, store, supplier, product, quantity="2")
+    po = _create_and_submit_po(client, headers, store, supplier, product, quantity="5")
+    item_id = po["items"][0]["id"]
+    client.post(
+        f"/api/v1/purchasing/purchase-orders/{po['id']}/receive",
+        headers=headers,
+        json={
+            "received_date": "2024-01-05",
+            "client_transaction_id": f"txn-{unique_suffix()}",
+            "lines": [
+                {"purchase_order_item_id": item_id, "quantity_received": "5", "unit_cost": "5.00"}
+            ],
+        },
+    )
+    # Some of the received stock left on-hand through an unrelated
+    # movement (e.g. a sale) before the return is attempted -- this
+    # isolates INSUFFICIENT_STOCK from RETURN_EXCEEDS_RECEIVED_QUANTITY:
+    # the return is well within what this PO received (5), but exceeds
+    # what is actually still on the shelf (2).
+    product.current_qty_on_hand = Decimal("2")
+    db.commit()
 
     response = client.post(
         f"/api/v1/purchasing/purchase-orders/{po['id']}/returns",
@@ -688,6 +819,127 @@ def test_purchase_return_cannot_exceed_current_stock(client: TestClient, db: Ses
     )
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "INSUFFICIENT_STOCK"
+
+
+def test_purchase_return_cannot_exceed_received_quantity(client: TestClient, db: Session) -> None:
+    store = make_store(db)
+    supplier = make_supplier(db)
+    product = make_product(db, store, current_qty_on_hand=Decimal("20"))
+    make_user_with_role(db, store, MANAGER, username="ret_mgr_3")
+    db.commit()
+    headers = auth_headers(client, "ret_mgr_3", DEFAULT_TEST_PASSWORD)
+
+    # The PO was only submitted, never received -- plenty of on-hand
+    # stock exists (from elsewhere), but none of it came from this PO,
+    # so nothing may be returned against it.
+    po = _create_and_submit_po(client, headers, store, supplier, product, quantity="5")
+
+    response = client.post(
+        f"/api/v1/purchasing/purchase-orders/{po['id']}/returns",
+        headers=headers,
+        json={
+            "store_id": store.id,
+            "return_date": "2024-01-06",
+            "client_transaction_id": f"txn-{unique_suffix()}",
+            "lines": [{"product_id": product.id, "quantity": "3"}],
+        },
+    )
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "RETURN_EXCEEDS_RECEIVED_QUANTITY"
+
+
+def test_purchase_return_of_exactly_the_received_quantity_succeeds(
+    client: TestClient, db: Session
+) -> None:
+    store = make_store(db)
+    supplier = make_supplier(db)
+    product = make_product(db, store, current_qty_on_hand=Decimal("0"))
+    make_user_with_role(db, store, MANAGER, username="ret_mgr_4")
+    db.commit()
+    headers = auth_headers(client, "ret_mgr_4", DEFAULT_TEST_PASSWORD)
+
+    po = _create_and_submit_po(client, headers, store, supplier, product, quantity="6")
+    item_id = po["items"][0]["id"]
+    client.post(
+        f"/api/v1/purchasing/purchase-orders/{po['id']}/receive",
+        headers=headers,
+        json={
+            "received_date": "2024-01-05",
+            "client_transaction_id": f"txn-{unique_suffix()}",
+            "lines": [
+                {"purchase_order_item_id": item_id, "quantity_received": "6", "unit_cost": "5.00"}
+            ],
+        },
+    )
+
+    response = client.post(
+        f"/api/v1/purchasing/purchase-orders/{po['id']}/returns",
+        headers=headers,
+        json={
+            "store_id": store.id,
+            "return_date": "2024-01-06",
+            "client_transaction_id": f"txn-{unique_suffix()}",
+            "lines": [{"product_id": product.id, "quantity": "6"}],
+        },
+    )
+    assert response.status_code == 201
+
+    db.refresh(product)
+    assert product.current_qty_on_hand == Decimal("0")
+
+
+def test_second_partial_return_cannot_push_total_past_received_quantity(
+    client: TestClient, db: Session
+) -> None:
+    """The received-quantity ceiling is against the SUM of every prior
+    return against this PO, not just the current request's own lines --
+    a second, individually-small return must still be rejected once it
+    would push the running total past what was actually received."""
+    store = make_store(db)
+    supplier = make_supplier(db)
+    product = make_product(db, store, current_qty_on_hand=Decimal("0"))
+    make_user_with_role(db, store, MANAGER, username="ret_mgr_5")
+    db.commit()
+    headers = auth_headers(client, "ret_mgr_5", DEFAULT_TEST_PASSWORD)
+
+    po = _create_and_submit_po(client, headers, store, supplier, product, quantity="10")
+    item_id = po["items"][0]["id"]
+    client.post(
+        f"/api/v1/purchasing/purchase-orders/{po['id']}/receive",
+        headers=headers,
+        json={
+            "received_date": "2024-01-05",
+            "client_transaction_id": f"txn-{unique_suffix()}",
+            "lines": [
+                {"purchase_order_item_id": item_id, "quantity_received": "10", "unit_cost": "5.00"}
+            ],
+        },
+    )
+
+    first_return = client.post(
+        f"/api/v1/purchasing/purchase-orders/{po['id']}/returns",
+        headers=headers,
+        json={
+            "store_id": store.id,
+            "return_date": "2024-01-06",
+            "client_transaction_id": f"txn-{unique_suffix()}",
+            "lines": [{"product_id": product.id, "quantity": "7"}],
+        },
+    )
+    assert first_return.status_code == 201
+
+    second_return = client.post(
+        f"/api/v1/purchasing/purchase-orders/{po['id']}/returns",
+        headers=headers,
+        json={
+            "store_id": store.id,
+            "return_date": "2024-01-07",
+            "client_transaction_id": f"txn-{unique_suffix()}",
+            "lines": [{"product_id": product.id, "quantity": "4"}],
+        },
+    )
+    assert second_return.status_code == 409
+    assert second_return.json()["error"]["code"] == "RETURN_EXCEEDS_RECEIVED_QUANTITY"
 
 
 # --- Multi-store isolation (M2 hardening audit Section 12, extended) -----

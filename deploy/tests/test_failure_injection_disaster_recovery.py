@@ -553,7 +553,18 @@ scrape_configs:
             # scale (higher sandbox load makes Prometheus's startup
             # window wide enough to actually land on), never in this
             # file alone or paired with just one other file.
-            resp = httpx.get(f"{prom_url}/api/v1/targets", timeout=3.0)
+            #
+            # Even earlier than that: right after Popen(), Prometheus may
+            # not have opened its listening socket yet at all, so the
+            # connection itself is refused (httpx.ConnectError) rather
+            # than answered with a 503 -- reproduced twice on real CI
+            # under load. That is the same startup race, one step
+            # earlier, and must be retried the same way instead of
+            # propagating out of the poll loop.
+            try:
+                resp = httpx.get(f"{prom_url}/api/v1/targets", timeout=3.0)
+            except httpx.TransportError:
+                return False
             if resp.status_code != 200:
                 return False
             targets = resp.json()["data"]["activeTargets"]

@@ -13,6 +13,7 @@ from app.api.v1.endpoints import (
     ap,
     audit,
     auth,
+    fiscal,
     hr,
     inventory,
     payroll,
@@ -21,6 +22,8 @@ from app.api.v1.endpoints import (
     replenishment,
     reports,
     sales,
+    shifts,
+    stores,
     transfers,
 )
 
@@ -29,6 +32,7 @@ api_router.include_router(auth.router)
 api_router.include_router(products.router)
 api_router.include_router(inventory.router)
 api_router.include_router(sales.router)
+api_router.include_router(shifts.router)
 api_router.include_router(purchasing.router)
 api_router.include_router(accounting.router)
 api_router.include_router(ap.router)
@@ -38,3 +42,5 @@ api_router.include_router(hr.router)
 api_router.include_router(payroll.router)
 api_router.include_router(reports.router)
 api_router.include_router(audit.router)
+api_router.include_router(stores.router)
+api_router.include_router(fiscal.router)

@@ -364,6 +364,56 @@ class SupplierCreditNoteLine(TimestampMixin, Base):
     credit_note: Mapped[SupplierCreditNote] = relationship(back_populates="lines")
 
 
+class SupplierPaymentReversal(TimestampMixin, Base):
+    """Records that a SupplierPayment was reversed. See
+    docs/M16_DESIGN.md "AP payment/credit-note correction path" for the
+    full design; this mirrors app.modules.payroll.models.PayrollReversal
+    exactly (same fields, same append-only-row-not-a-status-flip
+    rationale) — `SupplierPayment` itself is never mutated on reversal,
+    "was this reversed" is a derived fact answered by whether a row here
+    references it. `ap.reverse` is the only permission that can create
+    one."""
+
+    __tablename__ = "supplier_payment_reversals"
+    __table_args__ = (
+        UniqueConstraint("supplier_payment_id", name="uq_supplier_payment_reversals_payment"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    supplier_payment_id: Mapped[int] = mapped_column(
+        ForeignKey("supplier_payments.id"), nullable=False
+    )
+    reversal_journal_entry_id: Mapped[int] = mapped_column(
+        ForeignKey("journal_entries.id"), nullable=False
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    reversed_by: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    reversed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class SupplierCreditNoteReversal(TimestampMixin, Base):
+    """Records that a SupplierCreditNote was reversed. Mirrors
+    SupplierPaymentReversal exactly — see that model's docstring."""
+
+    __tablename__ = "supplier_credit_note_reversals"
+    __table_args__ = (
+        UniqueConstraint(
+            "supplier_credit_note_id", name="uq_supplier_credit_note_reversals_credit_note"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    supplier_credit_note_id: Mapped[int] = mapped_column(
+        ForeignKey("supplier_credit_notes.id"), nullable=False
+    )
+    reversal_journal_entry_id: Mapped[int] = mapped_column(
+        ForeignKey("journal_entries.id"), nullable=False
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    reversed_by: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    reversed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class SupplierCreditAllocation(TimestampMixin, Base):
     __tablename__ = "supplier_credit_allocations"
     __table_args__ = (

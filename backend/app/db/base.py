@@ -13,8 +13,10 @@ from app.modules.ap.models import (  # noqa: F401
     SupplierCreditAllocation,
     SupplierCreditNote,
     SupplierCreditNoteLine,
+    SupplierCreditNoteReversal,
     SupplierPayment,
     SupplierPaymentAllocation,
+    SupplierPaymentReversal,
 )
 from app.modules.audit.models import AuditLog  # noqa: F401
 from app.modules.auth.models import (  # noqa: F401
@@ -26,6 +28,7 @@ from app.modules.auth.models import (  # noqa: F401
     User,
     UserRole,
 )
+from app.modules.fiscal.models import FiscalConfig, FiscalSubmission  # noqa: F401
 from app.modules.hr.models import (  # noqa: F401
     AttendanceRecord,
     CompensationPeriod,
@@ -69,6 +72,7 @@ from app.modules.sales.models import (  # noqa: F401
     SaleReturn,
     SaleReturnItem,
 )
+from app.modules.shifts.models import CashierShift, CashMovement  # noqa: F401
 from app.modules.tax.models import TaxRate  # noqa: F401
 from app.modules.transfers.models import (  # noqa: F401
     InterStoreTransfer,

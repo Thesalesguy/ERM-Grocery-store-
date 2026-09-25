@@ -224,4 +224,75 @@ describe('PurchasingPage', () => {
     await waitFor(() => expect(screen.getByText('RECEIVED')).toBeInTheDocument())
     expect(receiveCallCount).toBe(1)
   })
+
+  it('creates a new purchase order via the form with a client_transaction_id', async () => {
+    // Regression test for a real M19 defect: PurchaseOrderCreate became a
+    // required client_transaction_id field, but this form's caller and its
+    // TypeScript input type were never updated to send one -- every real
+    // "New purchase order" submission would have 422'd. Asserts the actual
+    // outgoing request body carries a non-empty client_transaction_id, not
+    // just that the mocked call succeeds.
+    const SUPPLIER = { id: 1, name: 'Acme Distributors', is_active: true }
+    const PRODUCT = { id: 55, sku: 'WID-1', name: 'Widget' }
+    const createdPo = { ...SAMPLE_PO, id: 43 }
+    let capturedBody: Record<string, unknown> | null = null
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL, init?: RequestInit) => {
+        const url = String(input)
+        const method = (init?.method ?? 'GET').toUpperCase()
+        if (url.includes('/auth/refresh') && method === 'POST') {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              access_token: 'tok',
+              token_type: 'bearer',
+              expires_in_seconds: 900,
+            }),
+          } as Response
+        }
+        if (url.includes('/auth/me')) {
+          return { ok: true, status: 200, json: async () => AUTH_ROUTES[1].json } as Response
+        }
+        // More specific routes (the single-PO detail fetch) must be
+        // checked before the general list/create routes below, since
+        // '/purchase-orders/43' also includes '/purchase-orders'.
+        if (url.includes('/api/v1/purchasing/purchase-orders/43') && method === 'GET') {
+          return { ok: true, status: 200, json: async () => createdPo } as Response
+        }
+        if (url.includes('/api/v1/purchasing/purchase-orders') && method === 'GET') {
+          return { ok: true, status: 200, json: async () => [] } as Response
+        }
+        if (url.includes('/api/v1/purchasing/suppliers') && method === 'GET') {
+          return { ok: true, status: 200, json: async () => [SUPPLIER] } as Response
+        }
+        if (url.includes('/api/v1/products') && method === 'GET') {
+          return { ok: true, status: 200, json: async () => [PRODUCT] } as Response
+        }
+        if (url.includes('/api/v1/purchasing/purchase-orders') && method === 'POST') {
+          capturedBody = JSON.parse(String(init?.body))
+          return { ok: true, status: 201, json: async () => createdPo } as Response
+        }
+        throw new Error(`no route for ${method} ${url}`)
+      }),
+    )
+    await renderPurchasing()
+
+    fireEvent.click(screen.getByRole('button', { name: /new purchase order/i }))
+    await waitFor(() => expect(screen.getByText('New purchase order')).toBeInTheDocument())
+
+    fireEvent.change(screen.getByPlaceholderText('SKU'), { target: { value: 'WID-1' } })
+    fireEvent.change(screen.getByPlaceholderText('Qty'), { target: { value: '10' } })
+    fireEvent.change(screen.getByPlaceholderText('Cost'), { target: { value: '5.00' } })
+    fireEvent.click(screen.getByRole('button', { name: /save as draft/i }))
+
+    await waitFor(() => expect(capturedBody).not.toBeNull())
+    expect(typeof capturedBody!.client_transaction_id).toBe('string')
+    expect((capturedBody!.client_transaction_id as string).length).toBeGreaterThan(0)
+
+    // Let the resulting navigation to the new PO's detail view settle
+    // (onCreated selects it) so no fetch is left in flight after the test.
+    await waitFor(() => expect(screen.getByText('PO7-TEST')).toBeInTheDocument())
+  })
 })

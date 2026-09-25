@@ -55,6 +55,7 @@ from app.modules.audit import service as audit_service
 from app.modules.auth import service as auth_service
 from app.modules.auth.models import Store
 from app.modules.auth.permissions import SALES_RETURN_APPROVE
+from app.modules.fiscal import service as fiscal_service
 from app.modules.inventory import service as inventory_service
 from app.modules.products.models import Product
 from app.modules.sales.models import (
@@ -65,6 +66,7 @@ from app.modules.sales.models import (
     SaleReturn,
     SaleReturnItem,
 )
+from app.modules.shifts import service as shifts_service
 from app.modules.tax.models import TaxRate
 
 _MONEY_QUANTUM = Decimal("0.01")
@@ -320,6 +322,10 @@ def finalize_sale(
     change_due = total_paid - grand_total
 
     # --- Create the sale -------------------------------------------------
+    # M15 (docs/M15_DESIGN.md "Shift association"): opportunistic, never
+    # mandatory — if the cashier currently has no open shift, shift_id is
+    # simply NULL and finalize_sale behaves exactly as it did before M15.
+    active_shift = shifts_service.lock_active_shift_for_cashier(db, cashier_id)
     sale = Sale(
         store_id=store_id,
         sale_number=_generate_sale_number(store_id),
@@ -333,6 +339,7 @@ def finalize_sale(
         amount_tendered=total_paid,
         change_due=change_due,
         completed_at=datetime.now(UTC),
+        shift_id=active_shift.id if active_shift is not None else None,
     )
     db.add(sale)
     try:
@@ -423,6 +430,14 @@ def finalize_sale(
         payments=payments,
         created_by=cashier_id,
     )
+
+    # M20 (docs/M20_DESIGN.md Section 2): writes a PENDING outbox row in
+    # this same transaction if, and only if, this store has fiscalization
+    # enabled -- a complete no-op for every store today
+    # (docs/M20_DISCOVERY.md Section 1: no tax jurisdiction is
+    # established). The actual network attempt happens separately, after
+    # this transaction commits -- never here.
+    fiscal_service.create_fiscal_submission_if_enabled(db, sale)
 
     db.flush()
     return sale
@@ -950,6 +965,16 @@ def create_sale_return(
         for product_id in restock_product_ids
     }
 
+    # M15 (docs/M15_DESIGN.md "Shift association"): the PROCESSING
+    # cashier's own open shift at the moment this return/void is created
+    # — may differ from whatever shift (if any) the ORIGINAL sale
+    # happened under. Opportunistic, never mandatory, same as
+    # finalize_sale's Sale.shift_id above.
+    active_shift = (
+        shifts_service.lock_active_shift_for_cashier(db, created_by)
+        if created_by is not None
+        else None
+    )
     sale_return = SaleReturn(
         sale_id=sale_id,
         store_id=store_id,
@@ -961,6 +986,8 @@ def create_sale_return(
         processed_by=created_by,
         approval_required=approval_required,
         approved_by=approved_by,
+        shift_id=active_shift.id if active_shift is not None else None,
+        return_date=return_date,
     )
     db.add(sale_return)
     try:

@@ -70,6 +70,19 @@ class Store(TimestampMixin, Base):
     # other stored money amount in this system).
     return_approval_threshold_amount: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
 
+    # M20 (docs/M20_DESIGN.md Section 1.3): legal/business identity, for a
+    # future fiscal document's seller-identity fields. Both NULL by
+    # default on every store, including every pre-M20 one -- nothing
+    # reads or requires either unless that store's FiscalConfig.is_enabled
+    # is true (never true out of the box; M20_DISCOVERY.md Section 1 found
+    # no confirmed tax jurisdiction, so this stays inert everywhere until
+    # one is). `legal_name` falls back to `name` for display when unset;
+    # `tax_registration_number` is an opaque string -- its format is
+    # authority-specific and unknown today, so it is not validated beyond
+    # "some string, if the operator has one to enter."
+    legal_name: Mapped[str | None] = mapped_column(String(255))
+    tax_registration_number: Mapped[str | None] = mapped_column(String(100))
+
     users: Mapped[list["User"]] = relationship(back_populates="store")
 
 

@@ -8,6 +8,7 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
+from app.modules.accounting import service as accounting_service
 from app.modules.reports import service as reports_service
 from app.modules.sales import service as sales_service
 from app.modules.sales.service import PaymentInput, SaleLineInput, SaleReturnLineInput
@@ -464,3 +465,66 @@ def test_resolve_authorized_store_ids_store_scoped_user_denied_other_store() -> 
         reports_service.resolve_authorized_store_ids(manager, [7, 8])
     with pytest.raises(ForbiddenError):
         reports_service.resolve_authorized_store_ids(manager, [8])
+
+
+def test_backdated_return_lands_in_return_date_period_matching_gl(db: Session) -> None:
+    """M16 Phase 0 item 8: sales_summary previously bucketed a return by
+    SaleReturn.created_at (insertion time), while the GL posting
+    (post_sale_return_journal) always used the caller-supplied,
+    unvalidated return_date. A return recorded TODAY for a return_date
+    in an already-reported PRIOR period would appear in different
+    periods on the two reports.
+
+    Fix (docs/M16_DESIGN.md "Operational vs. GL return-date
+    divergence"): return_date is now persisted on SaleReturn itself and
+    sales_summary buckets by it, exactly like the GL does -- bringing
+    returns in line with the same principle sales already followed
+    (Sale.completed_at is the one date used both for GL posting and for
+    every operational report).
+
+    This test creates a return with return_date deliberately far in the
+    past (2020-01-01) relative to when the test actually runs, then
+    queries a narrow window around that backdated date: under the old
+    behavior the return would be invisible here (created_at is "now",
+    not 2020); under the fix it must appear, and the GL-derived P&L for
+    the identical window must show the exact same COGS reversal."""
+    store = make_store(db)
+    cashier = make_user(db, store)
+    sale, product = _sale(
+        db, store, cashier, price=Decimal("10.00"), cost=Decimal("4.000000"), qty=Decimal("5")
+    )
+    sales_service.create_sale_return(
+        db,
+        sale_id=sale.id,
+        store_id=store.id,
+        return_date=date(2020, 1, 15),
+        lines=[
+            SaleReturnLineInput(sale_item_id=sale.items[0].id, quantity=Decimal("2"), restock=True)
+        ],
+        refund_method="CASH",
+        client_transaction_id=f"ret-{unique_suffix()}",
+        caller_store_id=None,
+    )
+    db.commit()
+
+    window_from = date(2020, 1, 1)
+    window_to = date(2020, 1, 31)
+
+    summary = reports_service.sales_summary(
+        db, store_ids=[store.id], date_from=window_from, date_to=window_to
+    )
+    # The sale itself (completed_at = actual test run time) is NOT in
+    # this window -- only the backdated return's effect should appear:
+    # gross_sales 0, returns 2 * 10.00 = 20.00, net_sales -20.00.
+    assert summary.gross_sales == Decimal("0.00")
+    assert summary.returns == Decimal("20.00")
+    assert summary.net_sales == Decimal("-20.00")
+    # COGS reversal: 2 units restocked at cost 4.000000 = 8.00.
+    assert summary.cogs == Decimal("-8.00")
+
+    pl = accounting_service.profit_and_loss(
+        db, store_id=store.id, date_from=window_from, date_to=window_to
+    )
+    # The GL always used return_date -- it must show the identical COGS
+    # reversal for the same window, proving the two reports now agree.
+    assert pl.cogs == summary.cogs

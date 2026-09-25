@@ -183,6 +183,7 @@ def create_purchase_order(
         order_date=payload.order_date,
         expected_date=payload.expected_date,
         notes=payload.notes,
+        client_transaction_id=payload.client_transaction_id,
         lines=[
             PurchaseOrderItemInput(
                 product_id=line.product_id,

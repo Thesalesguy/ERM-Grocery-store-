@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal
 
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationAppError
@@ -229,6 +230,8 @@ def create_stock_adjustment(
     ip_address: str | None = None,
     user_agent: str | None = None,
     stock_count_id: int | None = None,
+    client_transaction_id: str | None = None,
+    caller_store_id: int | None = None,
 ) -> StockAdjustment:
     """The full authenticated, transactional, audited stock-adjustment
     flow (M2 task Section 6): the API can never overwrite
@@ -248,7 +251,38 @@ def create_stock_adjustment(
     any adjustment); lock_product_for_update below is a harmless re-lock
     of an already-locked row in that path, and the ONLY lock acquisition
     for the ordinary single-adjustment route-handler path.
+
+    `client_transaction_id` (M15 pre-milestone hardening, docs/
+    M15_DESIGN.md "Pre-M15 hardening"): optional, mirroring
+    Sale.client_transaction_id's idempotency pattern exactly —
+    finalize_sale's fast-path lookup, then an IntegrityError-recovery
+    block after the flush below catches a genuinely concurrent duplicate.
+    `post_stock_count` never passes one (each of its internal per-line
+    calls has no natural per-call client key; that path's idempotency is
+    already provided by StockCount's own status-based checks), so a
+    caller that omits it gets exactly the pre-M15 behavior — no key, no
+    fast path, no uniqueness check, unchanged from before this hardening.
+
+    `caller_store_id` (M16 pre-implementation hardening): unlike every
+    other financially-significant mutation in this codebase, this
+    function previously relied solely on its HTTP endpoint to enforce
+    store isolation — a direct service-layer call had no defense-in-depth
+    check. Optional and defaults to None so `post_stock_count`'s internal
+    per-line calls (which already validated the caller's store access once,
+    at their own entry point, before locking every affected product) are
+    unaffected; the route handler now passes the acting user's store_id.
     """
+    if client_transaction_id is not None:
+        existing = db.execute(
+            select(StockAdjustment).where(
+                StockAdjustment.client_transaction_id == client_transaction_id
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return existing
+
+    _enforce_store_access(caller_store_id, store_id, "stock adjustments")
+
     adjustment = StockAdjustment(
         store_id=store_id,
         product_id=product_id,
@@ -257,9 +291,36 @@ def create_stock_adjustment(
         notes=notes,
         created_by=created_by,
         stock_count_id=stock_count_id,
+        client_transaction_id=client_transaction_id,
     )
     db.add(adjustment)
-    db.flush()
+    if client_transaction_id is not None:
+        # Only take the rollback-and-recover path when a key was actually
+        # supplied — post_stock_count's internal calls (client_transaction_id
+        # always None) must keep flushing directly with no try/except
+        # inserted around them, so an unrelated IntegrityError during a
+        # multi-line count posting still propagates and rolls back the
+        # WHOLE posting transaction exactly as it did before this
+        # hardening, rather than this function swallowing it and rolling
+        # back only its own partial work.
+        try:
+            db.flush()
+        except IntegrityError:
+            # A genuinely concurrent duplicate submission (two requests
+            # with the same client_transaction_id racing before either
+            # committed) — mirrors finalize_sale's identical recovery
+            # block exactly.
+            db.rollback()
+            winner = db.execute(
+                select(StockAdjustment).where(
+                    StockAdjustment.client_transaction_id == client_transaction_id
+                )
+            ).scalar_one_or_none()
+            if winner is None:
+                raise
+            return winner
+    else:
+        db.flush()
 
     product = lock_product_for_update(db, product_id)
     movement_type = "STOCK_ADJUSTMENT_IN" if quantity_delta > 0 else "STOCK_ADJUSTMENT_OUT"

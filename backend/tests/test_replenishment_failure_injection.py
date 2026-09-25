@@ -20,7 +20,13 @@ from app.modules.replenishment import service as replenishment_service
 from app.modules.replenishment.models import ReplenishmentPlan
 from app.modules.transfers import service as transfer_service
 from app.modules.transfers.models import InterStoreTransfer
-from tests.factories import make_product, make_store, make_supplier, make_supplier_product
+from tests.factories import (
+    make_product,
+    make_store,
+    make_supplier,
+    make_supplier_product,
+    unique_suffix,
+)
 
 # --- A: plan generation --------------------------------------------------
 
@@ -408,6 +414,7 @@ def test_purchasing_and_transfer_modules_still_importable_and_unmodified_in_beha
         store_id=store.id,
         supplier_id=supplier.id,
         order_date=date.today(),
+        client_transaction_id=f"po-{unique_suffix()}",
         lines=[
             purchasing_service.PurchaseOrderItemInput(
                 product_id=product.id, quantity_ordered=Decimal("5"), unit_cost=Decimal("1.00")

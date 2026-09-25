@@ -85,6 +85,16 @@ ACCOUNT_INVENTORY_ADJUSTMENT_GAIN = "4900"
 # --- EXPENSE ---------------------------------------------------------------
 ACCOUNT_COGS = "5000"
 ACCOUNT_INVENTORY_SHRINKAGE_EXPENSE = "5900"
+# M15 (docs/M15_DESIGN.md "GL treatment"): a shift-close physical-cash
+# variance (docs/M15_DESIGN.md "Over/short") is posted here — ONE account
+# for both directions, the standard real-world "Cash Over and Short"
+# account name, mirroring ACCOUNT_PURCHASE_PRICE_VARIANCE's own contra
+# convention (normal_balance DEBIT, but routinely carries a CREDIT balance
+# for a run of cash overages) rather than Inventory's separate Gain/
+# Shrinkage-account split — a cash variance is one economic question
+# ("did the till reconcile"), not two structurally different event types
+# the way a found-vs-missing stock count line is modeled as.
+ACCOUNT_CASH_OVER_SHORT = "5910"
 # Purchase-invoice variance/tax accounts (docs/M6_AP_VENDOR_ACCOUNTING.md
 # "Invoice variances" / "Purchase invoice accounting"). Both are real,
 # named accounts with an actual posting rule — never a silent absorption
@@ -301,6 +311,16 @@ SYSTEM_ACCOUNTS: list[tuple[str, str, str, str, str]] = [
         "EXPENSE",
         "DEBIT",
         "Stock found missing relative to the recorded on-hand quantity (negative adjustment).",
+    ),
+    (
+        ACCOUNT_CASH_OVER_SHORT,
+        "Cash Over/Short",
+        "EXPENSE",
+        "DEBIT",
+        "Difference between a cashier shift's physically counted cash and the expected cash "
+        "derived from that shift's sales/returns/cash movements (docs/M15_DESIGN.md 'GL "
+        "treatment'); routinely carries a credit balance for a run of cash overages, same "
+        "contra convention as Purchase Price Variance.",
     ),
     (
         ACCOUNT_PAYROLL_PAYABLE,

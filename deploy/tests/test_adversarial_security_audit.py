@@ -208,7 +208,18 @@ def test_internal_service_is_not_reachable_except_via_loopback_binding(
     matching = [line for line in result.stdout.splitlines() if f":{port} " in line]
     assert matching, f"expected {label} to be listening on port {port}"
     for line in matching:
-        assert f"127.0.0.1:{port}" in line, f"{label} must bind loopback only, found: {line}"
+        # M18: PostgreSQL's own `listen_addresses = 'localhost'` resolves
+        # via the OS resolver, not an explicit IP the way uvicorn/the
+        # exporters are started with `--web.listen-address=127.0.0.1:...`
+        # -- on some hosts (confirmed on a real GitHub Actions runner,
+        # not reproducible in every environment) that resolves to the
+        # IPv6 loopback address only. [::1] is exactly as loopback-only
+        # as 127.0.0.1 -- the security property under test (unreachable
+        # except via loopback) holds either way, so both are accepted;
+        # only a real network-exposed bind fails this test.
+        assert f"127.0.0.1:{port}" in line or f"[::1]:{port}" in line, (
+            f"{label} must bind loopback only, found: {line}"
+        )
         assert f"0.0.0.0:{port}" not in line
         assert f"*:{port}" not in line
 

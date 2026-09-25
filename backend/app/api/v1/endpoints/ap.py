@@ -43,6 +43,7 @@ from app.modules.ap.schemas import (
     SupplierCreditNoteRead,
     SupplierPaymentCreate,
     SupplierPaymentRead,
+    SupplierReversalRequest,
     SupplierStatementLineRead,
     SupplierStatementRead,
     SupplierTransactionRead,
@@ -53,7 +54,7 @@ from app.modules.ap.service import (
     PurchaseInvoiceLineInput,
     SupplierCreditNoteLineInput,
 )
-from app.modules.auth.permissions import AP_CREDIT, AP_PAY, AP_POST, AP_READ, AP_WRITE
+from app.modules.auth.permissions import AP_CREDIT, AP_PAY, AP_POST, AP_READ, AP_REVERSE, AP_WRITE
 from app.modules.auth.service import (
     CurrentUser,
     enforce_store_access,
@@ -70,6 +71,7 @@ _write_permission = require_permission(AP_WRITE)
 _post_permission = require_permission(AP_POST)
 _pay_permission = require_permission(AP_PAY)
 _credit_permission = require_permission(AP_CREDIT)
+_reverse_permission = require_permission(AP_REVERSE)
 
 
 def _to_invoice_read(db: Session, invoice: PurchaseInvoice) -> PurchaseInvoiceRead:
@@ -336,6 +338,25 @@ def get_payment(
     return _to_payment_read(payment)
 
 
+@router.post("/payments/{supplier_payment_id}/reverse", response_model=SupplierPaymentRead)
+def reverse_payment(
+    supplier_payment_id: int,
+    payload: SupplierReversalRequest,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(_reverse_permission),
+) -> SupplierPaymentRead:
+    payment = service.reverse_supplier_payment(
+        db,
+        supplier_payment_id=supplier_payment_id,
+        reason=payload.reason,
+        caller_store_id=current_user.store_id,
+        reversed_by=current_user.id,
+    )
+    db.commit()
+    db.refresh(payment)
+    return _to_payment_read(service.get_supplier_payment(db, payment.id))
+
+
 @router.post("/credit-notes", response_model=SupplierCreditNoteRead, status_code=201)
 def create_credit_note(
     payload: SupplierCreditNoteCreate,
@@ -405,6 +426,27 @@ def get_credit_note(
     if current_user.store_id is not None and credit_note.store_id != current_user.store_id:
         raise NotFoundError(f"Supplier credit note {supplier_credit_note_id} not found")
     return _to_credit_note_read(db, credit_note)
+
+
+@router.post(
+    "/credit-notes/{supplier_credit_note_id}/reverse", response_model=SupplierCreditNoteRead
+)
+def reverse_credit_note(
+    supplier_credit_note_id: int,
+    payload: SupplierReversalRequest,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(_reverse_permission),
+) -> SupplierCreditNoteRead:
+    credit_note = service.reverse_supplier_credit_note(
+        db,
+        supplier_credit_note_id=supplier_credit_note_id,
+        reason=payload.reason,
+        caller_store_id=current_user.store_id,
+        reversed_by=current_user.id,
+    )
+    db.commit()
+    db.refresh(credit_note)
+    return _to_credit_note_read(db, service.get_supplier_credit_note(db, credit_note.id))
 
 
 @router.get("/suppliers/{supplier_id}/summary", response_model=SupplierApSummaryRead)

@@ -274,3 +274,151 @@ describe('PosPage', () => {
     expect(screen.getByText('Scarce Item')).toBeInTheDocument()
   })
 })
+
+// --- M15: cashier/till shift panel ------------------------------------------
+
+const SHIFT_AUTH_ROUTES = [
+  AUTH_ROUTES[0],
+  {
+    path: '/auth/me',
+    json: {
+      id: 1,
+      username: 'cashier',
+      full_name: 'Cash Ier',
+      store_id: 7,
+      permissions: ['pos.use', 'products.read', 'shift.manage'],
+    },
+  },
+]
+
+describe('PosPage shift panel', () => {
+  afterEach(() => {
+    setAccessToken(null)
+    vi.unstubAllGlobals()
+  })
+
+  it('shows the open-till prompt when no shift is active and opens one', async () => {
+    let openedShift: unknown = null
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL, init?: RequestInit) => {
+        const url = String(input)
+        const method = (init?.method ?? 'GET').toUpperCase()
+        if (url.includes('/auth/refresh')) {
+          return { ok: true, status: 200, json: async () => SHIFT_AUTH_ROUTES[0].json } as Response
+        }
+        if (url.includes('/auth/me')) {
+          return { ok: true, status: 200, json: async () => SHIFT_AUTH_ROUTES[1].json } as Response
+        }
+        if (url.includes('/shifts/active') && method === 'GET') {
+          return { ok: true, status: 200, json: async () => openedShift } as Response
+        }
+        if (url.includes('/api/v1/shifts') && method === 'POST') {
+          const body = JSON.parse(String(init?.body ?? '{}'))
+          openedShift = {
+            id: 501,
+            store_id: 7,
+            cashier_id: 1,
+            status: 'OPEN',
+            opening_float: body.opening_float,
+            opened_at: '2026-01-01T08:00:00Z',
+            closed_at: null,
+            closing_counted_amount: null,
+            expected_cash_amount: null,
+            variance_amount: null,
+            closed_by: null,
+            created_at: '2026-01-01T08:00:00Z',
+          }
+          return { ok: true, status: 201, json: async () => openedShift } as Response
+        }
+        throw new Error(`unexpected request: ${method} ${url}`)
+      }),
+    )
+
+    render(
+      <AuthProvider>
+        <PosPage />
+      </AuthProvider>,
+    )
+    await waitFor(() => {
+      expect(screen.getByText(/no active till session/i)).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /open till/i }))
+    fireEvent.change(screen.getByPlaceholderText(/opening float/i), {
+      target: { value: '100.00' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: /confirm/i }))
+
+    await waitFor(() => {
+      expect(screen.getByText(/till open — opening float 100.00/i)).toBeInTheDocument()
+    })
+  })
+
+  it('shows the active shift and closes it with a reported variance', async () => {
+    const activeShift = {
+      id: 502,
+      store_id: 7,
+      cashier_id: 1,
+      status: 'OPEN',
+      opening_float: '50.00',
+      opened_at: '2026-01-01T08:00:00Z',
+      closed_at: null,
+      closing_counted_amount: null,
+      expected_cash_amount: null,
+      variance_amount: null,
+      closed_by: null,
+      created_at: '2026-01-01T08:00:00Z',
+    }
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL, init?: RequestInit) => {
+        const url = String(input)
+        const method = (init?.method ?? 'GET').toUpperCase()
+        if (url.includes('/auth/refresh')) {
+          return { ok: true, status: 200, json: async () => SHIFT_AUTH_ROUTES[0].json } as Response
+        }
+        if (url.includes('/auth/me')) {
+          return { ok: true, status: 200, json: async () => SHIFT_AUTH_ROUTES[1].json } as Response
+        }
+        if (url.includes('/shifts/active') && method === 'GET') {
+          return { ok: true, status: 200, json: async () => activeShift } as Response
+        }
+        if (url.includes('/shifts/502/close') && method === 'POST') {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              ...activeShift,
+              status: 'CLOSED',
+              closed_at: '2026-01-01T16:00:00Z',
+              closing_counted_amount: '55.00',
+              expected_cash_amount: '50.00',
+              variance_amount: '5.00',
+              closed_by: 1,
+            }),
+          } as Response
+        }
+        throw new Error(`unexpected request: ${method} ${url}`)
+      }),
+    )
+
+    render(
+      <AuthProvider>
+        <PosPage />
+      </AuthProvider>,
+    )
+    await waitFor(() => {
+      expect(screen.getByText(/till open — opening float 50.00/i)).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /close till/i }))
+    fireEvent.change(screen.getByPlaceholderText(/counted cash/i), { target: { value: '55.00' } })
+    fireEvent.click(screen.getByRole('button', { name: /confirm close/i }))
+
+    await waitFor(() => {
+      expect(screen.getByText('Shift closed')).toBeInTheDocument()
+    })
+    expect(screen.getByText('+5.00')).toBeInTheDocument()
+  })
+})

@@ -149,6 +149,18 @@ class StockAdjustment(TimestampMixin, Base):
     # STOCKTAKE_CORRECTION adjustment back to the count that produced it.
     # NULL for every other reason_code and for pre-M8 rows.
     stock_count_id: Mapped[int | None] = mapped_column(ForeignKey("stock_counts.id"))
+    # M15 pre-milestone hardening (docs/M15_DESIGN.md "Pre-M15 hardening"):
+    # optional client-generated idempotency key, mirroring
+    # Sale.client_transaction_id exactly (nullable + unique, not required —
+    # post_stock_count's internal per-variance-line calls have no natural
+    # per-call client key of their own; that path's idempotency is already
+    # provided by StockCount's own status-based idempotency, so requiring
+    # one here would be inventing a key for a caller that has none to
+    # give). When a route-handler caller DOES supply one, the UNIQUE
+    # constraint is the real enforcement against a double-submitted
+    # request creating two adjustments/movements/journal entries — see
+    # app.modules.inventory.service.create_stock_adjustment.
+    client_transaction_id: Mapped[str | None] = mapped_column(String(100), unique=True)
 
 
 # --- Stock counts / physical inventory (M8) ---------------------------------

@@ -73,6 +73,7 @@ def test_purchase_order_lifecycle_is_audited(client: TestClient, db: Session) ->
             "store_id": store.id,
             "supplier_id": supplier.id,
             "order_date": "2024-01-01",
+            "client_transaction_id": f"po-{unique_suffix()}",
             "lines": [{"product_id": product.id, "quantity_ordered": "10", "unit_cost": "5.00"}],
         },
     ).json()
@@ -113,6 +114,7 @@ def test_goods_receipt_and_return_are_audited(client: TestClient, db: Session) -
             "store_id": store.id,
             "supplier_id": supplier.id,
             "order_date": "2024-01-01",
+            "client_transaction_id": f"po-{unique_suffix()}",
             "lines": [{"product_id": product.id, "quantity_ordered": "10", "unit_cost": "5.00"}],
         },
     ).json()
@@ -166,6 +168,7 @@ def test_over_receipt_is_flagged_in_the_audit_event(client: TestClient, db: Sess
             "store_id": store.id,
             "supplier_id": supplier.id,
             "order_date": "2024-01-01",
+            "client_transaction_id": f"po-{unique_suffix()}",
             "lines": [{"product_id": product.id, "quantity_ordered": "5", "unit_cost": "5.00"}],
         },
     ).json()
@@ -211,6 +214,7 @@ def test_purchase_order_item_cost_is_immutable_after_a_later_product_price_chang
             "store_id": store.id,
             "supplier_id": supplier.id,
             "order_date": "2024-01-01",
+            "client_transaction_id": f"po-{unique_suffix()}",
             "lines": [{"product_id": product.id, "quantity_ordered": "10", "unit_cost": "6.50"}],
         },
     ).json()
@@ -243,6 +247,7 @@ def test_goods_receipt_item_cost_is_immutable_after_a_later_wac_change(
             "store_id": store.id,
             "supplier_id": supplier.id,
             "order_date": "2024-01-01",
+            "client_transaction_id": f"po-{unique_suffix()}",
             "lines": [{"product_id": product.id, "quantity_ordered": "150", "unit_cost": "10.00"}],
         },
     ).json()

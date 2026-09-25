@@ -41,6 +41,12 @@ M11_HEAD_REVISION = "32e51bcda102"  # M11: + reports performance indexes
 M12_PHASE8_REVISION = "4708fb75ace5"  # M12: + revoke erp_app on alembic_version
 M12_HEAD_REVISION = "17fb9afe8d39"  # M12: + grant erp_app SELECT-only on alembic_version
 M14_HEAD_REVISION = "e0d2359bb08a"  # M14: return/void approval threshold
+M15_PRE_HARDENING_REVISION = "1a4bae98d246"  # pre-M15: stock adjustment idempotency
+M15_HEAD_REVISION = "db482a11ee31"  # M15: cashier/till shift sessions
+M16_HARDENING_REVISION = "e1a681c4aba3"  # M16: pre-implementation hardening
+M16_HEAD_REVISION = "4a83c462dbff"  # M16: store settings permissions
+M19_HEAD_REVISION = "3a0d50ccc909"  # M19: purchase order idempotency key
+M20_HEAD_REVISION = "9c4c5a209aa9"  # M20: fiscal integration boundary + permissions
 
 
 def _alembic_config() -> Config:
@@ -136,28 +142,38 @@ def test_full_upgrade_downgrade_upgrade_cycle(migrations_db: str) -> None:
     assert _table_count(migrations_db) == 46
 
     command.upgrade(cfg, "head")
-    # M10 adds fifteen tables: departments, positions, employees,
-    # employment_status_periods, employment_assignments,
-    # compensation_periods, overtime_policies, attendance_records,
-    # deduction_types, deduction_rates, payroll_periods,
+    # This jump goes all the way to the CURRENT head, not just M10 (the
+    # explicit M9_HEAD_REVISION step above was the last named checkpoint
+    # before "head" is used for the rest of the chain). M10 adds fifteen
+    # tables: departments, positions, employees, employment_status_periods,
+    # employment_assignments, compensation_periods, overtime_policies,
+    # attendance_records, deduction_types, deduction_rates, payroll_periods,
     # payroll_employee_results, payroll_earning_lines,
     # payroll_deduction_lines, payroll_reversals (stores.
     # attendance_day_boundary_hour and the accounts/journal_entries
-    # widening are a column/rows/CHECK change, not tables).
-    assert _table_count(migrations_db) == 61
+    # widening are a column/rows/CHECK change, not tables) -- 46 + 15 = 61.
+    # M11 adds two indexes, not tables; M12 only revokes/grants a
+    # privilege; M14 adds two COLUMNS, not tables -- unchanged at 61
+    # through M14. The pre-M15 hardening migration adds one COLUMN, not a
+    # table. M15 itself adds exactly two new tables (cashier_shifts,
+    # cash_movements): 61 + 2 = 63. The M16 pre-implementation hardening
+    # migration adds two more (supplier_payment_reversals,
+    # supplier_credit_note_reversals; sale_returns.return_date and the
+    # sales/sale_returns shift_id indexes are a column/index change, not
+    # tables): 63 + 2 = 65. M19 adds one COLUMN (purchase_orders.
+    # client_transaction_id), not a table -- unchanged at 65. M20 adds
+    # two new tables (fiscal_configs, fiscal_submissions; stores.
+    # legal_name/tax_registration_number and the fiscal.* permission seed
+    # are a column/rows change, not tables): 65 + 2 = 67.
+    assert _table_count(migrations_db) == 67
+    assert _current_revision(migrations_db) == M20_HEAD_REVISION
 
     command.downgrade(cfg, M0_REVISION)
     assert _table_count(migrations_db) == 8
 
     command.upgrade(cfg, "head")
-    # M11 adds two indexes (ix_sales_store_completed,
-    # ix_payroll_periods_store_status), not tables; M12 only revokes/
-    # grants a privilege; M14 adds two COLUMNS (stores.
-    # return_approval_threshold_amount, sale_returns.approval_required),
-    # not tables -- table count is unchanged from M10's 61 all the way to
-    # head.
-    assert _table_count(migrations_db) == 61
-    assert _current_revision(migrations_db) == M14_HEAD_REVISION
+    assert _table_count(migrations_db) == 67
+    assert _current_revision(migrations_db) == M20_HEAD_REVISION
 
 
 def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
@@ -173,8 +189,119 @@ def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
     finally:
         engine.dispose()
     assert role_count == 6
-    # M14 adds one new permission (sales.return.approve) on top of M12's 44.
-    assert permission_count == 45
+    # M14 adds one new permission (sales.return.approve) on top of M12's
+    # 44 = 45. M15 adds three more (shift.manage, shift.read,
+    # shift.override) = 48. The pre-M15 hardening migration adds no
+    # permissions (a column only). M16 adds one more (ap.reverse) = 49,
+    # then two more (store.settings.read, store.settings.write) = 51.
+    # M20 adds three more (fiscal.read, fiscal.config.write,
+    # fiscal.retry) = 54.
+    assert permission_count == 54
+
+
+def test_m4_downgrade_refuses_when_journal_entries_exist(migrations_db: str) -> None:
+    """M18 discovery finding: 8df037a45976 (M4 accounting core) was the
+    one accounting-core downgrade in the whole chain with no guard before
+    dropping journal_entries/journal_lines/accounts -- unlike every later
+    accounting migration (581d2a07f38c, M6, M14), which all refuse rather
+    than silently destroy real financial history. Fixed to match that
+    same discipline; proven here against a real posted journal_entries
+    row, not just an empty database (the same discipline that caught
+    M6/M7's own downgrade-vs-populated-data gaps)."""
+    from sqlalchemy.exc import DBAPIError, InternalError
+
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    # Upgrade to exactly the M4 core revision (not the M4 hardening head)
+    # so the downgrade below exercises 8df037a45976's own guard in
+    # isolation, as a single revision step.
+    command.upgrade(cfg, M4_ACCOUNTING_CORE_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            store_id = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, created_at) "
+                "VALUES ('T', 'UTC', true, now()) RETURNING id"
+            ).scalar_one()
+            conn.exec_driver_sql(
+                "INSERT INTO journal_entries "
+                "(journal_number, store_id, posting_date, entry_type, source_type, created_at) "
+                f"VALUES ('JE-GUARD-1', {store_id}, '2024-01-01', 'STANDARD', 'SALE', now())"
+            )
+    finally:
+        engine.dispose()
+
+    try:
+        with pytest.raises((DBAPIError, InternalError)):
+            command.downgrade(cfg, M3_HEAD_REVISION)
+
+        # Postgres transactional DDL must roll the whole migration back on
+        # failure, never leaving the database partially downgraded.
+        assert _current_revision(migrations_db) == M4_ACCOUNTING_CORE_REVISION
+        assert _table_count(migrations_db) == 30
+    finally:
+        # Clean up NO MATTER WHAT the assertions above did, so a failure
+        # here can never poison the shared migrations test database for
+        # every other test in this file's next run.
+        engine = create_engine(migrations_db)
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "DELETE FROM journal_entries WHERE journal_number = 'JE-GUARD-1'"
+                )
+        finally:
+            engine.dispose()
+        command.downgrade(cfg, "base")
+
+
+def test_m6_downgrade_refuses_when_ap_journal_entries_exist(migrations_db: str) -> None:
+    """M18 discovery finding: M6's downgrade guard code already existed
+    (raises if journal_entries has a PURCHASE_INVOICE/PURCHASE_INVOICE_VOID/
+    SUPPLIER_PAYMENT row, or journal_lines references an M6 AP account) but
+    had no test proving it against real populated data -- only the empty-DB
+    upgrade/downgrade cycle exercised this migration before. Proven here
+    against a real PURCHASE_INVOICE journal entry (mirrors
+    test_m7_downgrade_refuses_when_credit_note_data_exists's own
+    discipline, applied to the one migration upstream of it)."""
+    from sqlalchemy.exc import DBAPIError, InternalError
+
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M6_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            store_id = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, created_at) "
+                "VALUES ('T', 'UTC', true, now()) RETURNING id"
+            ).scalar_one()
+            conn.exec_driver_sql(
+                "INSERT INTO journal_entries "
+                "(journal_number, store_id, posting_date, entry_type, source_type, created_at) "
+                f"VALUES ('JE-GUARD-2', {store_id}, '2024-01-01', 'STANDARD', "
+                "'PURCHASE_INVOICE', now())"
+            )
+    finally:
+        engine.dispose()
+
+    try:
+        with pytest.raises((DBAPIError, InternalError)):
+            command.downgrade(cfg, M5_HEAD_REVISION)
+
+        assert _current_revision(migrations_db) == M6_HEAD_REVISION
+        assert _table_count(migrations_db) == 33
+    finally:
+        engine = create_engine(migrations_db)
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "DELETE FROM journal_entries WHERE journal_number = 'JE-GUARD-2'"
+                )
+        finally:
+            engine.dispose()
+        command.downgrade(cfg, "base")
 
 
 def test_m7_downgrade_refuses_when_credit_note_data_exists(migrations_db: str) -> None:
@@ -843,6 +970,46 @@ def test_m11_upgrade_downgrade_reupgrade_preserves_populated_m10_business_data(
     assert after_period == before_period
 
     command.downgrade(cfg, "base")
+
+
+def test_m14_downgrade_refuses_when_approval_data_exists(migrations_db: str) -> None:
+    """M18 discovery finding: M14's downgrade guard code already existed
+    (raises if any store has a configured return_approval_threshold_amount,
+    or any sale_returns row was created under the approval gate) but had
+    no test proving it against real populated data. Proven here against a
+    real store configuration (mirrors test_m7_downgrade_refuses_when_
+    credit_note_data_exists's own discipline, applied to the current
+    migration head)."""
+    from sqlalchemy.exc import DBAPIError, InternalError
+
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M14_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            store_id = conn.exec_driver_sql(
+                "INSERT INTO stores "
+                "(name, timezone, is_active, return_approval_threshold_amount, created_at) "
+                "VALUES ('T', 'UTC', true, 100.00, now()) RETURNING id"
+            ).scalar_one()
+    finally:
+        engine.dispose()
+
+    try:
+        with pytest.raises((DBAPIError, InternalError)):
+            command.downgrade(cfg, M12_HEAD_REVISION)
+
+        assert _current_revision(migrations_db) == M14_HEAD_REVISION
+    finally:
+        engine = create_engine(migrations_db)
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql("DELETE FROM stores WHERE id = %s", (store_id,))
+        finally:
+            engine.dispose()
+        command.downgrade(cfg, "base")
 
 
 def test_m12_alembic_version_privilege_revoked_on_upgrade_and_restored_on_downgrade(

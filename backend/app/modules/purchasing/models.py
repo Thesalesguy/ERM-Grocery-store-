@@ -91,6 +91,7 @@ class PurchaseOrder(TimestampMixin, Base):
     __tablename__ = "purchase_orders"
     __table_args__ = (
         UniqueConstraint("purchase_number", name="uq_purchase_orders_number"),
+        UniqueConstraint("client_transaction_id", name="uq_purchase_orders_client_transaction_id"),
         CheckConstraint(
             "status IN ('DRAFT', 'ORDERED', 'PARTIALLY_RECEIVED', 'RECEIVED', 'CANCELLED')",
             name="ck_purchase_orders_status",
@@ -103,6 +104,11 @@ class PurchaseOrder(TimestampMixin, Base):
     store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), nullable=False)
     supplier_id: Mapped[int] = mapped_column(ForeignKey("suppliers.id"), nullable=False)
     purchase_number: Mapped[str] = mapped_column(String(64), nullable=False)
+    # M19: the idempotency key -- same pattern/rationale as GoodsReceipt's
+    # own client_transaction_id (purchasing/models.py, GoodsReceipt
+    # docstring): a retried/duplicated PO-creation request must not
+    # silently create two separate DRAFT purchase orders.
+    client_transaction_id: Mapped[str] = mapped_column(String(100), nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="DRAFT")
     order_date: Mapped[date] = mapped_column(Date, nullable=False)
     expected_date: Mapped[date | None] = mapped_column(Date)

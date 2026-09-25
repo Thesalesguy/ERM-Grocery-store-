@@ -298,7 +298,17 @@ def test_E_idempotent_retry_of_the_same_sale(session_setup) -> None:
 def test_F_database_connectivity_failure(session_setup) -> None:
     subprocess.run([*SUDO, "service", "postgresql", "stop"], check=True, capture_output=True)
     try:
+        # M18: "service postgresql stop" returning success does not
+        # guarantee the app's connection pool has already noticed --
+        # the exact same tolerance test_monitoring.py's own DB-down test
+        # already applies (_wait_for_alert_state(..., timeout=40.0))
+        # rather than asserting on the very next request. Poll briefly
+        # instead of a single immediate check.
+        deadline = time.monotonic() + 10.0
         health = httpx.get(f"{BASE_URL}/health/db", verify=False, timeout=10.0)
+        while health.status_code != 503 and time.monotonic() < deadline:
+            time.sleep(0.3)
+            health = httpx.get(f"{BASE_URL}/health/db", verify=False, timeout=10.0)
         assert health.status_code == 503
         assert health.json() == {"status": "error", "database": "unreachable"}
 

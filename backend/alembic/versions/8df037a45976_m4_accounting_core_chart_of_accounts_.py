@@ -351,6 +351,29 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     conn = op.get_bind()
+
+    # Guard FIRST, before any destructive step (M18 discovery finding:
+    # this was the one accounting-core downgrade in the whole chain with
+    # no such guard, unlike every later accounting migration --
+    # 581d2a07f38c, M6, M14). journal_entries/journal_lines/accounts ARE
+    # the general ledger; every module from M4 onward posts to them. If
+    # any real transaction has ever posted, dropping these tables would
+    # destroy the entire financial history rather than merely revert an
+    # empty schema. journal_lines cannot have a row without a parent
+    # journal_entries row (FK), so checking journal_entries alone is
+    # sufficient to catch both tables.
+    op.execute(
+        "DO $$ BEGIN "
+        "IF EXISTS (SELECT 1 FROM journal_entries LIMIT 1) THEN "
+        "RAISE EXCEPTION "
+        "'Cannot downgrade: journal_entries has real posted transactions -- "
+        "dropping journal_entries/journal_lines/accounts would destroy the "
+        "entire general ledger. Downgrading past the accounting core is not "
+        "safe once any real financial activity exists.'; "
+        "END IF; "
+        "END $$;"
+    )
+
     conn.execute(
         sa.text(
             "DELETE FROM role_permissions WHERE permission_id IN "

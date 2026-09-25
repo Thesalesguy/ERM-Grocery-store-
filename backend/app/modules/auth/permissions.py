@@ -23,6 +23,13 @@ REPORTS_READ = "reports.read"
 USERS_MANAGE = "users.manage"
 AUDIT_READ = "audit.read"
 ACCOUNTING_READ = "accounting.read"
+# M16 (docs/M16_DESIGN.md "Settings screen"): store configuration
+# (return_approval_threshold_amount, attendance_day_boundary_hour, and
+# the basic identity fields name/address/timezone) previously had no API
+# surface at all -- these two mirror the read/write split every other
+# module in this permission matrix already follows.
+STORE_SETTINGS_READ = "store.settings.read"
+STORE_SETTINGS_WRITE = "store.settings.write"
 # Reserved for a future manual-journal-posting endpoint (M4 task Section
 # 27 explicitly asks manual posting endpoints to exist "only if users
 # genuinely need" them — they don't yet: every M4 journal entry is posted
@@ -73,6 +80,15 @@ AP_PAY = "ap.pay"
 # code rather than folded into ap.post so a role could plausibly have one
 # without the other, though M7's own matrix always grants them together.
 AP_CREDIT = "ap.credit"
+# M16 (docs/M16_DESIGN.md "AP payment/credit-note correction path"):
+# reversing a supplier payment or credit note is a genuinely new,
+# separate capability from creating one (ap.pay/ap.credit) — it corrects
+# a real cash/AP movement that already happened, mirroring
+# accounting.reverse's own scope (a correction action, not a routine
+# write). One permission covers both payment and credit-note reversal,
+# mirroring accounting.reverse's own single-permission scope for "reverse
+# a financial posting" rather than splitting per source type.
+AP_REVERSE = "ap.reverse"
 # M8 (docs/M8_ADVANCED_INVENTORY_DESIGN.md "Design Decision 2"): stock
 # counting is split into three tiers exactly like AP's write/post/pay
 # split — data entry (count.write covers create/open/count-entry/recount/
@@ -178,6 +194,37 @@ PAYROLL_CALCULATE = "payroll.calculate"
 PAYROLL_APPROVE = "payroll.approve"
 PAYROLL_POST = "payroll.post"
 PAYROLL_REVERSE = "payroll.reverse"
+# M15 (docs/M15_DESIGN.md "Permissions"): shift.manage covers a cashier's
+# own OPEN/close/cash-movement actions on THEIR OWN shift -- granted
+# alongside pos.use to every role that can operate the POS at all (mirrors
+# how sales.return.write sits alongside pos.use for Cashier). shift.read
+# is separate (view-only, for a Manager/Admin/Auditor reviewing shift
+# history/reconciliation) mirroring the read/write split used everywhere
+# else in this matrix. shift.override is its own, narrower permission --
+# NOT folded into shift.manage -- gating specifically the ability to close
+# a DIFFERENT cashier's shift, mirroring sales.return.approve's own
+# tier-separation reasoning: a role could plausibly have shift.manage
+# (run your own till) without shift.override (close someone else's), and
+# this milestone's Cashier role does exactly that.
+SHIFT_MANAGE = "shift.manage"
+SHIFT_READ = "shift.read"
+SHIFT_OVERRIDE = "shift.override"
+# M20 (docs/M20_DESIGN.md Section 8): fiscal.read covers viewing a
+# store's FiscalConfig (minus any secret value -- none is ever stored,
+# only a credential-reference NAME) and its FiscalSubmission history,
+# mirroring accounting.read's read-only scope. fiscal.retry is a
+# narrower, heavier action -- manually re-running one FAILED/EXHAUSTED
+# submission -- kept separate from fiscal.read the same way
+# accounting.reverse is kept separate from accounting.read, and granted
+# to Manager alongside it for the same reason (a real operational
+# recovery action, not a routine view). fiscal.config.write (enabling
+# fiscalization, choosing a provider, setting the credential-reference
+# name/endpoint) is Admin-only, matching accounting.admin's reserved,
+# configuration-level sensitivity -- it is the one action that turns
+# this milestone's otherwise-inert architecture on for a store.
+FISCAL_READ = "fiscal.read"
+FISCAL_CONFIG_WRITE = "fiscal.config.write"
+FISCAL_RETRY = "fiscal.retry"
 
 ALL_PERMISSIONS: dict[str, str] = {
     PRODUCTS_READ: "View products and barcodes",
@@ -191,6 +238,8 @@ ALL_PERMISSIONS: dict[str, str] = {
     SALES_READ: "View sales history and receipts",
     REPORTS_READ: "View reports (P&L, stock movement, ...)",
     USERS_MANAGE: "Create users and assign roles",
+    STORE_SETTINGS_READ: "View a store's configuration (return threshold, attendance rules)",
+    STORE_SETTINGS_WRITE: "Change a store's configuration",
     AUDIT_READ: "View the audit log",
     ACCOUNTING_READ: "View the chart of accounts, journal entries, and financial reports",
     ACCOUNTING_POST: "Manually post a journal entry (reserved; no endpoint uses this yet)",
@@ -213,6 +262,7 @@ ALL_PERMISSIONS: dict[str, str] = {
     ),
     AP_PAY: "Record a supplier payment, settling Accounts Payable",
     AP_CREDIT: "Create a supplier credit note, reducing Accounts Payable",
+    AP_REVERSE: "Reverse a supplier payment or credit note with a compensating entry",
     INVENTORY_COUNT_WRITE: "Create, open, count, recount, and cancel a stock count",
     INVENTORY_COUNT_REVIEW: "Review a counted stock count before posting",
     INVENTORY_COUNT_POST: "Post a reviewed stock count, committing its variance to the GL",
@@ -233,6 +283,13 @@ ALL_PERMISSIONS: dict[str, str] = {
     PAYROLL_APPROVE: "Approve a calculated payroll period before posting",
     PAYROLL_POST: "Post an approved payroll period, creating a real GL liability",
     PAYROLL_REVERSE: "Reverse a posted payroll period with a compensating entry",
+    SHIFT_MANAGE: "Open, record cash movements against, and close one's own cashier shift",
+    SHIFT_READ: "View cashier shift history and reconciliation detail",
+    SHIFT_OVERRIDE: "Close another cashier's shift on their behalf",
+    FISCAL_READ: "View a store's fiscal configuration and submission history",
+    FISCAL_CONFIG_WRITE: "Enable/configure fiscal submission for a store (provider, credential "
+    "reference, endpoint, retry policy)",
+    FISCAL_RETRY: "Manually retry one failed/exhausted fiscal submission",
 }
 
 # --- Roles --------------------------------------------------------------
@@ -288,6 +345,7 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         AP_POST,
         AP_PAY,
         AP_CREDIT,
+        AP_REVERSE,
         INVENTORY_COUNT_WRITE,
         INVENTORY_COUNT_REVIEW,
         INVENTORY_COUNT_POST,
@@ -309,6 +367,16 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         # Deliberately NOT PAYROLL_POST or PAYROLL_REVERSE — see the
         # permission constants' docstring above for the full
         # conflict-of-interest justification (M10 design decision #2).
+        SHIFT_MANAGE,
+        SHIFT_READ,
+        SHIFT_OVERRIDE,
+        STORE_SETTINGS_READ,
+        STORE_SETTINGS_WRITE,
+        # M20: view-only plus the operational recovery action, mirroring
+        # accounting.read + accounting.reverse — NOT fiscal.config.write
+        # (Admin-only, see the permission constants' docstring above).
+        FISCAL_READ,
+        FISCAL_RETRY,
     ],
     CASHIER: [
         PRODUCTS_READ,
@@ -316,6 +384,16 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         SALES_READ,
         SALES_RETURN_READ,
         SALES_RETURN_WRITE,
+        # M15: a Cashier can run their OWN till (open/close/record a cash
+        # movement, view its own history) but NOT shift.override —
+        # closing another cashier's shift is Manager/Admin-only,
+        # mirroring sales.return.approve's own separation. shift.read
+        # alongside shift.manage mirrors how Cashier already holds
+        # sales.read/sales.return.read alongside pos.use/sales.return.write
+        # — operating something and viewing your own history of it go
+        # together everywhere else in this matrix.
+        SHIFT_MANAGE,
+        SHIFT_READ,
     ],
     INVENTORY_CLERK: [
         PRODUCTS_READ,
@@ -356,6 +434,9 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         HR_READ,
         ATTENDANCE_READ,
         PAYROLL_READ,
+        STORE_SETTINGS_READ,
+        SHIFT_READ,
+        FISCAL_READ,
     ],
     # M10 design decision #3's exact scope: employee master data,
     # employment history, attendance, and payroll preparation/read.

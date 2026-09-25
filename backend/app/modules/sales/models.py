@@ -15,10 +15,10 @@ columns, so the stored value can never silently drift from what it's
 supposed to represent.
 """
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Numeric, String, Text
+from sqlalchemy import CheckConstraint, Date, DateTime, ForeignKey, Index, Numeric, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base_class import Base, TimestampMixin
@@ -80,6 +80,17 @@ class Sale(TimestampMixin, Base):
     voided_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
     voided_reason: Mapped[str | None] = mapped_column(Text)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # M15 (docs/M15_DESIGN.md "Shift association"): the cashier's OPEN
+    # CashierShift at the moment this sale finalized, or NULL if the
+    # cashier had no open shift (opportunistic attribution, not a
+    # mandatory requirement -- see the design doc's "Scope boundary": a
+    # pre-M15 sale, and any sale finalized without an open shift, is
+    # simply unattributed, never fabricated after the fact). Lives here,
+    # not on Payment: every Payment row for one Sale is created in the
+    # same checkout event, so a per-Payment shift_id would be redundant --
+    # this one column is sufficient to attribute every payment on the
+    # sale to the same shift.
+    shift_id: Mapped[int | None] = mapped_column(ForeignKey("cashier_shifts.id"))
 
     items: Mapped[list["SaleItem"]] = relationship(back_populates="sale")
     payments: Mapped[list["Payment"]] = relationship(back_populates="sale")
@@ -211,6 +222,27 @@ class SaleReturn(TimestampMixin, Base):
     # retroactively make an already-approved return look unapproved, or
     # vice versa.
     approval_required: Mapped[bool] = mapped_column(nullable=False, default=False)
+    # M15: the same opportunistic shift attribution as Sale.shift_id above
+    # -- the PROCESSING cashier's OPEN shift at the moment this return/void
+    # was created, which may be a DIFFERENT shift (even a different day)
+    # than whatever shift the ORIGINAL sale happened under. A return's own
+    # refund_method/refund_amount affect physical cash independently of
+    # the original sale, so it needs its own shift_id rather than one
+    # derived through sale_id -- see docs/M15_DESIGN.md "Shift
+    # association" for the full reasoning.
+    shift_id: Mapped[int | None] = mapped_column(ForeignKey("cashier_shifts.id"))
+    # M16 pre-implementation hardening (docs/M16_DESIGN.md "Operational vs.
+    # GL return-date divergence"): the same caller-supplied business date
+    # already passed to accounting_service.post_sale_return_journal's
+    # posting_date -- previously computed but never persisted anywhere on
+    # this row itself, so an operational reader (e.g. reports/service.py)
+    # had no way to bucket a return by the same date the GL used and fell
+    # back to created_at (insertion time), which a backdated return could
+    # silently disagree with. Nullable and NOT backfilled for pre-M16
+    # rows -- reporting code coalesces to created_at's date for any row
+    # where this is NULL, preserving every existing return's historical
+    # reporting bucket exactly as it already was.
+    return_date: Mapped[date | None] = mapped_column(Date)
 
     items: Mapped[list["SaleReturnItem"]] = relationship(back_populates="sale_return")
 

@@ -21,6 +21,9 @@ class SupplierCreate(BaseModel):
     email: str | None = Field(default=None, max_length=255)
     address: str | None = Field(default=None, max_length=500)
     tax_id: str | None = Field(default=None, max_length=100)
+    # M19: existed on the model since M6 (consumed by AP's payment-due-date
+    # calculation) but had no write path anywhere until now.
+    default_payment_terms_days: int | None = Field(default=None, ge=0)
 
 
 class SupplierUpdate(BaseModel):
@@ -31,6 +34,7 @@ class SupplierUpdate(BaseModel):
     email: str | None = Field(default=None, max_length=255)
     address: str | None = Field(default=None, max_length=500)
     tax_id: str | None = Field(default=None, max_length=100)
+    default_payment_terms_days: int | None = Field(default=None, ge=0)
 
     model_config = ConfigDict(extra="forbid")
 
@@ -47,6 +51,7 @@ class SupplierRead(BaseModel):
     address: str | None
     tax_id: str | None
     is_active: bool
+    default_payment_terms_days: int | None
 
 
 class PurchaseOrderItemCreate(BaseModel):
@@ -61,6 +66,10 @@ class PurchaseOrderCreate(BaseModel):
     order_date: date
     expected_date: date | None = None
     notes: str | None = Field(default=None, max_length=2000)
+    # M19: the idempotency key, same pattern as GoodsReceiptCreate/
+    # PurchaseReturnCreate below -- a retried/duplicated request must not
+    # silently create two separate DRAFT purchase orders.
+    client_transaction_id: str = Field(min_length=1, max_length=100)
     # Bounded (M2 hardening audit Section 13 precedent applied here too):
     # generous for any real order, bounded against an abusive payload.
     lines: list[PurchaseOrderItemCreate] = Field(min_length=1, max_length=500)
@@ -90,6 +99,7 @@ class PurchaseOrderRead(BaseModel):
     store_id: int
     supplier_id: int
     purchase_number: str
+    client_transaction_id: str
     status: str
     order_date: date
     expected_date: date | None

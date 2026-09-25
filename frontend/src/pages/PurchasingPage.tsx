@@ -21,6 +21,10 @@ function NewPurchaseOrderForm({
   ])
   const [error, setError] = useState<string | null>(null)
   const [isSubmitting, setIsSubmitting] = useState(false)
+  // One idempotency key per creation attempt (M2/M3 hardening pattern —
+  // see this file's own ReceiveGoodsForm/PosPage.tsx): stable across
+  // retries of the SAME attempt, reset only after a successful create.
+  const idempotencyKeyRef = useRef<string | null>(null)
 
   useEffect(() => {
     purchasingApi.listSuppliers({ is_active: true }).then((list) => {
@@ -44,6 +48,9 @@ function NewPurchaseOrderForm({
   async function handleSubmit(event: React.FormEvent) {
     event.preventDefault()
     if (supplierId === null) return
+    if (idempotencyKeyRef.current === null) {
+      idempotencyKeyRef.current = crypto.randomUUID()
+    }
     setError(null)
     setIsSubmitting(true)
     try {
@@ -72,8 +79,10 @@ function NewPurchaseOrderForm({
         store_id: storeId,
         supplier_id: supplierId,
         order_date: orderDate,
+        client_transaction_id: idempotencyKeyRef.current,
         lines: resolvedLines,
       })
+      idempotencyKeyRef.current = null
       onCreated(po)
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Failed to create purchase order.')

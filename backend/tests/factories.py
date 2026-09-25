@@ -130,6 +130,7 @@ def make_purchase_order(
         store_id=store.id,
         supplier_id=supplier.id,
         purchase_number=f"PO-{unique_suffix()}",
+        client_transaction_id=f"po-{unique_suffix()}",
         status="ORDERED",
         order_date=date(2024, 1, 1),
         created_by=created_by.id if created_by else None,

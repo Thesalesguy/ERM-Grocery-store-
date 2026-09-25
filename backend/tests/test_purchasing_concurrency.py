@@ -25,7 +25,7 @@ from app.modules.inventory import service as inventory_service
 from app.modules.inventory.models import InventoryMovement
 from app.modules.purchasing import service as purchasing_service
 from app.modules.purchasing.models import PurchaseOrderItem
-from app.modules.purchasing.service import GoodsReceiptLineInput
+from app.modules.purchasing.service import GoodsReceiptLineInput, PurchaseReturnLineInput
 from tests.factories import make_product, make_purchase_order, make_store, make_supplier
 
 
@@ -474,5 +474,242 @@ def test_f_concurrent_duplicate_receipt_requests_create_only_one_receipt() -> No
         product = verify_session.get(Product, product_id)
         # Only ONE receipt's worth of quantity (10), not 20 (double-applied).
         assert product.current_qty_on_hand == Decimal("10")
+    finally:
+        verify_session.close()
+
+
+@dataclass
+class _PoOutcome:
+    succeeded: bool = False
+    error_code: str | None = None
+    unexpected_error: str | None = None
+    po_id: int | None = None
+
+
+def _attempt_create_po(
+    *,
+    store_id: int,
+    supplier_id: int,
+    product_id: int,
+    client_transaction_id: str,
+    barrier: threading.Barrier,
+    result: _PoOutcome,
+) -> None:
+    session = SessionLocal()
+    try:
+        barrier.wait(timeout=10)
+        po = purchasing_service.create_purchase_order(
+            session,
+            store_id=store_id,
+            supplier_id=supplier_id,
+            order_date=date.today(),
+            client_transaction_id=client_transaction_id,
+            lines=[
+                purchasing_service.PurchaseOrderItemInput(
+                    product_id=product_id, quantity_ordered=Decimal("10"), unit_cost=Decimal("1.00")
+                )
+            ],
+        )
+        result.succeeded = True
+        result.po_id = po.id
+    except ConflictError as exc:
+        session.rollback()
+        result.succeeded = False
+        result.error_code = exc.error_code
+    except Exception as exc:  # noqa: BLE001 - want a real deadlock to surface, not vanish
+        session.rollback()
+        result.succeeded = False
+        result.unexpected_error = f"{type(exc).__name__}: {exc}"
+    finally:
+        session.close()
+
+
+def test_g_concurrent_duplicate_purchase_order_creation_creates_only_one_po() -> None:
+    """G: M19's PO-creation idempotency key, proven against real threads
+    (not the sequential-retry cases tests/test_purchasing_idempotency.py
+    covers) — two threads submit a purchase order with the SAME
+    client_transaction_id at (as close as threading allows) the same
+    instant. Exactly one PurchaseOrder must result, the same discipline
+    test_f above already proves for goods receipts."""
+    setup_session = SessionLocal()
+    try:
+        store = make_store(setup_session)
+        supplier = make_supplier(setup_session)
+        product = make_product(setup_session, store, current_qty_on_hand=Decimal("0"))
+        setup_session.commit()
+        store_id, supplier_id, product_id = store.id, supplier.id, product.id
+    finally:
+        setup_session.close()
+
+    shared_key = f"po-{uuid.uuid4().hex}"
+    barrier = threading.Barrier(2)
+    result_a, result_b = _PoOutcome(), _PoOutcome()
+    thread_a = threading.Thread(
+        target=_attempt_create_po,
+        kwargs=dict(
+            store_id=store_id,
+            supplier_id=supplier_id,
+            product_id=product_id,
+            client_transaction_id=shared_key,
+            barrier=barrier,
+            result=result_a,
+        ),
+    )
+    thread_b = threading.Thread(
+        target=_attempt_create_po,
+        kwargs=dict(
+            store_id=store_id,
+            supplier_id=supplier_id,
+            product_id=product_id,
+            client_transaction_id=shared_key,
+            barrier=barrier,
+            result=result_b,
+        ),
+    )
+    thread_a.start()
+    thread_b.start()
+    thread_a.join(timeout=15)
+    thread_b.join(timeout=15)
+
+    assert result_a.unexpected_error is None, result_a
+    assert result_b.unexpected_error is None, result_b
+    assert result_a.succeeded and result_b.succeeded
+    assert result_a.po_id == result_b.po_id
+
+    verify_session = SessionLocal()
+    try:
+        from app.modules.purchasing.models import PurchaseOrder
+
+        count = (
+            verify_session.query(PurchaseOrder).filter_by(client_transaction_id=shared_key).count()
+        )
+        assert count == 1
+    finally:
+        verify_session.close()
+
+
+@dataclass
+class _ReturnOutcome:
+    succeeded: bool = False
+    error_code: str | None = None
+    unexpected_error: str | None = None
+    return_id: int | None = None
+
+
+def _attempt_return(
+    *,
+    purchase_order_id: int,
+    store_id: int,
+    product_id: int,
+    quantity: Decimal,
+    barrier: threading.Barrier,
+    result: _ReturnOutcome,
+) -> None:
+    session = SessionLocal()
+    try:
+        barrier.wait(timeout=10)
+        purchase_return = purchasing_service.create_purchase_return(
+            session,
+            purchase_order_id=purchase_order_id,
+            store_id=store_id,
+            return_date=date.today(),
+            lines=[PurchaseReturnLineInput(product_id=product_id, quantity=quantity)],
+            client_transaction_id=f"ret-{uuid.uuid4().hex}",
+            caller_store_id=None,
+        )
+        session.commit()
+        result.succeeded = True
+        result.return_id = purchase_return.id
+    except ConflictError as exc:
+        session.rollback()
+        result.succeeded = False
+        result.error_code = exc.error_code
+    except Exception as exc:  # noqa: BLE001 - want a real deadlock to surface, not vanish
+        session.rollback()
+        result.succeeded = False
+        result.unexpected_error = f"{type(exc).__name__}: {exc}"
+    finally:
+        session.close()
+
+
+def test_h_concurrent_returns_against_the_same_po_cannot_jointly_over_return() -> None:
+    """H: M19's received-quantity ceiling on purchase returns
+    (RETURN_EXCEEDS_RECEIVED_QUANTITY), proven against two real threads
+    that EACH individually request a quantity within what was received,
+    but which together would exceed it. The PurchaseOrderItem row lock
+    the validation takes must serialize the two requests so exactly one
+    succeeds -- never both, which would silently over-return."""
+    setup_session = SessionLocal()
+    try:
+        store = make_store(setup_session)
+        supplier = make_supplier(setup_session)
+        product = make_product(setup_session, store, current_qty_on_hand=Decimal("0"))
+        po = make_purchase_order(setup_session, store, supplier)
+        setup_session.commit()
+
+        item = PurchaseOrderItem(
+            purchase_order_id=po.id,
+            product_id=product.id,
+            quantity_ordered=Decimal("10"),
+            quantity_received=Decimal("10"),
+            unit_cost=Decimal("2.00"),
+        )
+        setup_session.add(item)
+        setup_session.commit()
+
+        product.current_qty_on_hand = Decimal("10")
+        setup_session.add(product)
+        setup_session.commit()
+        store_id, po_id, product_id = store.id, po.id, product.id
+    finally:
+        setup_session.close()
+
+    barrier = threading.Barrier(2)
+    result_a, result_b = _ReturnOutcome(), _ReturnOutcome()
+    thread_a = threading.Thread(
+        target=_attempt_return,
+        kwargs=dict(
+            purchase_order_id=po_id,
+            store_id=store_id,
+            product_id=product_id,
+            quantity=Decimal("7"),
+            barrier=barrier,
+            result=result_a,
+        ),
+    )
+    thread_b = threading.Thread(
+        target=_attempt_return,
+        kwargs=dict(
+            purchase_order_id=po_id,
+            store_id=store_id,
+            product_id=product_id,
+            quantity=Decimal("7"),
+            barrier=barrier,
+            result=result_b,
+        ),
+    )
+    thread_a.start()
+    thread_b.start()
+    thread_a.join(timeout=15)
+    thread_b.join(timeout=15)
+
+    assert result_a.unexpected_error is None, result_a
+    assert result_b.unexpected_error is None, result_b
+
+    outcomes = [result_a, result_b]
+    succeeded = [r for r in outcomes if r.succeeded]
+    failed = [r for r in outcomes if not r.succeeded]
+    assert len(succeeded) == 1, outcomes
+    assert len(failed) == 1, outcomes
+    assert failed[0].error_code == "RETURN_EXCEEDS_RECEIVED_QUANTITY"
+
+    verify_session = SessionLocal()
+    try:
+        from app.modules.products.models import Product
+
+        product = verify_session.get(Product, product_id)
+        # Only ONE return's worth (7), not both (14) -- the loser never
+        # applied its inventory effect.
+        assert product.current_qty_on_hand == Decimal("3")
     finally:
         verify_session.close()

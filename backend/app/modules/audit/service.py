@@ -32,6 +32,7 @@ from app.modules.products.models import Product
 from app.modules.purchasing.models import GoodsReceipt, PurchaseOrder, PurchaseReturn
 from app.modules.replenishment.models import ReplenishmentPlan
 from app.modules.sales.models import Sale, SaleReturn
+from app.modules.shifts.models import CashierShift
 from app.modules.transfers.models import InterStoreTransfer, InterStoreTransferReceipt
 
 
@@ -107,6 +108,11 @@ _DIRECT_STORE_ENTITY_MODELS: dict[str, Any] = {
     "supplier_credit_note": SupplierCreditNote,
     "journal_entry": JournalEntry,
     "inter_store_transfer_receipt": InterStoreTransferReceipt,
+    # M15: CashierShift has its own store_id column directly (unlike
+    # M14's "store" entity_type, which had no per-approval row to point
+    # at and so had to be join-resolved via _JOIN_RESOLVED_ENTITY_TYPES
+    # below) — a plain direct-model entry is sufficient here.
+    "cashier_shift": CashierShift,
 }
 
 # entity_type -> (model, column_a, column_b): matches if EITHER column

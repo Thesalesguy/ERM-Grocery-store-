@@ -11,7 +11,7 @@ as an integer `sale_id` — a static path segment must be registered ahead
 of a same-prefix parameterized one to win the match.
 """
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -31,6 +31,8 @@ from app.modules.auth.service import (
     require_permission,
     scoped_store_filter,
 )
+from app.modules.fiscal import service as fiscal_service
+from app.modules.fiscal.models import FiscalSubmission
 from app.modules.products.models import Product
 from app.modules.sales import service
 from app.modules.sales.models import Sale, SaleItem, SaleReturn
@@ -104,6 +106,7 @@ def _to_sale_return_read(db: Session, sale_return: SaleReturn) -> SaleReturnRead
 def create_sale(
     payload: SaleCreate,
     request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_pos_use),
 ) -> SaleRead:
@@ -134,6 +137,18 @@ def create_sale(
     )
     db.commit()
     db.refresh(sale)
+    # M20 (docs/M20_DESIGN.md Section 2.1): a best-effort attempt,
+    # scheduled only after the sale is durably committed and only when
+    # finalize_sale actually wrote a PENDING outbox row (i.e. this
+    # store has fiscalization enabled -- never true out of the box). The
+    # cashier's response is never delayed by this.
+    pending_submission = db.execute(
+        select(FiscalSubmission).where(FiscalSubmission.sale_id == sale.id)
+    ).scalar_one_or_none()
+    if pending_submission is not None:
+        background_tasks.add_task(
+            fiscal_service.run_pending_fiscal_submission_in_background, pending_submission.id
+        )
     return _to_sale_read(db, service.get_sale(db, sale.id))
 
 

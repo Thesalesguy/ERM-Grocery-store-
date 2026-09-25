@@ -148,7 +148,14 @@ function App() {
               </RequirePermission>
             }
           />
-          <Route path="settings" element={<SettingsPage />} />
+          <Route
+            path="settings"
+            element={
+              <RequirePermission permission="store.settings.read">
+                <SettingsPage />
+              </RequirePermission>
+            }
+          />
         </Route>
       </Route>
     </Routes>
