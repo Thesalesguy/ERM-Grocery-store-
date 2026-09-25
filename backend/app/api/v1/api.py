@@ -13,6 +13,7 @@ from app.api.v1.endpoints import (
     ap,
     audit,
     auth,
+    fiscal,
     hr,
     inventory,
     payroll,
@@ -42,3 +43,4 @@ api_router.include_router(payroll.router)
 api_router.include_router(reports.router)
 api_router.include_router(audit.router)
 api_router.include_router(stores.router)
+api_router.include_router(fiscal.router)

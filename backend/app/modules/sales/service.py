@@ -55,6 +55,7 @@ from app.modules.audit import service as audit_service
 from app.modules.auth import service as auth_service
 from app.modules.auth.models import Store
 from app.modules.auth.permissions import SALES_RETURN_APPROVE
+from app.modules.fiscal import service as fiscal_service
 from app.modules.inventory import service as inventory_service
 from app.modules.products.models import Product
 from app.modules.sales.models import (
@@ -429,6 +430,14 @@ def finalize_sale(
         payments=payments,
         created_by=cashier_id,
     )
+
+    # M20 (docs/M20_DESIGN.md Section 2): writes a PENDING outbox row in
+    # this same transaction if, and only if, this store has fiscalization
+    # enabled -- a complete no-op for every store today
+    # (docs/M20_DISCOVERY.md Section 1: no tax jurisdiction is
+    # established). The actual network attempt happens separately, after
+    # this transaction commits -- never here.
+    fiscal_service.create_fiscal_submission_if_enabled(db, sale)
 
     db.flush()
     return sale

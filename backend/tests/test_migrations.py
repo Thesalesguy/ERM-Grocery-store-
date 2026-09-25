@@ -46,6 +46,7 @@ M15_HEAD_REVISION = "db482a11ee31"  # M15: cashier/till shift sessions
 M16_HARDENING_REVISION = "e1a681c4aba3"  # M16: pre-implementation hardening
 M16_HEAD_REVISION = "4a83c462dbff"  # M16: store settings permissions
 M19_HEAD_REVISION = "3a0d50ccc909"  # M19: purchase order idempotency key
+M20_HEAD_REVISION = "9c4c5a209aa9"  # M20: fiscal integration boundary + permissions
 
 
 def _alembic_config() -> Config:
@@ -160,16 +161,19 @@ def test_full_upgrade_downgrade_upgrade_cycle(migrations_db: str) -> None:
     # supplier_credit_note_reversals; sale_returns.return_date and the
     # sales/sale_returns shift_id indexes are a column/index change, not
     # tables): 63 + 2 = 65. M19 adds one COLUMN (purchase_orders.
-    # client_transaction_id), not a table -- unchanged at 65.
-    assert _table_count(migrations_db) == 65
-    assert _current_revision(migrations_db) == M19_HEAD_REVISION
+    # client_transaction_id), not a table -- unchanged at 65. M20 adds
+    # two new tables (fiscal_configs, fiscal_submissions; stores.
+    # legal_name/tax_registration_number and the fiscal.* permission seed
+    # are a column/rows change, not tables): 65 + 2 = 67.
+    assert _table_count(migrations_db) == 67
+    assert _current_revision(migrations_db) == M20_HEAD_REVISION
 
     command.downgrade(cfg, M0_REVISION)
     assert _table_count(migrations_db) == 8
 
     command.upgrade(cfg, "head")
-    assert _table_count(migrations_db) == 65
-    assert _current_revision(migrations_db) == M19_HEAD_REVISION
+    assert _table_count(migrations_db) == 67
+    assert _current_revision(migrations_db) == M20_HEAD_REVISION
 
 
 def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
@@ -190,7 +194,9 @@ def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
     # shift.override) = 48. The pre-M15 hardening migration adds no
     # permissions (a column only). M16 adds one more (ap.reverse) = 49,
     # then two more (store.settings.read, store.settings.write) = 51.
-    assert permission_count == 51
+    # M20 adds three more (fiscal.read, fiscal.config.write,
+    # fiscal.retry) = 54.
+    assert permission_count == 54
 
 
 def test_m4_downgrade_refuses_when_journal_entries_exist(migrations_db: str) -> None:

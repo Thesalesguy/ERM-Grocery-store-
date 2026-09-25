@@ -22,6 +22,12 @@ _REDACTED_KEYS = {
     "refresh_token",
     "authorization",
     "api_key",
+    # M20 (docs/M20_DESIGN.md Section 6): a fiscal-provider credential
+    # reference is a NAME/POINTER, not a secret value -- nothing
+    # resolvable is ever stored -- but it names a real production
+    # secret's location, so it is redacted here on the same conservative
+    # footing as the others.
+    "credential_reference",
 }
 _REDACTED_VALUE = "***REDACTED***"
 

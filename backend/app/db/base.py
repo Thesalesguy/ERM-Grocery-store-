@@ -28,6 +28,7 @@ from app.modules.auth.models import (  # noqa: F401
     User,
     UserRole,
 )
+from app.modules.fiscal.models import FiscalConfig, FiscalSubmission  # noqa: F401
 from app.modules.hr.models import (  # noqa: F401
     AttendanceRecord,
     CompensationPeriod,

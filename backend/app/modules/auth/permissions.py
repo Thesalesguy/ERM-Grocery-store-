@@ -209,6 +209,22 @@ PAYROLL_REVERSE = "payroll.reverse"
 SHIFT_MANAGE = "shift.manage"
 SHIFT_READ = "shift.read"
 SHIFT_OVERRIDE = "shift.override"
+# M20 (docs/M20_DESIGN.md Section 8): fiscal.read covers viewing a
+# store's FiscalConfig (minus any secret value -- none is ever stored,
+# only a credential-reference NAME) and its FiscalSubmission history,
+# mirroring accounting.read's read-only scope. fiscal.retry is a
+# narrower, heavier action -- manually re-running one FAILED/EXHAUSTED
+# submission -- kept separate from fiscal.read the same way
+# accounting.reverse is kept separate from accounting.read, and granted
+# to Manager alongside it for the same reason (a real operational
+# recovery action, not a routine view). fiscal.config.write (enabling
+# fiscalization, choosing a provider, setting the credential-reference
+# name/endpoint) is Admin-only, matching accounting.admin's reserved,
+# configuration-level sensitivity -- it is the one action that turns
+# this milestone's otherwise-inert architecture on for a store.
+FISCAL_READ = "fiscal.read"
+FISCAL_CONFIG_WRITE = "fiscal.config.write"
+FISCAL_RETRY = "fiscal.retry"
 
 ALL_PERMISSIONS: dict[str, str] = {
     PRODUCTS_READ: "View products and barcodes",
@@ -270,6 +286,10 @@ ALL_PERMISSIONS: dict[str, str] = {
     SHIFT_MANAGE: "Open, record cash movements against, and close one's own cashier shift",
     SHIFT_READ: "View cashier shift history and reconciliation detail",
     SHIFT_OVERRIDE: "Close another cashier's shift on their behalf",
+    FISCAL_READ: "View a store's fiscal configuration and submission history",
+    FISCAL_CONFIG_WRITE: "Enable/configure fiscal submission for a store (provider, credential "
+    "reference, endpoint, retry policy)",
+    FISCAL_RETRY: "Manually retry one failed/exhausted fiscal submission",
 }
 
 # --- Roles --------------------------------------------------------------
@@ -352,6 +372,11 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         SHIFT_OVERRIDE,
         STORE_SETTINGS_READ,
         STORE_SETTINGS_WRITE,
+        # M20: view-only plus the operational recovery action, mirroring
+        # accounting.read + accounting.reverse — NOT fiscal.config.write
+        # (Admin-only, see the permission constants' docstring above).
+        FISCAL_READ,
+        FISCAL_RETRY,
     ],
     CASHIER: [
         PRODUCTS_READ,
@@ -411,6 +436,7 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         PAYROLL_READ,
         STORE_SETTINGS_READ,
         SHIFT_READ,
+        FISCAL_READ,
     ],
     # M10 design decision #3's exact scope: employee master data,
     # employment history, attendance, and payroll preparation/read.
