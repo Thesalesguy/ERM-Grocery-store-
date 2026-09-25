@@ -14,7 +14,7 @@ from tests.factories import make_product, make_store, make_user, unique_suffix
 from tests.fiscal_fakes import FakeFiscalProvider
 
 
-def _enable_fiscal(db: Session, store, fake: FakeFiscalProvider) -> None:
+def _enable_fiscal(db: Session, store, fake: FakeFiscalProvider, *, updated_by: int) -> None:
     fiscal_service.register_provider("FAKE", fake)
     fiscal_service.upsert_config(
         db,
@@ -24,7 +24,7 @@ def _enable_fiscal(db: Session, store, fake: FakeFiscalProvider) -> None:
         credential_reference=None,
         submission_endpoint=None,
         retry_max_attempts=5,
-        updated_by=1,
+        updated_by=updated_by,
     )
 
 
@@ -47,7 +47,7 @@ def test_full_lifecycle_sale_to_acknowledged(db: Session) -> None:
         db, store, current_price=Decimal("11.80"), current_qty_on_hand=Decimal("100")
     )
     fake = FakeFiscalProvider(behavior="success")
-    _enable_fiscal(db, store, fake)
+    _enable_fiscal(db, store, fake, updated_by=cashier.id)
     db.commit()
 
     sale = _finalize_sale(db, store, product, cashier)
@@ -75,7 +75,7 @@ def test_rejection_is_terminal_and_never_auto_retried(db: Session) -> None:
         db, store, current_price=Decimal("11.80"), current_qty_on_hand=Decimal("100")
     )
     fake = FakeFiscalProvider(behavior="rejection")
-    _enable_fiscal(db, store, fake)
+    _enable_fiscal(db, store, fake, updated_by=cashier.id)
     db.commit()
 
     _finalize_sale(db, store, product, cashier)
@@ -104,7 +104,7 @@ def test_disabling_fiscal_after_pending_row_created_leaves_it_untouched(db: Sess
         db, store, current_price=Decimal("11.80"), current_qty_on_hand=Decimal("100")
     )
     fake = FakeFiscalProvider(behavior="success")
-    _enable_fiscal(db, store, fake)
+    _enable_fiscal(db, store, fake, updated_by=cashier.id)
     db.commit()
     sale = _finalize_sale(db, store, product, cashier)
     db.commit()
@@ -141,7 +141,7 @@ def test_return_against_acknowledged_sale_does_not_mutate_original_submission(
         db, store, current_price=Decimal("11.80"), current_qty_on_hand=Decimal("100")
     )
     fake = FakeFiscalProvider(behavior="success")
-    _enable_fiscal(db, store, fake)
+    _enable_fiscal(db, store, fake, updated_by=cashier.id)
     db.commit()
 
     sale = _finalize_sale(db, store, product, cashier)
@@ -180,7 +180,7 @@ def test_return_itself_creates_no_fiscal_submission(db: Session) -> None:
         db, store, current_price=Decimal("11.80"), current_qty_on_hand=Decimal("100")
     )
     fake = FakeFiscalProvider(behavior="success")
-    _enable_fiscal(db, store, fake)
+    _enable_fiscal(db, store, fake, updated_by=cashier.id)
     db.commit()
 
     sale = _finalize_sale(db, store, product, cashier)

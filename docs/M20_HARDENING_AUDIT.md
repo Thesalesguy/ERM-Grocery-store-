@@ -128,6 +128,28 @@ is the actual observable consequence of a cross-store config leak (a
 disabled store would wrongly start fiscalizing), and it does fail
 without the fix.
 
+## 5.3 A real CI-only failure, not a mutation-testing finding
+
+Independent of mutation testing: the first CI run against the full M20
+implementation (`f88f814`) failed the `backend` job. Several new tests
+(`test_sequential_duplicate_submit_calls_are_a_no_op_after_first_success`,
+`test_store_a_config_change_does_not_affect_store_b`, and others) called
+`fiscal_service.upsert_config(..., updated_by=1)` with a **hardcoded
+literal user ID** instead of a real, test-created user's ID.
+`FiscalConfig.updated_by` is a real foreign key to `users.id`. This
+passed locally because the local dev database had accumulated a real
+user with `id=1` from many prior manual verification runs across this
+entire multi-milestone session — but a fresh CI database has no such
+row, so every one of these inserts failed with `ForeignKeyViolation:
+Key (updated_by)=(1) is not present in table "users"`. Fixed by
+creating a real user in each affected test and passing its actual
+`.id` instead of a literal. Re-verified locally against the same dev
+database (which still has a real `id=1` row) to confirm the fix doesn't
+merely coincidentally work — the tests no longer reference `1` at all.
+This is exactly the class of environment-divergence bug the milestone's
+own regression discipline (real CI verification, never trusting local
+state alone) exists to catch, and it did.
+
 ## 6. Reconciliation with M19's closure
 
 Confirmed the M19 fiscal-unrelated final state remains untouched: no

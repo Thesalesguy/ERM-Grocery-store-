@@ -15,11 +15,13 @@ from app.modules.fiscal import service as fiscal_service
 from app.modules.fiscal.models import FiscalConfig, FiscalSubmission
 from app.modules.sales import service as sales_service
 from app.modules.sales.service import PaymentInput, SaleLineInput
-from tests.factories import make_product, make_store, make_user_with_role, unique_suffix
+from tests.factories import make_product, make_store, make_user, make_user_with_role, unique_suffix
 from tests.fiscal_fakes import FakeFiscalProvider
 
 
 def test_upsert_config_with_nonexistent_store_id_violates_fk(db: Session) -> None:
+    store = make_store(db)
+    admin = make_user(db, store)
     with pytest.raises(IntegrityError):
         fiscal_service.upsert_config(
             db,
@@ -29,7 +31,7 @@ def test_upsert_config_with_nonexistent_store_id_violates_fk(db: Session) -> Non
             credential_reference=None,
             submission_endpoint=None,
             retry_max_attempts=5,
-            updated_by=1,
+            updated_by=admin.id,
         )
         db.flush()
     db.rollback()
@@ -37,6 +39,7 @@ def test_upsert_config_with_nonexistent_store_id_violates_fk(db: Session) -> Non
 
 def test_retry_max_attempts_zero_is_rejected(db: Session) -> None:
     store = make_store(db)
+    admin = make_user(db, store)
     with pytest.raises(IntegrityError):
         fiscal_service.upsert_config(
             db,
@@ -46,7 +49,7 @@ def test_retry_max_attempts_zero_is_rejected(db: Session) -> None:
             credential_reference=None,
             submission_endpoint=None,
             retry_max_attempts=0,
-            updated_by=1,
+            updated_by=admin.id,
         )
         db.flush()
     db.rollback()

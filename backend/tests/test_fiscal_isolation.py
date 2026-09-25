@@ -93,6 +93,7 @@ def test_disabled_store_config_lookup_never_falls_through_to_another_stores_enab
 def test_store_a_config_change_does_not_affect_store_b(db: Session) -> None:
     store_a = make_store(db)
     store_b = make_store(db)
+    admin = make_user(db, store_a)
     fiscal_service.upsert_config(
         db,
         store_id=store_a.id,
@@ -101,7 +102,7 @@ def test_store_a_config_change_does_not_affect_store_b(db: Session) -> None:
         credential_reference="STORE_A_KEY",
         submission_endpoint=None,
         retry_max_attempts=3,
-        updated_by=1,
+        updated_by=admin.id,
     )
     db.commit()
 

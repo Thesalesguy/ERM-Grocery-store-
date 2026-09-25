@@ -17,7 +17,13 @@ from app.modules.auth.permissions import ADMIN, CASHIER
 from app.modules.fiscal import service as fiscal_service
 from app.modules.fiscal.models import FiscalConfig
 from app.modules.fiscal.schemas import FiscalConfigRead
-from tests.factories import DEFAULT_TEST_PASSWORD, make_store, make_user_with_role, unique_suffix
+from tests.factories import (
+    DEFAULT_TEST_PASSWORD,
+    make_store,
+    make_user,
+    make_user_with_role,
+    unique_suffix,
+)
 from tests.helpers import auth_headers
 
 
@@ -44,6 +50,8 @@ def test_get_config_endpoint_returns_only_the_reference_name_never_a_secret_valu
     client: TestClient, db: Session
 ) -> None:
     store = make_store(db)
+    username = f"fiscal_admin_sec_{unique_suffix()}"
+    admin = make_user_with_role(db, store, ADMIN, username=username)
     fiscal_service.upsert_config(
         db,
         store_id=store.id,
@@ -52,12 +60,8 @@ def test_get_config_endpoint_returns_only_the_reference_name_never_a_secret_valu
         credential_reference="FISCAL_API_KEY_STORE_X",
         submission_endpoint="https://example.invalid/submit",
         retry_max_attempts=5,
-        updated_by=1,
+        updated_by=admin.id,
     )
-    db.commit()
-
-    username = f"fiscal_admin_sec_{unique_suffix()}"
-    make_user_with_role(db, store, ADMIN, username=username)
     db.commit()
     headers = auth_headers(client, username, DEFAULT_TEST_PASSWORD)
 
@@ -109,6 +113,7 @@ def test_fiscal_config_update_is_audited_without_leaking_a_secret_value(db: Sess
     proves the audit event exists and carries that name, not that it's
     hidden (there is nothing sensitive to hide)."""
     store = make_store(db)
+    admin = make_user(db, store)
     fiscal_service.upsert_config(
         db,
         store_id=store.id,
@@ -117,7 +122,7 @@ def test_fiscal_config_update_is_audited_without_leaking_a_secret_value(db: Sess
         credential_reference="FISCAL_API_KEY_STORE_Y",
         submission_endpoint=None,
         retry_max_attempts=5,
-        updated_by=1,
+        updated_by=admin.id,
     )
     db.commit()
 

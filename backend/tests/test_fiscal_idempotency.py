@@ -46,7 +46,7 @@ def test_sequential_duplicate_submit_calls_are_a_no_op_after_first_success(db: S
         credential_reference=None,
         submission_endpoint=None,
         retry_max_attempts=5,
-        updated_by=1,
+        updated_by=cashier.id,
     )
     db.commit()
 
