@@ -62,6 +62,7 @@ from app.modules.accounting.constants import (
 from app.modules.accounting.models import (
     AUTOMATED_SOURCE_TYPES,
     Account,
+    AccountingPeriod,
     JournalEntry,
     JournalLine,
 )
@@ -121,6 +122,29 @@ def _enforce_store_access(caller_store_id: int | None, target_store_id: int, nou
             f"Your account is scoped to store {caller_store_id} and cannot "
             f"access this {noun} in store {target_store_id}",
             error_code="STORE_ACCESS_DENIED",
+        )
+
+
+def _enforce_period_open(db: Session, *, store_id: int, posting_date: date) -> None:
+    """docs/M22_DISCOVERY.md Phase 2: the single period-lock gate. Called
+    from exactly two places -- the top of `_post_journal` (covering every
+    forward-posting function and every reversal function that routes
+    through it) and `reverse_journal_entry` (the one code path that
+    builds a JournalEntry directly, without going through
+    `_post_journal`) -- which together are every place in this codebase
+    that ever creates a JournalEntry row."""
+    closed = db.execute(
+        select(AccountingPeriod.id).where(
+            AccountingPeriod.store_id == store_id,
+            AccountingPeriod.period_start <= posting_date,
+            AccountingPeriod.period_end >= posting_date,
+        )
+    ).scalar_one_or_none()
+    if closed is not None:
+        raise ConflictError(
+            f"Store {store_id}'s accounting period covering {posting_date} is closed; "
+            "no journal entry may be posted with a date inside a closed period",
+            error_code="PERIOD_CLOSED",
         )
 
 
@@ -202,6 +226,7 @@ def _post_journal(
         raise ValidationAppError(
             "A journal entry must have at least one line", error_code="EMPTY_JOURNAL_ENTRY"
         )
+    _enforce_period_open(db, store_id=store_id, posting_date=posting_date)
     accounts = _resolve_accounts(db, {line.account_code for line in lines})
 
     entry = JournalEntry(
@@ -1186,10 +1211,13 @@ def reverse_journal_entry(
             f"Journal entry {entry.id} has no lines to reverse", error_code="EMPTY_JOURNAL_ENTRY"
         )
 
+    reversal_posting_date = date.today()
+    _enforce_period_open(db, store_id=entry.store_id, posting_date=reversal_posting_date)
+
     reversal = JournalEntry(
         journal_number=_generate_journal_number(entry.store_id),
         store_id=entry.store_id,
-        posting_date=date.today(),
+        posting_date=reversal_posting_date,
         entry_type="REVERSAL",
         source_type=entry.source_type,
         source_id=entry.source_id,
@@ -1223,6 +1251,74 @@ def reverse_journal_entry(
     )
     db.flush()
     return reversal
+
+
+# --- Accounting periods (docs/M22_DISCOVERY.md Phase 2) --------------------
+
+
+def close_accounting_period(
+    db: Session,
+    *,
+    store_id: int,
+    period_start: date,
+    period_end: date,
+    reason: str,
+    closed_by: int,
+    caller_store_id: int | None,
+) -> AccountingPeriod:
+    """Close a date range for a store against further posting. There is
+    no reopen (see AccountingPeriod's docstring) and no "OPEN" status to
+    set -- creating this row is the entire action. Overlap with an
+    existing closed period for the same store is rejected by the DB's
+    own EXCLUDE constraint, surfaced here as a 409 rather than a raw
+    IntegrityError."""
+    _enforce_store_access(caller_store_id, store_id, "store")
+    if period_end < period_start:
+        raise ValidationAppError(
+            "period_end must be on or after period_start",
+            error_code="INVALID_PERIOD_RANGE",
+        )
+    period = AccountingPeriod(
+        store_id=store_id,
+        period_start=period_start,
+        period_end=period_end,
+        closed_by=closed_by,
+        closed_at=datetime.now(UTC),
+        reason=reason,
+    )
+    db.add(period)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ConflictError(
+            f"Store {store_id} already has a closed accounting period overlapping "
+            f"{period_start}..{period_end}",
+            error_code="PERIOD_OVERLAP",
+        ) from exc
+    audit_service.log_event(
+        db,
+        user_id=closed_by,
+        action="ACCOUNTING_PERIOD_CLOSED",
+        entity_type="accounting_period",
+        entity_id=period.id,
+        after={
+            "store_id": store_id,
+            "period_start": period_start.isoformat(),
+            "period_end": period_end.isoformat(),
+            "reason": reason,
+        },
+    )
+    return period
+
+
+def list_accounting_periods(db: Session, *, store_id: int | None = None) -> list[AccountingPeriod]:
+    query = select(AccountingPeriod).order_by(
+        AccountingPeriod.store_id, AccountingPeriod.period_start
+    )
+    if store_id is not None:
+        query = query.where(AccountingPeriod.store_id == store_id)
+    return list(db.execute(query).scalars().all())
 
 
 # --- Reads / reports -----------------------------------------------------
@@ -1422,7 +1518,23 @@ def profit_and_loss(
     cogs = net_debit(ACCOUNT_COGS)
     gross_profit = net_sales - cogs
     other_income = net_credit(ACCOUNT_INVENTORY_ADJUSTMENT_GAIN)
-    operating_expenses = net_debit(ACCOUNT_INVENTORY_SHRINKAGE_EXPENSE)
+    # docs/M22_DISCOVERY.md Phase 4 (resolves F2/Business Question A): every
+    # EXPENSE account except COGS (already subtracted once above, in
+    # gross_profit) -- not a hardcoded list. docs/M4_ACCOUNTING_CORE.md
+    # Section 13 always intended this term to grow as new EXPENSE accounts
+    # were seeded (payroll, purchase variance/discounts/tax, cash
+    # over/short); it never did until now. Derived purely from the same
+    # trial_balance() rows already computed above, per this file's own
+    # "never independently compute two sides of a pair that must match"
+    # rule -- no second query, no separate calculation.
+    operating_expenses = sum(
+        (
+            net_debit(row.account_code)
+            for row in rows.values()
+            if row.account_type == "EXPENSE" and row.account_code != ACCOUNT_COGS
+        ),
+        start=Decimal("0"),
+    )
     net_income = gross_profit + other_income - operating_expenses
 
     return ProfitAndLoss(
