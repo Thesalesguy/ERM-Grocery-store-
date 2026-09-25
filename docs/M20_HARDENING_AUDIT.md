@@ -150,6 +150,31 @@ This is exactly the class of environment-divergence bug the milestone's
 own regression discipline (real CI verification, never trusting local
 state alone) exists to catch, and it did.
 
+## 5.4 A pre-existing flaky deploy test, fixed (not this milestone's domain, but blocking its CI gate)
+
+`deploy-infra-native`'s `test_monitoring_exporter_itself_going_down_fires_an_alert`
+(in `deploy/tests/test_failure_injection_disaster_recovery.py`, a file no
+M20 commit touches otherwise) failed twice in a row on real CI on this
+branch (`f88f814`'s CI parent commit, then again on a confirming re-run
+of `9a3930f`) with an identical `httpx.ConnectError: [Errno 111]
+Connection refused`, already documented as a known startup-timing race
+in `M19_HARDENING_AUDIT.md` Session Q. Root cause: the test's own
+`_target_up()` poll helper already retried through Prometheus's
+"still loading TSDB" 503 response (a comment in the code documents that
+earlier fix), but let an `httpx.ConnectError` propagate unhandled and
+crash the poll loop when Prometheus's process hadn't opened its
+listening socket at all yet -- the same startup race, one step earlier,
+under CI's higher load. Per this engagement's established CI-failure
+protocol (one confirming re-run only; a second identical failure is
+real and must be fixed, not re-run again), fixed by catching
+`httpx.TransportError` in the poll helper and treating it the same as
+the already-handled 503 case (retry, don't crash). Verified: 5/5 passes
+locally against the real `prometheus`/`prometheus-alertmanager`
+binaries for the specific test, plus a full re-run of the file (7/7
+passed). This is not a fiscal/tax-domain fix and is called out
+separately from Sections 5.1-5.3 for that reason, but it was necessary
+to reach the milestone's own "CI completely green job-by-job" gate.
+
 ## 6. Reconciliation with M19's closure
 
 Confirmed the M19 fiscal-unrelated final state remains untouched: no
