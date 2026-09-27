@@ -295,7 +295,15 @@ def list_employees(db: Session, *, caller_store_id: int | None) -> list[Employee
     return list(db.execute(query).scalars().all())
 
 
-def employment_status_history(db: Session, employee_id: int) -> list[EmploymentStatusPeriod]:
+def employment_status_history(
+    db: Session, employee_id: int, *, caller_store_id: int | None
+) -> list[EmploymentStatusPeriod]:
+    """M21 F1 fix: store-scoped via the employee's CURRENT assignment,
+    exactly like every mutating function in this module already does --
+    see `_enforce_store_access_via_current_assignment`'s own docstring for
+    why the current assignment (not a nonexistent Employee.store_id
+    column) is the authoritative relationship."""
+    _enforce_store_access_via_current_assignment(db, employee_id, caller_store_id)
     return list(
         db.execute(
             select(EmploymentStatusPeriod)
@@ -307,7 +315,11 @@ def employment_status_history(db: Session, employee_id: int) -> list[EmploymentS
     )
 
 
-def employment_assignment_history(db: Session, employee_id: int) -> list[EmploymentAssignment]:
+def employment_assignment_history(
+    db: Session, employee_id: int, *, caller_store_id: int | None
+) -> list[EmploymentAssignment]:
+    """M21 F1 fix: see `employment_status_history`'s docstring."""
+    _enforce_store_access_via_current_assignment(db, employee_id, caller_store_id)
     return list(
         db.execute(
             select(EmploymentAssignment)
@@ -319,7 +331,13 @@ def employment_assignment_history(db: Session, employee_id: int) -> list[Employm
     )
 
 
-def compensation_history(db: Session, employee_id: int) -> list[CompensationPeriod]:
+def compensation_history(
+    db: Session, employee_id: int, *, caller_store_id: int | None
+) -> list[CompensationPeriod]:
+    """M21 F1 fix: see `employment_status_history`'s docstring. This is the
+    highest-severity of the three -- compensation/pay-rate data -- so the
+    same-store-or-unrestricted-only invariant applies here identically."""
+    _enforce_store_access_via_current_assignment(db, employee_id, caller_store_id)
     return list(
         db.execute(
             select(CompensationPeriod)

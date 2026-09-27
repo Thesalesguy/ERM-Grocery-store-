@@ -94,3 +94,22 @@ class InventoryReconciliationRowRead(BaseModel):
 
 class InventoryReconciliationRead(BaseModel):
     rows: list[InventoryReconciliationRowRead]
+
+
+class AccountingPeriodRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    store_id: int
+    period_start: date
+    period_end: date
+    closed_by: int
+    closed_at: datetime
+    reason: str
+
+
+class AccountingPeriodCloseRequest(BaseModel):
+    store_id: int
+    period_start: date
+    period_end: date
+    reason: str = Field(min_length=1, max_length=1000)

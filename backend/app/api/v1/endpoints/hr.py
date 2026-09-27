@@ -192,7 +192,7 @@ def get_employment_status_history(
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_read_permission),
 ) -> list[EmploymentStatusPeriodRead]:
-    rows = service.employment_status_history(db, employee_id)
+    rows = service.employment_status_history(db, employee_id, caller_store_id=current_user.store_id)
     return [EmploymentStatusPeriodRead.model_validate(row) for row in rows]
 
 
@@ -223,7 +223,9 @@ def get_employment_assignment_history(
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_read_permission),
 ) -> list[EmploymentAssignmentRead]:
-    rows = service.employment_assignment_history(db, employee_id)
+    rows = service.employment_assignment_history(
+        db, employee_id, caller_store_id=current_user.store_id
+    )
     return [EmploymentAssignmentRead.model_validate(row) for row in rows]
 
 
@@ -259,7 +261,7 @@ def get_compensation_history(
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_compensation_permission),
 ) -> list[CompensationPeriodRead]:
-    rows = service.compensation_history(db, employee_id)
+    rows = service.compensation_history(db, employee_id, caller_store_id=current_user.store_id)
     return [CompensationPeriodRead.model_validate(row) for row in rows]
 
 

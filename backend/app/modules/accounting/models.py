@@ -29,10 +29,21 @@ bearing decisions (each documented in full in that doc):
   DB is the actual backstop.
 """
 
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import CheckConstraint, Date, ForeignKey, Index, Numeric, String, Text, text
+from sqlalchemy import (
+    CheckConstraint,
+    Date,
+    DateTime,
+    ForeignKey,
+    Index,
+    Numeric,
+    String,
+    Text,
+    text,
+)
+from sqlalchemy.dialects.postgresql import ExcludeConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base_class import Base, TimestampMixin
@@ -255,3 +266,36 @@ class JournalLine(TimestampMixin, Base):
     # accounting identity (a line about a store-wide tax total has none).
     product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id"))
     description: Mapped[str | None] = mapped_column(String(255))
+
+
+class AccountingPeriod(TimestampMixin, Base):
+    """One CLOSED date range for one store (docs/M22_DISCOVERY.md Phase 2).
+
+    A row here is a denylist entry, not a lifecycle state: there is no
+    "OPEN" row to store, since a posting_date not covered by any row is
+    open by default. There is deliberately no reopen (rows are never
+    updated or deleted — UPDATE/DELETE are revoked from the app runtime
+    role in the migration, same carve-out as journal_entries/
+    journal_lines): M22's own discovery explicitly treats reopen
+    semantics as undefined and out of scope rather than guessing at them.
+    """
+
+    __tablename__ = "accounting_periods"
+    __table_args__ = (
+        CheckConstraint("period_end >= period_start", name="ck_accounting_periods_valid_range"),
+        ExcludeConstraint(
+            ("store_id", "="),
+            (text("daterange(period_start, period_end, '[]')"), "&&"),
+            using="gist",
+            name="excl_accounting_periods_no_overlap",
+        ),
+        Index("ix_accounting_periods_store_id", "store_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), nullable=False)
+    period_start: Mapped[date] = mapped_column(Date, nullable=False)
+    period_end: Mapped[date] = mapped_column(Date, nullable=False)
+    closed_by: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    closed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)

@@ -220,7 +220,9 @@ def get_matching_status(
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_read_permission),
 ) -> PurchaseOrderMatchingStatusRead:
-    rows = service.get_invoice_matching_status(db, purchase_order_id)
+    rows = service.get_invoice_matching_status(
+        db, purchase_order_id, caller_store_id=current_user.store_id
+    )
     return _matching_status_response(db, [purchase_order_id], rows)
 
 
@@ -237,7 +239,7 @@ def get_matching_status_multi(
     several purchase orders" workflow. `purchase_order_ids` is a
     comma-separated list, e.g. `?purchase_order_ids=12,13`."""
     ids = [int(part) for part in purchase_order_ids.split(",") if part.strip()]
-    rows = service.get_invoice_matching_status_multi(db, ids)
+    rows = service.get_invoice_matching_status_multi(db, ids, caller_store_id=current_user.store_id)
     return _matching_status_response(db, ids, rows)
 
 
@@ -456,7 +458,17 @@ def get_supplier_summary(
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_read_permission),
 ) -> SupplierApSummaryRead:
-    summary = service.get_supplier_ap_summary(db, supplier_id, as_of=as_of)
+    # M21 F5 fix: Supplier is company-wide reference data (no store_id
+    # query param here to begin with), but its invoices/payments/credit
+    # notes are store-scoped operational rows -- scoped_store_filter(...,
+    # None) silently narrows a store-scoped caller to their own store's
+    # rows, exactly like list_invoices/list_payments already do for the
+    # omitted-filter case, while an unrestricted caller still gets the
+    # true company-wide total.
+    effective_store_id = scoped_store_filter(current_user, None)
+    summary = service.get_supplier_ap_summary(
+        db, supplier_id, as_of=as_of, store_id=effective_store_id
+    )
     return SupplierApSummaryRead(**summary.__dict__)
 
 
@@ -466,7 +478,10 @@ def get_supplier_transactions(
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_read_permission),
 ) -> list[SupplierTransactionRead]:
-    transactions = service.get_supplier_transaction_history(db, supplier_id)
+    effective_store_id = scoped_store_filter(current_user, None)
+    transactions = service.get_supplier_transaction_history(
+        db, supplier_id, store_id=effective_store_id
+    )
     return [
         SupplierTransactionRead(
             transaction_type=t.transaction_type,
@@ -488,8 +503,9 @@ def get_supplier_statement(
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(_read_permission),
 ) -> SupplierStatementRead:
+    effective_store_id = scoped_store_filter(current_user, None)
     statement = service.get_supplier_statement(
-        db, supplier_id, date_from=date_from, date_to=date_to
+        db, supplier_id, date_from=date_from, date_to=date_to, store_id=effective_store_id
     )
     return SupplierStatementRead(
         supplier_id=statement.supplier_id,

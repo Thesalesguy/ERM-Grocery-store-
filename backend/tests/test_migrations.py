@@ -47,6 +47,7 @@ M16_HARDENING_REVISION = "e1a681c4aba3"  # M16: pre-implementation hardening
 M16_HEAD_REVISION = "4a83c462dbff"  # M16: store settings permissions
 M19_HEAD_REVISION = "3a0d50ccc909"  # M19: purchase order idempotency key
 M20_HEAD_REVISION = "9c4c5a209aa9"  # M20: fiscal integration boundary + permissions
+M22_HEAD_REVISION = "aa9ac6ad7476"  # M22: accounting_periods
 
 
 def _alembic_config() -> Config:
@@ -164,16 +165,18 @@ def test_full_upgrade_downgrade_upgrade_cycle(migrations_db: str) -> None:
     # client_transaction_id), not a table -- unchanged at 65. M20 adds
     # two new tables (fiscal_configs, fiscal_submissions; stores.
     # legal_name/tax_registration_number and the fiscal.* permission seed
-    # are a column/rows change, not tables): 65 + 2 = 67.
-    assert _table_count(migrations_db) == 67
-    assert _current_revision(migrations_db) == M20_HEAD_REVISION
+    # are a column/rows change, not tables): 65 + 2 = 67. M22 adds one new
+    # table (accounting_periods; the profit_and_loss() operating_expenses
+    # fix is a code change, not a schema change): 67 + 1 = 68.
+    assert _table_count(migrations_db) == 68
+    assert _current_revision(migrations_db) == M22_HEAD_REVISION
 
     command.downgrade(cfg, M0_REVISION)
     assert _table_count(migrations_db) == 8
 
     command.upgrade(cfg, "head")
-    assert _table_count(migrations_db) == 67
-    assert _current_revision(migrations_db) == M20_HEAD_REVISION
+    assert _table_count(migrations_db) == 68
+    assert _current_revision(migrations_db) == M22_HEAD_REVISION
 
 
 def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:

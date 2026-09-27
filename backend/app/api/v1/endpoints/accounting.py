@@ -1,15 +1,21 @@
-"""Accounting endpoints: chart of accounts, journal entries, reversal, and
-financial reports.
+"""Accounting endpoints: chart of accounts, journal entries, reversal,
+accounting periods, and financial reports.
 
-`accounting.read` gates every GET. `accounting.reverse` gates the one
-mutating endpoint — reversing a posted journal entry. There is
-deliberately no manual journal-creation endpoint in M4 (see
-app.modules.auth.permissions.ACCOUNTING_POST's docstring): every M4
-journal entry is posted automatically, inline, by the operational
-transaction it represents (sale finalization, goods receiving, purchase
-return, stock adjustment) — exposing arbitrary journal creation to users
-would let anyone fabricate financial history, which M4 task Section 27
-explicitly says not to do without a genuine need.
+`accounting.read` gates every GET. `accounting.reverse` gates reversing a
+posted journal entry. There is deliberately no manual journal-creation
+endpoint in M4 (see app.modules.auth.permissions.ACCOUNTING_POST's
+docstring): every M4 journal entry is posted automatically, inline, by
+the operational transaction it represents (sale finalization, goods
+receiving, purchase return, stock adjustment) — exposing arbitrary
+journal creation to users would let anyone fabricate financial history,
+which M4 task Section 27 explicitly says not to do without a genuine
+need.
+
+`accounting.admin` (M22, docs/M22_DISCOVERY.md Phase 2) gates closing an
+accounting period — an administrative, configuration-level action
+(currently Admin-only, matching fiscal.config.write's own precedent),
+distinct from accounting.reverse's routine correction-action scope.
+Closing a period is create-only; there is no reopen endpoint.
 
 Journal entries and reports are store-scoped the same way sales/
 purchasing already are (M2 hardening audit Section 12): a store-scoped
@@ -21,7 +27,7 @@ leaking its existence.
 from datetime import date
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -30,6 +36,8 @@ from app.core.exceptions import NotFoundError
 from app.modules.accounting import service
 from app.modules.accounting.models import Account, JournalEntry
 from app.modules.accounting.schemas import (
+    AccountingPeriodCloseRequest,
+    AccountingPeriodRead,
     AccountRead,
     InventoryReconciliationRead,
     InventoryReconciliationRowRead,
@@ -40,13 +48,14 @@ from app.modules.accounting.schemas import (
     TrialBalanceRead,
     TrialBalanceRowRead,
 )
-from app.modules.auth.permissions import ACCOUNTING_READ, ACCOUNTING_REVERSE
+from app.modules.auth.permissions import ACCOUNTING_ADMIN, ACCOUNTING_READ, ACCOUNTING_REVERSE
 from app.modules.auth.service import CurrentUser, require_permission, scoped_store_filter
 
 router = APIRouter(prefix="/accounting", tags=["accounting"])
 
 _read_permission = require_permission(ACCOUNTING_READ)
 _reverse_permission = require_permission(ACCOUNTING_REVERSE)
+_admin_permission = require_permission(ACCOUNTING_ADMIN)
 
 
 def _to_journal_entry_read(db: Session, entry: JournalEntry) -> JournalEntryRead:
@@ -144,6 +153,37 @@ def reverse_journal(
     db.commit()
     db.refresh(reversal)
     return _to_journal_entry_read(db, service.get_journal_entry(db, reversal.id))
+
+
+@router.post("/periods", response_model=AccountingPeriodRead, status_code=status.HTTP_201_CREATED)
+def close_period(
+    payload: AccountingPeriodCloseRequest,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(_admin_permission),
+) -> AccountingPeriodRead:
+    period = service.close_accounting_period(
+        db,
+        store_id=payload.store_id,
+        period_start=payload.period_start,
+        period_end=payload.period_end,
+        reason=payload.reason,
+        closed_by=current_user.id,
+        caller_store_id=current_user.store_id,
+    )
+    db.commit()
+    db.refresh(period)
+    return AccountingPeriodRead.model_validate(period)
+
+
+@router.get("/periods", response_model=list[AccountingPeriodRead])
+def list_periods(
+    store_id: int | None = None,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(_read_permission),
+) -> list[AccountingPeriodRead]:
+    effective_store_id = scoped_store_filter(current_user, store_id)
+    periods = service.list_accounting_periods(db, store_id=effective_store_id)
+    return [AccountingPeriodRead.model_validate(p) for p in periods]
 
 
 @router.get("/reports/trial-balance", response_model=TrialBalanceRead)

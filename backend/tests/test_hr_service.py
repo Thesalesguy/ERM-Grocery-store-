@@ -96,7 +96,7 @@ def test_valid_status_transition_closes_prior_period(db: Session) -> None:
         actor_id=None,
         caller_store_id=None,
     )
-    history = hr_service.employment_status_history(db, employee.id)
+    history = hr_service.employment_status_history(db, employee.id, caller_store_id=None)
     assert [h.status for h in history] == ["ACTIVE", "ON_LEAVE"]
     assert history[0].effective_to == date(2024, 2, 29)
     assert history[1].effective_to is None
@@ -140,7 +140,7 @@ def test_terminate_then_rehire_cycle(db: Session) -> None:
         actor_id=None,
         caller_store_id=None,
     )
-    history = hr_service.employment_status_history(db, employee.id)
+    history = hr_service.employment_status_history(db, employee.id, caller_store_id=None)
     assert [h.status for h in history] == ["ACTIVE", "TERMINATED", "ACTIVE"]
 
 
@@ -178,7 +178,7 @@ def test_reassign_employee_to_a_new_store_closes_prior_assignment(db: Session) -
         actor_id=None,
         caller_store_id=None,
     )
-    history = hr_service.employment_assignment_history(db, employee.id)
+    history = hr_service.employment_assignment_history(db, employee.id, caller_store_id=None)
     assert [a.store_id for a in history] == [store_a.id, store_b.id]
     assert history[0].effective_to == date(2024, 6, 30)
 
@@ -262,7 +262,7 @@ def test_change_compensation_closes_prior_period(db: Session) -> None:
         actor_id=None,
         caller_store_id=None,
     )
-    history = hr_service.compensation_history(db, employee.id)
+    history = hr_service.compensation_history(db, employee.id, caller_store_id=None)
     assert [c.rate for c in history] == [Decimal("10.00"), Decimal("12.00")]
     assert history[0].effective_to == date(2024, 6, 30)
 
@@ -365,7 +365,9 @@ def test_concurrent_reassignment_of_the_same_employee_serializes_via_row_lock() 
 
     verify = SessionLocal()
     try:
-        history = hr_service.employment_assignment_history(verify, employee_id)
+        history = hr_service.employment_assignment_history(
+            verify, employee_id, caller_store_id=None
+        )
         # Exactly one reassignment took effect — never both, never neither.
         assert len(history) == 2
         assert history[0].effective_to == date(2024, 6, 30)

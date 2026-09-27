@@ -21,7 +21,7 @@ from typing import Any
 from sqlalchemy import Select, and_, or_, select
 from sqlalchemy.orm import Session
 
-from app.modules.accounting.models import JournalEntry
+from app.modules.accounting.models import AccountingPeriod, JournalEntry
 from app.modules.ap.models import PurchaseInvoice, SupplierCreditNote, SupplierPayment
 from app.modules.audit.models import AuditLog
 from app.modules.auth.models import Store, User
@@ -113,6 +113,9 @@ _DIRECT_STORE_ENTITY_MODELS: dict[str, Any] = {
     # at and so had to be join-resolved via _JOIN_RESOLVED_ENTITY_TYPES
     # below) — a plain direct-model entry is sufficient here.
     "cashier_shift": CashierShift,
+    # M22 (docs/M22_DISCOVERY.md Phase 2): AccountingPeriod has its own
+    # store_id column directly, same shape as CashierShift above.
+    "accounting_period": AccountingPeriod,
 }
 
 # entity_type -> (model, column_a, column_b): matches if EITHER column
