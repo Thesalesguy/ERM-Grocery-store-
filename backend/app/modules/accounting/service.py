@@ -616,7 +616,22 @@ def post_purchase_invoice_void_journal(
 
     `void_purchase_invoice` only ever calls this while
     `purchase_invoice.amount_paid == 0` (see that function's docstring for
-    why voiding a partially/fully paid invoice is out of scope for M6)."""
+    why voiding a partially/fully paid invoice is out of scope for M6).
+
+    `posting_date` (docs/M23A_POLICY.md Section 3.5): always today, like
+    every other compensating entry in this module
+    (`post_supplier_payment_reversal_journal`,
+    `post_supplier_credit_note_reversal_journal`,
+    `post_payroll_reversal_journal`) — never the original invoice's date.
+    This was the one correction mechanism in this codebase that diverged
+    from that pattern; M23 discovery found no reason for the divergence,
+    and M23A resolved it: a void that reused the original date became
+    impossible to perform once that date's period was closed, silently
+    turning ordinary period locking into an unintended block on a
+    genuinely current action. Posting at today's date still passes through
+    `_enforce_period_open` like everything else — a void is not a way to
+    post into a closed period, only a way to avoid being blocked by a
+    period that closed *after* the original posting."""
     memo = f"Void of purchase invoice {purchase_invoice.id} ({purchase_invoice.invoice_number})"
     lines = _purchase_invoice_journal_lines(
         clearing_amount=clearing_amount,
@@ -632,7 +647,7 @@ def post_purchase_invoice_void_journal(
     return _post_journal(
         db,
         store_id=purchase_invoice.store_id,
-        posting_date=purchase_invoice.invoice_date,
+        posting_date=datetime.now(UTC).date(),
         source_type="PURCHASE_INVOICE_VOID",
         source_id=purchase_invoice.id,
         memo=memo,
