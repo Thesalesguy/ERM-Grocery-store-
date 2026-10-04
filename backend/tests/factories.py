@@ -12,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.security import hash_password
+from app.modules.accounting_entities.service import get_default_accounting_entity
 from app.modules.auth.models import Role, Store, User, UserRole
 from app.modules.products.models import Product, ProductCategory
 from app.modules.purchasing.models import PurchaseOrder, Supplier
@@ -26,7 +27,18 @@ def unique_suffix() -> str:
 
 
 def make_store(db: Session, **overrides) -> Store:
-    defaults = dict(name=f"Store {unique_suffix()}", timezone="UTC", is_active=True)
+    """Every store must belong to an AccountingEntity (M25 Phase 1,
+    docs/M24D_TECHNICAL_CONTRACT.md Section 3/4). Existing callers that
+    never heard of accounting entities continue to work unchanged -- they
+    land on the one default entity every migration backfill already
+    guarantees exists, exactly the same backward-compatibility contract
+    the migration itself provides for real production data."""
+    defaults = dict(
+        name=f"Store {unique_suffix()}",
+        timezone="UTC",
+        is_active=True,
+        accounting_entity_id=get_default_accounting_entity(db).id,
+    )
     defaults.update(overrides)
     store = Store(**defaults)
     db.add(store)

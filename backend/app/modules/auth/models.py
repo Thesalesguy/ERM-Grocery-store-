@@ -83,6 +83,16 @@ class Store(TimestampMixin, Base):
     legal_name: Mapped[str | None] = mapped_column(String(255))
     tax_registration_number: Mapped[str | None] = mapped_column(String(100))
 
+    # M25 Phase 1 (docs/M24D_TECHNICAL_CONTRACT.md Section 3/4): every
+    # store belongs to exactly one accounting entity. The migration that
+    # adds this column backfills every existing store onto one default
+    # CORPORATE_DIVISION entity before making it NOT NULL -- no existing
+    # behavior reads this column yet; it is read starting in a later M25
+    # phase to decide intra-entity vs. inter-entity transfer treatment.
+    accounting_entity_id: Mapped[int] = mapped_column(
+        ForeignKey("accounting_entities.id"), nullable=False
+    )
+
     users: Mapped[list["User"]] = relationship(back_populates="store")
 
 

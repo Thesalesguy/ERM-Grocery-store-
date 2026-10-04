@@ -11,6 +11,7 @@ from app.modules.accounting.models import (  # noqa: F401
     JournalEntry,
     JournalLine,
 )
+from app.modules.accounting_entities.models import AccountingEntity  # noqa: F401
 from app.modules.ap.models import (  # noqa: F401
     PurchaseInvoice,
     PurchaseInvoiceLine,

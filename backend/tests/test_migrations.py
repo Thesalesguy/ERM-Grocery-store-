@@ -48,6 +48,7 @@ M16_HEAD_REVISION = "4a83c462dbff"  # M16: store settings permissions
 M19_HEAD_REVISION = "3a0d50ccc909"  # M19: purchase order idempotency key
 M20_HEAD_REVISION = "9c4c5a209aa9"  # M20: fiscal integration boundary + permissions
 M22_HEAD_REVISION = "aa9ac6ad7476"  # M22: accounting_periods
+M25_PHASE1_HEAD_REVISION = "75d685966c98"  # M25 Phase 1: accounting_entities foundation
 
 
 def _alembic_config() -> Config:
@@ -142,8 +143,8 @@ def test_full_upgrade_downgrade_upgrade_cycle(migrations_db: str) -> None:
     # back-links are columns, not tables).
     assert _table_count(migrations_db) == 46
 
-    command.upgrade(cfg, "head")
-    # This jump goes all the way to the CURRENT head, not just M10 (the
+    command.upgrade(cfg, M22_HEAD_REVISION)
+    # This jump goes all the way to the M22 head, not just M10 (the
     # explicit M9_HEAD_REVISION step above was the last named checkpoint
     # before "head" is used for the rest of the chain). M10 adds fifteen
     # tables: departments, positions, employees, employment_status_periods,
@@ -171,12 +172,19 @@ def test_full_upgrade_downgrade_upgrade_cycle(migrations_db: str) -> None:
     assert _table_count(migrations_db) == 68
     assert _current_revision(migrations_db) == M22_HEAD_REVISION
 
+    command.upgrade(cfg, "head")
+    # M25 Phase 1 (docs/M24D_TECHNICAL_CONTRACT.md Section 23) adds one new
+    # table (accounting_entities; stores.accounting_entity_id is a column,
+    # not a table): 68 + 1 = 69.
+    assert _table_count(migrations_db) == 69
+    assert _current_revision(migrations_db) == M25_PHASE1_HEAD_REVISION
+
     command.downgrade(cfg, M0_REVISION)
     assert _table_count(migrations_db) == 8
 
     command.upgrade(cfg, "head")
-    assert _table_count(migrations_db) == 68
-    assert _current_revision(migrations_db) == M22_HEAD_REVISION
+    assert _table_count(migrations_db) == 69
+    assert _current_revision(migrations_db) == M25_PHASE1_HEAD_REVISION
 
 
 def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
@@ -1013,6 +1021,188 @@ def test_m14_downgrade_refuses_when_approval_data_exists(migrations_db: str) -> 
         finally:
             engine.dispose()
         command.downgrade(cfg, "base")
+
+
+def test_m25_phase1_backfills_every_existing_store_onto_one_default_entity(
+    migrations_db: str,
+) -> None:
+    """docs/M24D_TECHNICAL_CONTRACT.md Section 23: a store created BEFORE
+    this migration runs must be backfilled onto exactly one, newly
+    seeded, default CORPORATE_DIVISION entity -- proven against a real
+    pre-existing store, not just a from-scratch database."""
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M22_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            store_id = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, created_at) "
+                "VALUES ('Pre-Phase1 Store', 'UTC', true, now()) RETURNING id"
+            ).scalar_one()
+    finally:
+        engine.dispose()
+
+    command.upgrade(cfg, M25_PHASE1_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.connect() as conn:
+            entity_count = conn.exec_driver_sql(
+                "SELECT COUNT(*) FROM accounting_entities"
+            ).scalar_one()
+            default_count = conn.exec_driver_sql(
+                "SELECT COUNT(*) FROM accounting_entities WHERE is_default = true"
+            ).scalar_one()
+            null_count = conn.exec_driver_sql(
+                "SELECT COUNT(*) FROM stores WHERE accounting_entity_id IS NULL"
+            ).scalar_one()
+            store_entity_id, default_entity_id = conn.exec_driver_sql(
+                "SELECT s.accounting_entity_id, e.id FROM stores s "
+                "JOIN accounting_entities e ON e.is_default = true "
+                "WHERE s.id = %s",
+                (store_id,),
+            ).one()
+    finally:
+        engine.dispose()
+
+    assert entity_count == 1
+    assert default_count == 1
+    assert null_count == 0
+    assert store_entity_id == default_entity_id
+
+    command.downgrade(cfg, "base")
+
+
+def test_m25_phase1_downgrade_refuses_when_a_second_entity_exists(migrations_db: str) -> None:
+    """Mirrors the M7/M8/M9/M10 downgrade-guard precedents in this same
+    file: this migration's own downgrade must fail LOUDLY, before any
+    destructive step, when data exists that it cannot represent -- here,
+    a second accounting_entities row (which could only have been created
+    by a later, not-yet-downgraded M25 phase)."""
+    from sqlalchemy.exc import DBAPIError, InternalError
+
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M25_PHASE1_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                "INSERT INTO accounting_entities (name, entity_type, is_default, created_at) "
+                "VALUES ('Guard Independent', 'INDEPENDENT', false, now())"
+            )
+    finally:
+        engine.dispose()
+
+    try:
+        with pytest.raises((DBAPIError, InternalError)):
+            command.downgrade(cfg, M22_HEAD_REVISION)
+
+        assert _current_revision(migrations_db) == M25_PHASE1_HEAD_REVISION
+        assert _table_count(migrations_db) == 69
+    finally:
+        engine = create_engine(migrations_db)
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "DELETE FROM accounting_entities WHERE name = 'Guard Independent'"
+                )
+        finally:
+            engine.dispose()
+        command.downgrade(cfg, "base")
+
+
+def test_m25_phase1_downgrade_refuses_when_a_store_was_reassigned(migrations_db: str) -> None:
+    """Same guard, the other triggering condition: a store reassigned
+    off the default entity onto a (necessarily later-phase-created)
+    second entity."""
+    from sqlalchemy.exc import DBAPIError, InternalError
+
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M25_PHASE1_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            other_entity_id = conn.exec_driver_sql(
+                "INSERT INTO accounting_entities (name, entity_type, is_default, created_at) "
+                "VALUES ('Guard Reassign Target', 'INDEPENDENT', false, now()) RETURNING id"
+            ).scalar_one()
+            store_id = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, accounting_entity_id, "
+                "created_at) VALUES ('Guard Reassigned Store', 'UTC', true, %s, now()) "
+                "RETURNING id",
+                (other_entity_id,),
+            ).scalar_one()
+    finally:
+        engine.dispose()
+
+    try:
+        with pytest.raises((DBAPIError, InternalError)):
+            command.downgrade(cfg, M22_HEAD_REVISION)
+
+        assert _current_revision(migrations_db) == M25_PHASE1_HEAD_REVISION
+        assert _table_count(migrations_db) == 69
+    finally:
+        engine = create_engine(migrations_db)
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql("DELETE FROM stores WHERE id = %s", (store_id,))
+                conn.exec_driver_sql(
+                    "DELETE FROM accounting_entities WHERE id = %s", (other_entity_id,)
+                )
+        finally:
+            engine.dispose()
+        command.downgrade(cfg, "base")
+
+
+def test_m25_phase1_upgrade_downgrade_reupgrade_preserves_populated_m22_business_data(
+    migrations_db: str,
+) -> None:
+    """A purely additive foundation migration must never touch existing
+    rows -- mirrors
+    test_m11_upgrade_downgrade_reupgrade_preserves_populated_m10_business_data's
+    own discipline, applied to this migration. Downgrading past this
+    migration is safe here ONLY because no second entity/reassignment
+    exists yet in this freshly-seeded scenario (see the two guard tests
+    above for the case where it is not safe)."""
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M22_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            store_id = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, created_at) "
+                "VALUES ('M25 Phase1 Migration Test Store', 'UTC', true, now()) RETURNING id"
+            ).scalar_one()
+        with engine.connect() as conn:
+            before = conn.exec_driver_sql(
+                "SELECT id, name, timezone FROM stores WHERE id = %s", (store_id,)
+            ).one()
+    finally:
+        engine.dispose()
+
+    command.upgrade(cfg, M25_PHASE1_HEAD_REVISION)
+    command.downgrade(cfg, M22_HEAD_REVISION)
+    command.upgrade(cfg, M25_PHASE1_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.connect() as conn:
+            after = conn.exec_driver_sql(
+                "SELECT id, name, timezone FROM stores WHERE id = %s", (store_id,)
+            ).one()
+    finally:
+        engine.dispose()
+
+    assert after == before
+    command.downgrade(cfg, "base")
 
 
 def test_m12_alembic_version_privilege_revoked_on_upgrade_and_restored_on_downgrade(
