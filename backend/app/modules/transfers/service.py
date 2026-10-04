@@ -34,6 +34,7 @@ from app.modules.transfers.models import (
     InterStoreTransferLine,
     InterStoreTransferReceipt,
     InterStoreTransferReceiptItem,
+    TransferCustodyAcceptance,
 )
 
 _LEDGER_QUANTUM = Decimal("0.000001")  # matches accounting/service.py's own quantum
@@ -420,8 +421,16 @@ def ship_transfer(
 
 @dataclass(frozen=True)
 class ReceiveLineInput:
+    """M25 Phase 2 (docs/M24D_TECHNICAL_CONTRACT.md Section 5):
+    `quantity_received` means "good" (the historical name is kept —
+    see InterStoreTransferLine's docstring). `quantity_damaged`/
+    `quantity_declared_short` default to zero so every pre-Phase-2
+    caller behaves identically to before."""
+
     transfer_line_id: int
     quantity_received: Decimal
+    quantity_damaged: Decimal = Decimal("0")
+    quantity_declared_short: Decimal = Decimal("0")
 
 
 def receive_transfer(
@@ -436,12 +445,23 @@ def receive_transfer(
     notes: str | None = None,
 ) -> InterStoreTransferReceipt:
     """SHIPPED, one or more receipt events, each capped at
-    (shipped_quantity - already received) per line. Mirrors
-    receive_goods's locking/idempotency shape exactly: lock the transfer
-    header first, then every distinct DESTINATION product touched,
-    ascending id order. Uses the FROZEN unit_cost_at_shipment for the
-    destination's own WAC recompute — never the destination's current
-    WAC (Design Decision 4/9)."""
+    (shipped + damaged + declared_short already accounted for) per line.
+    Mirrors receive_goods's locking/idempotency shape exactly: lock the
+    transfer header first, then every distinct DESTINATION product
+    touched, ascending id order. Uses the FROZEN unit_cost_at_shipment
+    for the destination's own WAC recompute — never the destination's
+    current WAC (Design Decision 4/9).
+
+    M25 Phase 2 (docs/M24D_TECHNICAL_CONTRACT.md Sections 5/11): each
+    raw input line now carries good/damaged/declared-short quantities
+    instead of a single "received" quantity. Only the good quantity ever
+    moves inventory or posts to the GL — damaged/declared-short remain
+    explicit, unresolved physical-discrepancy facts recorded on the line
+    and on each InterStoreTransferReceiptItem for a later phase to
+    consume; nothing here writes them off or attributes responsibility.
+    The receiving action itself is this line's custody acceptance: one
+    immutable TransferCustodyAcceptance row is created per receipt event,
+    in the same transaction, never on the idempotent-replay fast path."""
     existing = db.execute(
         select(InterStoreTransferReceipt).where(
             InterStoreTransferReceipt.client_transaction_id == client_transaction_id
@@ -455,9 +475,19 @@ def receive_transfer(
             "A transfer receipt must have at least one line", error_code="EMPTY_RECEIPT"
         )
     for line in lines:
-        if line.quantity_received <= 0:
+        if (
+            line.quantity_received < 0
+            or line.quantity_damaged < 0
+            or line.quantity_declared_short < 0
+        ):
             raise ValidationAppError(
-                "Received quantity must be positive", error_code="INVALID_QUANTITY"
+                "Quantities must not be negative", error_code="INVALID_QUANTITY"
+            )
+        if line.quantity_received + line.quantity_damaged + line.quantity_declared_short <= 0:
+            raise ValidationAppError(
+                "At least one of quantity_received, quantity_damaged, "
+                "quantity_declared_short must be positive",
+                error_code="INVALID_QUANTITY",
             )
 
     transfer = db.execute(
@@ -482,35 +512,47 @@ def receive_transfer(
             error_code="INVALID_TRANSFER_STATE",
         )
 
-    requested_by_line: dict[int, Decimal] = {}
+    # Aggregated per transfer_line_id, across every raw input line in
+    # this request — (good, damaged, declared_short).
+    by_line: dict[int, tuple[Decimal, Decimal, Decimal]] = {}
     for line in lines:
-        requested_by_line[line.transfer_line_id] = (
-            requested_by_line.get(line.transfer_line_id, Decimal("0")) + line.quantity_received
+        good, damaged, short = by_line.get(
+            line.transfer_line_id, (Decimal("0"), Decimal("0"), Decimal("0"))
+        )
+        by_line[line.transfer_line_id] = (
+            good + line.quantity_received,
+            damaged + line.quantity_damaged,
+            short + line.quantity_declared_short,
         )
 
-    line_ids = set(requested_by_line)
+    line_ids = set(by_line)
     db_lines = {
         line.id: line
         for line in db.execute(
             select(InterStoreTransferLine).where(InterStoreTransferLine.id.in_(line_ids))
         ).scalars()
     }
-    for transfer_line_id, requested_qty in requested_by_line.items():
+    for transfer_line_id, (good, damaged, short) in by_line.items():
         db_line = db_lines.get(transfer_line_id)
         if db_line is None or db_line.transfer_id != transfer_id:
             raise NotFoundError(
                 f"Transfer line {transfer_line_id} not found on transfer {transfer_id}"
             )
-        remaining = db_line.shipped_quantity - db_line.received_quantity
-        if requested_qty > remaining:
+        already_accounted = (
+            db_line.received_quantity + db_line.damaged_quantity + db_line.declared_short_quantity
+        )
+        remaining = db_line.shipped_quantity - already_accounted
+        event_total = good + damaged + short
+        if event_total > remaining:
             raise ConflictError(
-                f"Cannot receive {requested_qty} of line {transfer_line_id}: only "
-                f"{remaining} remains unreceived (of {db_line.shipped_quantity} shipped)",
+                f"Cannot record {event_total} (good+damaged+short) against line "
+                f"{transfer_line_id}: only {remaining} remains unaccounted for (of "
+                f"{db_line.shipped_quantity} shipped)",
                 error_code="OVER_RECEIPT",
             )
 
     distinct_destination_product_ids = sorted(
-        {db_lines[line_id].destination_product_id for line_id in requested_by_line}
+        {db_lines[line_id].destination_product_id for line_id in by_line}
     )
     locked_products = {
         product_id: inventory_service.lock_product_for_update(db, product_id)
@@ -548,37 +590,40 @@ def receive_transfer(
         # unit_cost_at_shipment before advancing the transfer to SHIPPED.
         assert db_line.unit_cost_at_shipment is not None
         unit_cost = db_line.unit_cost_at_shipment
-        new_wac = inventory_service.compute_new_wac(
-            existing_qty=product.current_qty_on_hand,
-            existing_wac=product.current_cost,
-            received_qty=line.quantity_received,
-            received_unit_cost=unit_cost,
-        )
-        inventory_service.record_movement(
-            db,
-            product=product,
-            store_id=transfer.to_store_id,
-            movement_type="TRANSFER_IN",
-            quantity_delta=line.quantity_received,
-            unit_cost_at_movement=unit_cost,
-            reference_type="inter_store_transfer",
-            reference_id=transfer.id,
-            created_by=received_by,
-            new_product_cost=new_wac,
-        )
-        total_received_value += _quantize(line.quantity_received * unit_cost)
+        if line.quantity_received > 0:
+            new_wac = inventory_service.compute_new_wac(
+                existing_qty=product.current_qty_on_hand,
+                existing_wac=product.current_cost,
+                received_qty=line.quantity_received,
+                received_unit_cost=unit_cost,
+            )
+            inventory_service.record_movement(
+                db,
+                product=product,
+                store_id=transfer.to_store_id,
+                movement_type="TRANSFER_IN",
+                quantity_delta=line.quantity_received,
+                unit_cost_at_movement=unit_cost,
+                reference_type="inter_store_transfer",
+                reference_id=transfer.id,
+                created_by=received_by,
+                new_product_cost=new_wac,
+            )
+            total_received_value += _quantize(line.quantity_received * unit_cost)
         db.add(
             InterStoreTransferReceiptItem(
                 inter_store_transfer_receipt_id=receipt.id,
                 inter_store_transfer_line_id=line.transfer_line_id,
                 quantity_received=line.quantity_received,
+                quantity_damaged=line.quantity_damaged,
+                quantity_declared_short=line.quantity_declared_short,
             )
         )
 
-    for transfer_line_id, requested_qty in requested_by_line.items():
-        db_lines[transfer_line_id].received_quantity = (
-            db_lines[transfer_line_id].received_quantity + requested_qty
-        )
+    for transfer_line_id, (good, damaged, short) in by_line.items():
+        db_lines[transfer_line_id].received_quantity += good
+        db_lines[transfer_line_id].damaged_quantity += damaged
+        db_lines[transfer_line_id].declared_short_quantity += short
 
     audit_service.log_event(
         db,
@@ -590,6 +635,35 @@ def receive_transfer(
             "transfer_id": transfer_id,
             "line_count": len(lines),
             "received_value": str(total_received_value),
+            "total_damaged": str(sum((d for _, d, _ in by_line.values()), Decimal("0"))),
+            "total_declared_short": str(sum((s for _, _, s in by_line.values()), Decimal("0"))),
+        },
+    )
+
+    # M25 Phase 2 custody acceptance (docs/M24D_TECHNICAL_CONTRACT.md
+    # Section 11): one immutable row per receiving event, same
+    # transaction, never created on the idempotent-replay path above.
+    custody_acceptance = TransferCustodyAcceptance(
+        transfer_id=transfer_id,
+        inter_store_transfer_receipt_id=receipt.id,
+        store_id=transfer.to_store_id,
+        accepted_by=received_by,
+        accepted_at=datetime.now(UTC),
+        is_digital_acknowledgment=True,
+    )
+    db.add(custody_acceptance)
+    db.flush()
+    audit_service.log_event(
+        db,
+        user_id=received_by,
+        action="TRANSFER_CUSTODY_ACCEPTED",
+        entity_type="inter_store_transfer_custody_acceptance",
+        entity_id=custody_acceptance.id,
+        after={
+            "transfer_id": transfer_id,
+            "inter_store_transfer_receipt_id": receipt.id,
+            "store_id": transfer.to_store_id,
+            "accepted_by": received_by,
         },
     )
 

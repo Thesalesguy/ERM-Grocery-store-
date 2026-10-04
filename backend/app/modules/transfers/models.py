@@ -18,6 +18,7 @@ from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     Date,
     DateTime,
@@ -93,8 +94,19 @@ class InterStoreTransferLine(TimestampMixin, Base):
             "shipped_quantity >= 0 AND shipped_quantity <= requested_quantity",
             name="ck_inter_store_transfer_lines_shipped_bounds",
         ),
+        # M25 Phase 2 (docs/M24D_TECHNICAL_CONTRACT.md Section 5): the
+        # single-table proxy for the quantity-ledger identity -- every
+        # unit shipped is eventually good, damaged, declared short, or
+        # still outstanding (remaining_in_transit, never stored --
+        # derived as shipped_quantity minus the other three, the same
+        # "don't store a redundant derived fact" rule RECEIVED already
+        # follows). received_quantity's historical name is kept
+        # unchanged; it means "good" as of this phase.
         CheckConstraint(
-            "received_quantity >= 0 AND received_quantity <= shipped_quantity",
+            "received_quantity >= 0 AND damaged_quantity >= 0 AND "
+            "declared_short_quantity >= 0 AND "
+            "(received_quantity + damaged_quantity + declared_short_quantity) <= "
+            "shipped_quantity",
             name="ck_inter_store_transfer_lines_received_bounds",
         ),
         Index("ix_inter_store_transfer_lines_transfer_id", "transfer_id"),
@@ -108,7 +120,20 @@ class InterStoreTransferLine(TimestampMixin, Base):
     destination_product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), nullable=False)
     requested_quantity: Mapped[Decimal] = mapped_column(Numeric(14, 3), nullable=False)
     shipped_quantity: Mapped[Decimal] = mapped_column(Numeric(14, 3), nullable=False, default=0)
+    # "Good" quantity received to date, across every receipt event for
+    # this line (M25 Phase 2: the column name predates the
+    # good/damaged/short split and is kept for compatibility -- see
+    # docs/M24D_TECHNICAL_CONTRACT.md Section 3.1).
     received_quantity: Mapped[Decimal] = mapped_column(Numeric(14, 3), nullable=False, default=0)
+    # New in M25 Phase 2: cumulative damaged/declared-short quantity
+    # across every receipt event for this line. Neither creates an
+    # inventory movement or a GL posting here -- both remain explicit,
+    # unresolved physical-discrepancy facts for a later phase to
+    # consume (Section 5/9 -- no write-off, no vendor claim yet).
+    damaged_quantity: Mapped[Decimal] = mapped_column(Numeric(14, 3), nullable=False, default=0)
+    declared_short_quantity: Mapped[Decimal] = mapped_column(
+        Numeric(14, 3), nullable=False, default=0
+    )
     # Frozen at ship time from the SOURCE product's current_cost — never
     # recomputed from the destination's WAC (Design Decision 4/9). NULL
     # until shipped.
@@ -135,13 +160,25 @@ class InterStoreTransferReceipt(TimestampMixin, Base):
 
     transfer: Mapped[InterStoreTransfer] = relationship(back_populates="receipts")
     items: Mapped[list["InterStoreTransferReceiptItem"]] = relationship(back_populates="receipt")
+    custody_acceptance: Mapped["TransferCustodyAcceptance | None"] = relationship(
+        back_populates="receipt", uselist=False
+    )
 
 
 class InterStoreTransferReceiptItem(TimestampMixin, Base):
     __tablename__ = "inter_store_transfer_receipt_items"
     __table_args__ = (
+        # M25 Phase 2: a single raw input line may now record any mix of
+        # good/damaged/declared-short, as long as at least one is
+        # positive (an all-zero line is rejected as malformed before it
+        # ever reaches here -- see transfers/service.py). Individually
+        # non-negative so neither a damage-only nor a shortage-only
+        # receiving event is blocked.
         CheckConstraint(
-            "quantity_received > 0", name="ck_inter_store_transfer_receipt_items_qty_positive"
+            "quantity_received >= 0 AND quantity_damaged >= 0 AND "
+            "quantity_declared_short >= 0 AND "
+            "(quantity_received + quantity_damaged + quantity_declared_short) > 0",
+            name="ck_inter_store_transfer_receipt_items_qty_positive",
         ),
         Index(
             "ix_inter_store_transfer_receipt_items_receipt_id",
@@ -157,6 +194,57 @@ class InterStoreTransferReceiptItem(TimestampMixin, Base):
     inter_store_transfer_line_id: Mapped[int] = mapped_column(
         ForeignKey("inter_store_transfer_lines.id"), nullable=False
     )
-    quantity_received: Mapped[Decimal] = mapped_column(Numeric(14, 3), nullable=False)
+    # "Good" quantity for this specific receiving event/line (see
+    # InterStoreTransferLine.received_quantity's docstring for the name).
+    quantity_received: Mapped[Decimal] = mapped_column(Numeric(14, 3), nullable=False, default=0)
+    quantity_damaged: Mapped[Decimal] = mapped_column(Numeric(14, 3), nullable=False, default=0)
+    quantity_declared_short: Mapped[Decimal] = mapped_column(
+        Numeric(14, 3), nullable=False, default=0
+    )
 
     receipt: Mapped[InterStoreTransferReceipt] = relationship(back_populates="items")
+
+
+class TransferCustodyAcceptance(TimestampMixin, Base):
+    """M25 Phase 2 (docs/M24D_TECHNICAL_CONTRACT.md Section 11): the
+    immutable, digital custody-acceptance record for one receiving event.
+    Created in the SAME transaction as the InterStoreTransferReceipt it
+    belongs to -- the receiving action itself IS the custody acceptance
+    (no separate "sign now, count later" step exists in this design; see
+    Section 11 for why). This record is the operative boundary a later
+    phase uses to distinguish loss attribution before vs. after
+    destination custody.
+
+    Not a legally compliant electronic signature -- an internal ERP
+    custody acknowledgment only (the authenticated receiving user's
+    identity, action, and timestamp), unless a future requirement
+    explicitly establishes legal-signature functionality.
+
+    UPDATE/DELETE are revoked from the application runtime role in the
+    migration, the same carve-out journal_entries/accounting_periods use,
+    since this is evidentiary, append-only history.
+    """
+
+    __tablename__ = "inter_store_transfer_custody_acceptances"
+    __table_args__ = (
+        UniqueConstraint(
+            "inter_store_transfer_receipt_id",
+            name="uq_inter_store_transfer_custody_acceptances_receipt_id",
+        ),
+        Index(
+            "ix_inter_store_transfer_custody_acceptances_transfer_id",
+            "transfer_id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    transfer_id: Mapped[int] = mapped_column(ForeignKey("inter_store_transfers.id"), nullable=False)
+    inter_store_transfer_receipt_id: Mapped[int] = mapped_column(
+        ForeignKey("inter_store_transfer_receipts.id"), nullable=False
+    )
+    store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), nullable=False)
+    accepted_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    accepted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    is_digital_acknowledgment: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    receipt: Mapped[InterStoreTransferReceipt] = relationship(back_populates="custody_acceptance")

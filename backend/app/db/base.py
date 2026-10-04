@@ -85,4 +85,5 @@ from app.modules.transfers.models import (  # noqa: F401
     InterStoreTransferLine,
     InterStoreTransferReceipt,
     InterStoreTransferReceiptItem,
+    TransferCustodyAcceptance,
 )
