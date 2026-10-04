@@ -25,6 +25,7 @@ from app.modules.accounting.models import AccountingPeriod, JournalEntry
 from app.modules.ap.models import PurchaseInvoice, SupplierCreditNote, SupplierPayment
 from app.modules.audit.models import AuditLog
 from app.modules.auth.models import Store, User
+from app.modules.discrepancies.models import ReceivingDiscrepancy
 from app.modules.hr.models import AttendanceRecord, EmploymentAssignment
 from app.modules.inventory.models import StockAdjustment, StockCount, StockCountLine
 from app.modules.payroll.models import PayrollPeriod
@@ -116,6 +117,11 @@ _DIRECT_STORE_ENTITY_MODELS: dict[str, Any] = {
     # M22 (docs/M22_DISCOVERY.md Phase 2): AccountingPeriod has its own
     # store_id column directly, same shape as CashierShift above.
     "accounting_period": AccountingPeriod,
+    # M25 Phase 3 (docs/M24D_TECHNICAL_CONTRACT.md Section 12):
+    # ReceivingDiscrepancy.store_id is the destination store where the
+    # discrepancy was discovered -- same direct-model shape as
+    # CashierShift/AccountingPeriod above.
+    "receiving_discrepancy": ReceivingDiscrepancy,
 }
 
 # entity_type -> (model, column_a, column_b): matches if EITHER column

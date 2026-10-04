@@ -110,6 +110,17 @@ INVENTORY_COUNT_POST = "inventory.count.post"
 INVENTORY_TRANSFER_WRITE = "inventory.transfer.write"
 INVENTORY_TRANSFER_SHIP = "inventory.transfer.ship"
 INVENTORY_TRANSFER_RECEIVE = "inventory.transfer.receive"
+# M25 Phase 3 (docs/M24D_TECHNICAL_CONTRACT.md Section 10.3): claiming a
+# RECORDED discrepancy for investigation, and resolving one, sit at the
+# same tier that already holds inventory.transfer.write — "investigation/
+# correction sits at the same or a slightly heavier tier than the routine
+# write permission" (the contract's own stated pattern, matching how
+# count.review/count.post already sit alongside count.write). One code
+# covers both the investigate and resolve transitions: Phase 3 records a
+# finding only (no approval tiers exist yet — those arrive with the
+# write-off authority of a later phase), so there is no basis yet for
+# splitting them the way AP's write/post/pay split is.
+INVENTORY_TRANSFER_DISCREPANCY_INVESTIGATE = "inventory.transfer.discrepancy.investigate"
 # M9 (docs/M9_SUPPLY_CHAIN_DESIGN.md "design answer #19"): four tiers
 # mirroring the count/transfer split — read is separate from plan
 # (generating recommendations is inventory-adjacent data work, not a
@@ -269,6 +280,9 @@ ALL_PERMISSIONS: dict[str, str] = {
     INVENTORY_TRANSFER_WRITE: "Create and cancel a draft inter-store transfer",
     INVENTORY_TRANSFER_SHIP: "Ship an inter-store transfer from its source store",
     INVENTORY_TRANSFER_RECEIVE: "Receive an inter-store transfer at its destination store",
+    INVENTORY_TRANSFER_DISCREPANCY_INVESTIGATE: (
+        "Claim a recorded receiving discrepancy for investigation and record its resolution"
+    ),
     SUPPLY_CHAIN_READ: "View replenishment plans, supplier catalog, and supply-chain metrics",
     SUPPLY_CHAIN_PLAN: "Generate replenishment recommendations and cancel a plan",
     SUPPLY_CHAIN_APPROVE: "Approve a replenishment recommendation",
@@ -352,6 +366,7 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         INVENTORY_TRANSFER_WRITE,
         INVENTORY_TRANSFER_SHIP,
         INVENTORY_TRANSFER_RECEIVE,
+        INVENTORY_TRANSFER_DISCREPANCY_INVESTIGATE,
         SUPPLY_CHAIN_READ,
         SUPPLY_CHAIN_PLAN,
         SUPPLY_CHAIN_APPROVE,
@@ -417,6 +432,7 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
         INVENTORY_TRANSFER_WRITE,
         INVENTORY_TRANSFER_SHIP,
         INVENTORY_TRANSFER_RECEIVE,
+        INVENTORY_TRANSFER_DISCREPANCY_INVESTIGATE,
         SUPPLY_CHAIN_READ,
         SUPPLY_CHAIN_PLAN,
     ],

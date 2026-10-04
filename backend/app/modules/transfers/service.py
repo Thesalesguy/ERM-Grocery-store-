@@ -26,6 +26,7 @@ from app.modules.accounting import service as accounting_service
 from app.modules.accounting.constants import ACCOUNT_INVENTORY_IN_TRANSIT
 from app.modules.audit import service as audit_service
 from app.modules.auth.models import Store
+from app.modules.discrepancies import service as discrepancy_service
 from app.modules.inventory import service as inventory_service
 from app.modules.products.models import Product
 from app.modules.transfers.models import (
@@ -582,6 +583,7 @@ def receive_transfer(
         return winner
 
     total_received_value = Decimal("0")
+    created_items: list[tuple[InterStoreTransferReceiptItem, ReceiveLineInput]] = []
     for line in lines:
         db_line = db_lines[line.transfer_line_id]
         product = locked_products[db_line.destination_product_id]
@@ -610,14 +612,37 @@ def receive_transfer(
                 new_product_cost=new_wac,
             )
             total_received_value += _quantize(line.quantity_received * unit_cost)
-        db.add(
-            InterStoreTransferReceiptItem(
-                inter_store_transfer_receipt_id=receipt.id,
-                inter_store_transfer_line_id=line.transfer_line_id,
-                quantity_received=line.quantity_received,
-                quantity_damaged=line.quantity_damaged,
-                quantity_declared_short=line.quantity_declared_short,
-            )
+        item = InterStoreTransferReceiptItem(
+            inter_store_transfer_receipt_id=receipt.id,
+            inter_store_transfer_line_id=line.transfer_line_id,
+            quantity_received=line.quantity_received,
+            quantity_damaged=line.quantity_damaged,
+            quantity_declared_short=line.quantity_declared_short,
+        )
+        db.add(item)
+        created_items.append((item, line))
+
+    # M25 Phase 3 (docs/M24D_TECHNICAL_CONTRACT.md Section 12): flush to
+    # obtain each item's id, then turn any nonzero damaged/declared-short
+    # item into an explicit, unresolved ReceivingDiscrepancy -- in the
+    # SAME transaction, never on the idempotent-replay path above. This
+    # creates no inventory movement and no GL posting of its own.
+    db.flush()
+    for item, line in created_items:
+        db_line = db_lines[line.transfer_line_id]
+        assert db_line.unit_cost_at_shipment is not None
+        discrepancy_service.create_discrepancy_for_receipt_item(
+            db,
+            receipt_item_id=item.id,
+            transfer_id=transfer_id,
+            product_id=db_line.destination_product_id,
+            store_id=transfer.to_store_id,
+            counterparty_store_id=transfer.from_store_id,
+            quantity_short=line.quantity_declared_short,
+            quantity_damaged=line.quantity_damaged,
+            unit_cost=db_line.unit_cost_at_shipment,
+            raised_by=received_by,
+            raised_at=datetime.now(UTC),
         )
 
     for transfer_line_id, (good, damaged, short) in by_line.items():

@@ -13,6 +13,7 @@ from app.api.v1.endpoints import (
     ap,
     audit,
     auth,
+    discrepancies,
     fiscal,
     hr,
     inventory,
@@ -37,6 +38,7 @@ api_router.include_router(purchasing.router)
 api_router.include_router(accounting.router)
 api_router.include_router(ap.router)
 api_router.include_router(transfers.router)
+api_router.include_router(discrepancies.router)
 api_router.include_router(replenishment.router)
 api_router.include_router(hr.router)
 api_router.include_router(payroll.router)
