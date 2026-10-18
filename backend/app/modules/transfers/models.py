@@ -109,6 +109,17 @@ class InterStoreTransferLine(TimestampMixin, Base):
             "shipped_quantity",
             name="ck_inter_store_transfer_lines_received_bounds",
         ),
+        # M25 Phase 4 (docs/M24D_TECHNICAL_CONTRACT.md Section 5/20): a
+        # write-off is a SUBSET of the damaged/short bucket, not an
+        # additional disjoint physical quantity -- bounded against
+        # (damaged_quantity + declared_short_quantity), never against
+        # shipped_quantity directly, to avoid double-counting against the
+        # existing bounds check above.
+        CheckConstraint(
+            "written_off_quantity >= 0 AND written_off_quantity <= "
+            "(damaged_quantity + declared_short_quantity)",
+            name="ck_inter_store_transfer_lines_written_off_bounds",
+        ),
         Index("ix_inter_store_transfer_lines_transfer_id", "transfer_id"),
         Index("ix_inter_store_transfer_lines_source_product_id", "source_product_id"),
         Index("ix_inter_store_transfer_lines_destination_product_id", "destination_product_id"),
@@ -134,6 +145,15 @@ class InterStoreTransferLine(TimestampMixin, Base):
     declared_short_quantity: Mapped[Decimal] = mapped_column(
         Numeric(14, 3), nullable=False, default=0
     )
+    # New in M25 Phase 4 (docs/M24D_TECHNICAL_CONTRACT.md Section 5):
+    # cumulative quantity from this line's damaged/declared-short bucket
+    # that has since been POSTED as an approved write-off
+    # (writeoffs.TransferWriteOff). Used by
+    # transfers.service.inventory_in_transit_reconciliation to keep the
+    # derived Inventory-In-Transit reconciliation in agreement with the
+    # GL credit a write-off posts -- see that function for the exact
+    # formula. Never decremented except by a write-off reversal.
+    written_off_quantity: Mapped[Decimal] = mapped_column(Numeric(14, 3), nullable=False, default=0)
     # Frozen at ship time from the SOURCE product's current_cost — never
     # recomputed from the destination's WAC (Design Decision 4/9). NULL
     # until shipped.

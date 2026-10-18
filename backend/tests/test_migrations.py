@@ -52,6 +52,8 @@ M25_PHASE1_HEAD_REVISION = "75d685966c98"  # M25 Phase 1: accounting_entities fo
 M25_PHASE2_HEAD_REVISION = "b628fc058834"  # M25 Phase 2: extended receiving + custody acceptance
 M25_PHASE3_SCHEMA_REVISION = "c1a2b3d4e5f6"  # M25 Phase 3: receiving_discrepancies table
 M25_PHASE3_HEAD_REVISION = "d2b3c4e5f6a7"  # M25 Phase 3: + discrepancy.investigate permission
+M25_PHASE4_SCHEMA_REVISION = "a1b2c3d4e5f6"  # M25 Phase 4: write-off/approval tables + column
+M25_PHASE4_HEAD_REVISION = "b2c3d4e5f6a7"  # M25 Phase 4: + Regional Manager role + permissions
 
 
 def _alembic_config() -> Config:
@@ -191,7 +193,7 @@ def test_full_upgrade_downgrade_upgrade_cycle(migrations_db: str) -> None:
     assert _table_count(migrations_db) == 70
     assert _current_revision(migrations_db) == M25_PHASE2_HEAD_REVISION
 
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, M25_PHASE3_HEAD_REVISION)
     # M25 Phase 3 (docs/M24D_TECHNICAL_CONTRACT.md Sections 3.1/12/16/17)
     # adds one new table (receiving_discrepancies): 70 + 1 = 71. The
     # second migration in this phase seeds one permission row -- data,
@@ -199,12 +201,23 @@ def test_full_upgrade_downgrade_upgrade_cycle(migrations_db: str) -> None:
     assert _table_count(migrations_db) == 71
     assert _current_revision(migrations_db) == M25_PHASE3_HEAD_REVISION
 
+    command.upgrade(cfg, "head")
+    # M25 Phase 4 (docs/M24D_TECHNICAL_CONTRACT.md Sections 3.1/5/6.2/10/20)
+    # adds three new tables (approval_policy_rules, transfer_write_offs,
+    # write_off_approvals): 71 + 3 = 74. The new
+    # inter_store_transfer_lines.written_off_quantity column and the
+    # widened ck_journal_entries_source_type CHECK are not tables. The
+    # second migration in this phase seeds one role + three permission
+    # rows -- data, not tables -- so the count is unchanged by it.
+    assert _table_count(migrations_db) == 74
+    assert _current_revision(migrations_db) == M25_PHASE4_HEAD_REVISION
+
     command.downgrade(cfg, M0_REVISION)
     assert _table_count(migrations_db) == 8
 
     command.upgrade(cfg, "head")
-    assert _table_count(migrations_db) == 71
-    assert _current_revision(migrations_db) == M25_PHASE3_HEAD_REVISION
+    assert _table_count(migrations_db) == 74
+    assert _current_revision(migrations_db) == M25_PHASE4_HEAD_REVISION
 
 
 def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
@@ -219,7 +232,9 @@ def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
             permission_count = conn.exec_driver_sql("SELECT count(*) FROM permissions").scalar_one()
     finally:
         engine.dispose()
-    assert role_count == 6
+    # M25 Phase 4 adds one new role (Regional Manager) on top of the
+    # prior 6 = 7.
+    assert role_count == 7
     # M14 adds one new permission (sales.return.approve) on top of M12's
     # 44 = 45. M15 adds three more (shift.manage, shift.read,
     # shift.override) = 48. The pre-M15 hardening migration adds no
@@ -227,8 +242,10 @@ def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
     # then two more (store.settings.read, store.settings.write) = 51.
     # M20 adds three more (fiscal.read, fiscal.config.write,
     # fiscal.retry) = 54. M25 Phase 3 adds one more
-    # (inventory.transfer.discrepancy.investigate) = 55.
-    assert permission_count == 55
+    # (inventory.transfer.discrepancy.investigate) = 55. M25 Phase 4
+    # adds three more (inventory.transfer.writeoff.initiate/.approve/
+    # .reverse) = 58.
+    assert permission_count == 58
 
 
 def test_m4_downgrade_refuses_when_journal_entries_exist(migrations_db: str) -> None:
@@ -1698,6 +1715,265 @@ def test_m25_phase3_permission_seeded_and_removed_on_downgrade(migrations_db: st
     finally:
         engine.dispose()
     assert exists_after == 0
+
+    command.downgrade(cfg, "base")
+
+
+def test_m25_phase4_downgrade_refuses_when_write_off_rows_exist(migrations_db: str) -> None:
+    """Mirrors test_m25_phase3_downgrade_refuses_when_discrepancy_rows_exist:
+    a1b2c3d4e5f6's downgrade must refuse, before any destructive step,
+    when a transfer_write_offs row exists -- the pre-Phase-4 schema has
+    no table for it at all."""
+    from sqlalchemy.exc import DBAPIError, InternalError
+
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M25_PHASE4_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            store_id = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, accounting_entity_id, "
+                "created_at) VALUES ('P4 Guard Store', 'UTC', true, "
+                "(SELECT id FROM accounting_entities WHERE is_default = true), now()) "
+                "RETURNING id"
+            ).scalar_one()
+            other_store_id = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, accounting_entity_id, "
+                "created_at) VALUES ('P4 Guard Store 2', 'UTC', true, "
+                "(SELECT id FROM accounting_entities WHERE is_default = true), now()) "
+                "RETURNING id"
+            ).scalar_one()
+            category_id = conn.exec_driver_sql(
+                "INSERT INTO product_categories (name, is_active, created_at) "
+                "VALUES ('P4 Guard Cat', true, now()) RETURNING id"
+            ).scalar_one()
+            product_id = conn.exec_driver_sql(
+                "INSERT INTO products (store_id, category_id, sku, name, unit_of_measure, "
+                "is_weighed, current_price, current_cost, current_qty_on_hand, "
+                "allow_negative_stock, is_active, created_at) VALUES "
+                f"({store_id}, {category_id}, 'SKU-P4-GUARD', 'P4 Guard Product', 'each', "
+                "false, 9.99, 4.00, 0, false, true, now()) RETURNING id"
+            ).scalar_one()
+            user_id = conn.exec_driver_sql(
+                "INSERT INTO users (username, email, password_hash, full_name, is_active, "
+                "created_at) VALUES ('p4guard', 'p4guard@example.com', 'x', 'P4 Guard', "
+                "true, now()) RETURNING id"
+            ).scalar_one()
+            role_id = conn.exec_driver_sql("SELECT id FROM roles WHERE name = 'Admin'").scalar_one()
+            transfer_id = conn.exec_driver_sql(
+                "INSERT INTO inter_store_transfers (from_store_id, to_store_id, "
+                "transfer_number, status, requested_date, created_at) VALUES "
+                f"({store_id}, {other_store_id}, 'TR-P4-GUARD', 'SHIPPED', '2024-01-01', "
+                "now()) RETURNING id"
+            ).scalar_one()
+            line_id = conn.exec_driver_sql(
+                "INSERT INTO inter_store_transfer_lines (transfer_id, source_product_id, "
+                "destination_product_id, requested_quantity, shipped_quantity, "
+                "received_quantity, damaged_quantity, declared_short_quantity, "
+                "written_off_quantity, unit_cost_at_shipment, created_at) VALUES "
+                f"({transfer_id}, {product_id}, {product_id}, 10, 10, 0, 10, 0, 0, 4.00, "
+                "now()) RETURNING id"
+            ).scalar_one()
+            discrepancy_id = conn.exec_driver_sql(
+                "INSERT INTO receiving_discrepancies (source_type, source_id, transfer_id, "
+                "product_id, store_id, counterparty_store_id, discrepancy_type, "
+                "quantity_short, quantity_damaged, unit_cost, status, resolved_by, "
+                "resolved_at, resolution_type, resolution_notes, raised_at, created_at) "
+                f"VALUES ('TRANSFER_RECEIPT', 1, {transfer_id}, {product_id}, {other_store_id}, "
+                f"{store_id}, 'DAMAGE', 0, 10, 4.00, 'RESOLVED', {user_id}, now(), "
+                "'SOURCE_STORE_CAUSED', 'guard test', now(), now()) RETURNING id"
+            ).scalar_one()
+            write_off_id = conn.exec_driver_sql(
+                "INSERT INTO transfer_write_offs (transfer_id, transfer_line_id, "
+                "discrepancy_id, quantity, unit_cost, amount, store_id, reason, "
+                "initiated_by, initiated_at, required_role_id, status, "
+                "client_transaction_id, created_at) VALUES "
+                f"({transfer_id}, {line_id}, {discrepancy_id}, 10, 4.00, 40.00, {store_id}, "
+                f"'guard test', {user_id}, now(), {role_id}, 'PENDING_APPROVAL', "
+                "'ctxn-p4-guard', now()) RETURNING id"
+            ).scalar_one()
+    finally:
+        engine.dispose()
+
+    try:
+        with pytest.raises((DBAPIError, InternalError)):
+            command.downgrade(cfg, M25_PHASE3_HEAD_REVISION)
+
+        assert _current_revision(migrations_db) == M25_PHASE4_HEAD_REVISION
+        assert _table_count(migrations_db) == 74
+    finally:
+        engine = create_engine(migrations_db)
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "DELETE FROM transfer_write_offs WHERE id = %s", (write_off_id,)
+                )
+                conn.exec_driver_sql(
+                    "DELETE FROM receiving_discrepancies WHERE id = %s", (discrepancy_id,)
+                )
+                conn.exec_driver_sql(
+                    "DELETE FROM inter_store_transfer_lines WHERE id = %s", (line_id,)
+                )
+                conn.exec_driver_sql(
+                    "DELETE FROM inter_store_transfers WHERE id = %s", (transfer_id,)
+                )
+                conn.exec_driver_sql("DELETE FROM products WHERE id = %s", (product_id,))
+                conn.exec_driver_sql("DELETE FROM product_categories WHERE id = %s", (category_id,))
+                conn.exec_driver_sql("DELETE FROM users WHERE id = %s", (user_id,))
+                conn.exec_driver_sql(
+                    "DELETE FROM stores WHERE id IN (%s, %s)", (store_id, other_store_id)
+                )
+        finally:
+            engine.dispose()
+        command.downgrade(cfg, "base")
+
+
+def test_m25_phase4_upgrade_downgrade_reupgrade_preserves_populated_phase3_data(
+    migrations_db: str,
+) -> None:
+    """A purely additive extension must never touch existing rows --
+    mirrors the M25 Phase 1/Phase 2/Phase 3 equivalent tests, applied to
+    this migration."""
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M25_PHASE3_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            store_id = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, accounting_entity_id, "
+                "created_at) VALUES ('P4 Migration Test Store', 'UTC', true, "
+                "(SELECT id FROM accounting_entities WHERE is_default = true), now()) "
+                "RETURNING id"
+            ).scalar_one()
+        with engine.connect() as conn:
+            before = conn.exec_driver_sql(
+                "SELECT id, name, timezone FROM stores WHERE id = %s", (store_id,)
+            ).one()
+    finally:
+        engine.dispose()
+
+    command.upgrade(cfg, M25_PHASE4_HEAD_REVISION)
+    command.downgrade(cfg, M25_PHASE3_HEAD_REVISION)
+    command.upgrade(cfg, M25_PHASE4_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.connect() as conn:
+            after = conn.exec_driver_sql(
+                "SELECT id, name, timezone FROM stores WHERE id = %s", (store_id,)
+            ).one()
+    finally:
+        engine.dispose()
+
+    assert after == before
+    command.downgrade(cfg, "base")
+
+
+def test_m25_phase4_rbac_seeded_and_removed_on_downgrade(migrations_db: str) -> None:
+    """The dedicated RBAC-seed migration (b2c3d4e5f6a7) creates the
+    Regional Manager role and grants the three new write-off permissions
+    to exactly the right roles, and its downgrade removes the role,
+    permissions, and grants cleanly -- mirrors
+    test_m25_phase3_permission_seeded_and_removed_on_downgrade exactly
+    (including the same "M2's seed migration reads live Python data"
+    nuance noted there)."""
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M25_PHASE4_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.connect() as conn:
+            assert (
+                conn.exec_driver_sql(
+                    "SELECT COUNT(*) FROM roles WHERE name = 'Regional Manager'"
+                ).scalar_one()
+                == 1
+            )
+            granted = {
+                code: set(
+                    conn.exec_driver_sql(
+                        "SELECT r.name FROM roles r "
+                        "JOIN role_permissions rp ON rp.role_id = r.id "
+                        "JOIN permissions p ON p.id = rp.permission_id "
+                        "WHERE p.code = %s",
+                        (code,),
+                    )
+                    .scalars()
+                    .all()
+                )
+                for code in (
+                    "inventory.transfer.writeoff.initiate",
+                    "inventory.transfer.writeoff.approve",
+                    "inventory.transfer.writeoff.reverse",
+                )
+            }
+    finally:
+        engine.dispose()
+    assert granted["inventory.transfer.writeoff.initiate"] == {"Admin", "Manager"}
+    assert granted["inventory.transfer.writeoff.approve"] == {
+        "Admin",
+        "Manager",
+        "Regional Manager",
+    }
+    assert granted["inventory.transfer.writeoff.reverse"] == {"Admin"}
+
+    command.downgrade(cfg, M25_PHASE4_SCHEMA_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.connect() as conn:
+            assert (
+                conn.exec_driver_sql(
+                    "SELECT COUNT(*) FROM roles WHERE name = 'Regional Manager'"
+                ).scalar_one()
+                == 0
+            )
+            assert (
+                conn.exec_driver_sql(
+                    "SELECT COUNT(*) FROM permissions WHERE code LIKE "
+                    "'inventory.transfer.writeoff.%%'"
+                ).scalar_one()
+                == 0
+            )
+    finally:
+        engine.dispose()
+
+    command.downgrade(cfg, "base")
+
+
+def test_m25_phase4_write_off_approvals_immutable_for_erp_app(migrations_db: str) -> None:
+    """write_off_approvals must have NO UPDATE/DELETE privilege for
+    erp_app at the Phase 4 schema revision -- proven against the real
+    privilege catalog, not just a code comment (mirrors
+    test_m12_alembic_version_privilege_revoked_on_upgrade_and_restored_on_downgrade's
+    own discipline, applied to this table). This is the DB-level backing
+    for "approval record/audit history must not be silently editable
+    through ordinary application permissions"."""
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M25_PHASE4_SCHEMA_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.connect() as conn:
+            privileges = {
+                row[0]
+                for row in conn.exec_driver_sql(
+                    "SELECT privilege_type FROM information_schema.role_table_grants "
+                    "WHERE grantee = 'erp_app' AND table_name = 'write_off_approvals'"
+                ).all()
+            }
+    finally:
+        engine.dispose()
+    assert "UPDATE" not in privileges
+    assert "DELETE" not in privileges
+    assert "SELECT" in privileges
+    assert "INSERT" in privileges
 
     command.downgrade(cfg, "base")
 

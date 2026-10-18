@@ -88,3 +88,8 @@ from app.modules.transfers.models import (  # noqa: F401
     InterStoreTransferReceiptItem,
     TransferCustodyAcceptance,
 )
+from app.modules.writeoffs.models import (  # noqa: F401
+    ApprovalPolicyRule,
+    TransferWriteOff,
+    WriteOffApproval,
+)

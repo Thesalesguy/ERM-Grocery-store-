@@ -283,3 +283,67 @@ def resolve_discrepancy(
         },
     )
     return discrepancy
+
+
+# --- M25 Phase 4 reopen (added, not a modification of Phase 3's own
+# RECORDED -> INVESTIGATING -> RESOLVED functions above) ---------------
+
+
+def reopen_discrepancy_after_write_off_denial(
+    db: Session,
+    discrepancy_id: int,
+    *,
+    actor_id: int | None,
+) -> ReceivingDiscrepancy:
+    """RESOLVED -> INVESTIGATING, the one reopening path Phase 3's own
+    `resolve_discrepancy` docstring explicitly deferred to "the write-off
+    ... denial-reopen path[] of a later phase"
+    (docs/M24D_TECHNICAL_CONTRACT.md Section 20 Scenario 11: "the
+    originating ReceivingDiscrepancy ... reopens into INVESTIGATING").
+    Called ONLY from app.modules.writeoffs.service when a write-off
+    request against this discrepancy is DENIED -- never on approval,
+    never standalone. Clears the prior resolution so a genuine fresh
+    investigation (a new resolve_discrepancy call) is required before
+    another write-off may be submitted; the denied resolution itself is
+    not retained on this row (the WriteOffApproval/TransferWriteOff rows
+    the caller writes in the same transaction are the permanent record of
+    what was denied and why -- this function's job is only to put the
+    discrepancy back into a state new investigation work can act on).
+
+    Locks the row first, exactly like every other transition above, so a
+    denial racing a concurrent resolve/second-denial attempt on the SAME
+    discrepancy serializes rather than silently overwriting one
+    another's state."""
+    discrepancy = db.execute(
+        select(ReceivingDiscrepancy)
+        .where(ReceivingDiscrepancy.id == discrepancy_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if discrepancy is None:
+        raise NotFoundError(f"Discrepancy {discrepancy_id} not found")
+
+    if discrepancy.status != "RESOLVED":
+        raise ConflictError(
+            f"Discrepancy {discrepancy_id} is {discrepancy.status}, not RESOLVED -- only a "
+            "resolved discrepancy can be reopened by a write-off denial",
+            error_code="INVALID_DISCREPANCY_STATE",
+        )
+
+    before_status = discrepancy.status
+    discrepancy.status = "INVESTIGATING"
+    discrepancy.resolved_by = None
+    discrepancy.resolved_at = None
+    discrepancy.resolution_type = None
+    discrepancy.resolution_notes = None
+    db.flush()
+
+    audit_service.log_event(
+        db,
+        user_id=actor_id,
+        action="DISCREPANCY_REOPENED_AFTER_WRITE_OFF_DENIAL",
+        entity_type="receiving_discrepancy",
+        entity_id=discrepancy.id,
+        before={"status": before_status},
+        after={"status": "INVESTIGATING"},
+    )
+    return discrepancy

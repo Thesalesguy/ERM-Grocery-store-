@@ -783,11 +783,19 @@ class InventoryInTransitReconciliationRow:
 
 def inventory_in_transit_reconciliation(db: Session) -> InventoryInTransitReconciliationRow:
     """Compares the Inventory In Transit GL balance against Σ
-    (shipped_quantity - received_quantity) * unit_cost_at_shipment across
-    every not-fully-received transfer line — company-wide, not
-    per-store, since the account represents value in transit BETWEEN
-    stores, not within one (docs/M8_ADVANCED_INVENTORY_DESIGN.md
-    'Design Decision 9')."""
+    (shipped_quantity - received_quantity - written_off_quantity) *
+    unit_cost_at_shipment across every not-fully-accounted-for transfer
+    line — company-wide, not per-store, since the account represents
+    value in transit BETWEEN stores, not within one
+    (docs/M8_ADVANCED_INVENTORY_DESIGN.md 'Design Decision 9').
+
+    `written_off_quantity` (M25 Phase 4,
+    docs/M24D_TECHNICAL_CONTRACT.md Section 5/20) is subtracted here
+    because a posted write-off credits this same GL account for exactly
+    that quantity's frozen value — leaving it out of this formula would
+    make an approved write-off permanently diverge the derived
+    reconciliation from the GL balance it is meant to explain, even
+    though both sides are individually correct."""
     rows = accounting_service.trial_balance(db)
     account_row = next((r for r in rows if r.account_code == ACCOUNT_INVENTORY_IN_TRANSIT), None)
     gl_balance = (
@@ -797,7 +805,9 @@ def inventory_in_transit_reconciliation(db: Session) -> InventoryInTransitReconc
     outstanding_lines = list(
         db.execute(
             select(InterStoreTransferLine).where(
-                InterStoreTransferLine.shipped_quantity > InterStoreTransferLine.received_quantity
+                InterStoreTransferLine.shipped_quantity
+                > InterStoreTransferLine.received_quantity
+                + InterStoreTransferLine.written_off_quantity
             )
         )
         .scalars()
@@ -810,7 +820,8 @@ def inventory_in_transit_reconciliation(db: Session) -> InventoryInTransitReconc
         # unit_cost_at_shipment before shipped_quantity becomes positive.
         assert line.unit_cost_at_shipment is not None
         outstanding_total += _quantize(
-            (line.shipped_quantity - line.received_quantity) * line.unit_cost_at_shipment
+            (line.shipped_quantity - line.received_quantity - line.written_off_quantity)
+            * line.unit_cost_at_shipment
         )
     return InventoryInTransitReconciliationRow(
         gl_in_transit_balance=gl_balance,
