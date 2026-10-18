@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     from app.modules.sales.service import PaymentInput, _ComputedLine
     from app.modules.shifts.models import CashierShift
     from app.modules.transfers.models import InterStoreTransfer, InterStoreTransferReceipt
+    from app.modules.writeoffs.models import TransferWriteOff
 
 
 @dataclass(frozen=True)
@@ -930,6 +931,93 @@ def post_transfer_receipt_journal(
         posting_date=transfer_receipt.received_date,
         source_type="INTER_STORE_TRANSFER_RECEIVE",
         source_id=transfer_receipt.id,
+        memo=memo,
+        created_by=created_by,
+        lines=lines,
+    )
+
+
+# --- M25 Phase 4: approval-gated transfer write-offs ------------------------
+
+
+def post_transfer_write_off_journal(
+    db: Session,
+    *,
+    write_off: "TransferWriteOff",
+    posting_date: date,
+    created_by: int | None,
+) -> JournalEntry:
+    """Dr Inventory Shrinkage Expense / Cr Inventory In Transit, posted
+    against `write_off.store_id` -- the ATTRIBUTED (source) store, per
+    docs/M24D_TECHNICAL_CONTRACT.md Section 6.2's pre-custody-acceptance
+    rule and Section 20 Scenario 5's own worked example
+    ("Dr 5900/Cr 1520, store_id=from_store_id"). Reuses the existing
+    global shrinkage expense account (Section 6: no new GL account for
+    this phase) and credits Inventory In Transit -- the SAME account
+    `post_transfer_shipment_journal`/`post_transfer_receipt_journal`
+    already debit/credit for this transfer -- because the written-off
+    quantity never became on-hand stock anywhere: it is leaving the
+    in-transit bucket as a loss, not as a receipt into Inventory. Never
+    touches the Inventory (1500) account at either store and has no WAC
+    effect (Section 7) -- `write_off.unit_cost` is the discrepancy's own
+    frozen unit_cost_at_shipment, never either store's current WAC.
+
+    `write_off.amount` is computed once by
+    app.modules.writeoffs.service from `write_off.quantity *
+    write_off.unit_cost` and reused here unchanged -- never
+    recomputed, per this module's own "never independently compute two
+    sides of a pair that must match" rule.
+
+    Caller is responsible for incrementing the corresponding
+    InterStoreTransferLine.written_off_quantity in the SAME transaction
+    (see app.modules.transfers.service.inventory_in_transit_reconciliation's
+    own docstring for why that column must move in lockstep with this
+    journal's credit side, or the derived reconciliation permanently
+    diverges from this GL balance)."""
+    memo = f"Transfer write-off {write_off.id} (discrepancy {write_off.discrepancy_id})"
+    lines = [
+        _debit(ACCOUNT_INVENTORY_SHRINKAGE_EXPENSE, write_off.amount, description=memo),
+        _credit(ACCOUNT_INVENTORY_IN_TRANSIT, write_off.amount, description=memo),
+    ]
+    return _post_journal(
+        db,
+        store_id=write_off.store_id,
+        posting_date=posting_date,
+        source_type="TRANSFER_WRITE_OFF",
+        source_id=write_off.id,
+        memo=memo,
+        created_by=created_by,
+        lines=lines,
+    )
+
+
+def post_transfer_write_off_reversal_journal(
+    db: Session,
+    *,
+    write_off: "TransferWriteOff",
+    created_by: int | None,
+) -> JournalEntry:
+    """The dedicated transfer-write-off reversal -- mirrors
+    post_supplier_payment_reversal_journal exactly (see that function's
+    docstring): a NEW STANDARD entry
+    (source_type='TRANSFER_WRITE_OFF_REVERSAL', source_id=the ORIGINAL
+    write-off's id), with the original's two lines exactly swapped
+    (Dr Inventory In Transit / Cr Inventory Shrinkage Expense), same
+    store, recomputed from the write-off's own stored `amount` rather
+    than read back from the original JournalLine rows -- never editing
+    or deleting the original posting (docs/M24D_TECHNICAL_CONTRACT.md
+    Section 20 Scenario 12)."""
+    memo = f"Reversal of transfer write-off {write_off.id}"
+    lines = [
+        _debit(ACCOUNT_INVENTORY_IN_TRANSIT, write_off.amount, description=memo),
+        _credit(ACCOUNT_INVENTORY_SHRINKAGE_EXPENSE, write_off.amount, description=memo),
+    ]
+    return _post_journal(
+        db,
+        store_id=write_off.store_id,
+        posting_date=datetime.now(UTC).date(),
+        source_type="TRANSFER_WRITE_OFF_REVERSAL",
+        source_id=write_off.id,
         memo=memo,
         created_by=created_by,
         lines=lines,

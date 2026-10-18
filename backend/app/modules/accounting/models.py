@@ -157,6 +157,23 @@ AUTOMATED_SOURCE_TYPES = (
     # domain-row level.
     "SUPPLIER_PAYMENT_REVERSAL",
     "SUPPLIER_CREDIT_NOTE_REVERSAL",
+    # M25 Phase 4 (docs/M24D_TECHNICAL_CONTRACT.md Sections 6.2/10/20
+    # Scenarios 10-12): TRANSFER_WRITE_OFF posts once per approved-and-
+    # posted TransferWriteOff (source_id = its own id); the already-
+    # existing partial unique index on (source_type, source_id) WHERE
+    # entry_type='STANDARD' (above) gives "posted at most once" for
+    # free, the identical backstop SUPPLIER_PAYMENT_REVERSAL's own
+    # comment describes. Blocked from generic reverse_journal_entry for
+    # the same reason every automated type above is: a bare journal
+    # reversal would not undo TransferWriteOff.status or
+    # InterStoreTransferLine.written_off_quantity. TRANSFER_WRITE_OFF_
+    # REVERSAL is posted once per reversal by a dedicated
+    # reverse_transfer_write_off function (source_id = the ORIGINAL
+    # write-off's id, mirroring SUPPLIER_PAYMENT_REVERSAL's own
+    # source_id=payment.id convention) -- the same partial unique index
+    # also makes a write-off reversible at most once, for free.
+    "TRANSFER_WRITE_OFF",
+    "TRANSFER_WRITE_OFF_REVERSAL",
 )
 SOURCE_TYPES = AUTOMATED_SOURCE_TYPES + ("MANUAL",)
 ENTRY_TYPES = ("STANDARD", "REVERSAL")

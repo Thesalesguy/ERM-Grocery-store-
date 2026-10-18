@@ -160,6 +160,8 @@ def receive_transfer(
             ReceiveLineInput(
                 transfer_line_id=line.transfer_line_id,
                 quantity_received=line.quantity_received,
+                quantity_damaged=line.quantity_damaged,
+                quantity_declared_short=line.quantity_declared_short,
             )
             for line in payload.lines
         ],

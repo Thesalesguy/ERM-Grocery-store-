@@ -48,6 +48,12 @@ M16_HEAD_REVISION = "4a83c462dbff"  # M16: store settings permissions
 M19_HEAD_REVISION = "3a0d50ccc909"  # M19: purchase order idempotency key
 M20_HEAD_REVISION = "9c4c5a209aa9"  # M20: fiscal integration boundary + permissions
 M22_HEAD_REVISION = "aa9ac6ad7476"  # M22: accounting_periods
+M25_PHASE1_HEAD_REVISION = "75d685966c98"  # M25 Phase 1: accounting_entities foundation
+M25_PHASE2_HEAD_REVISION = "b628fc058834"  # M25 Phase 2: extended receiving + custody acceptance
+M25_PHASE3_SCHEMA_REVISION = "c1a2b3d4e5f6"  # M25 Phase 3: receiving_discrepancies table
+M25_PHASE3_HEAD_REVISION = "d2b3c4e5f6a7"  # M25 Phase 3: + discrepancy.investigate permission
+M25_PHASE4_SCHEMA_REVISION = "a1b2c3d4e5f6"  # M25 Phase 4: write-off/approval tables + column
+M25_PHASE4_HEAD_REVISION = "b2c3d4e5f6a7"  # M25 Phase 4: + Regional Manager role + permissions
 
 
 def _alembic_config() -> Config:
@@ -142,8 +148,8 @@ def test_full_upgrade_downgrade_upgrade_cycle(migrations_db: str) -> None:
     # back-links are columns, not tables).
     assert _table_count(migrations_db) == 46
 
-    command.upgrade(cfg, "head")
-    # This jump goes all the way to the CURRENT head, not just M10 (the
+    command.upgrade(cfg, M22_HEAD_REVISION)
+    # This jump goes all the way to the M22 head, not just M10 (the
     # explicit M9_HEAD_REVISION step above was the last named checkpoint
     # before "head" is used for the rest of the chain). M10 adds fifteen
     # tables: departments, positions, employees, employment_status_periods,
@@ -171,12 +177,47 @@ def test_full_upgrade_downgrade_upgrade_cycle(migrations_db: str) -> None:
     assert _table_count(migrations_db) == 68
     assert _current_revision(migrations_db) == M22_HEAD_REVISION
 
+    command.upgrade(cfg, M25_PHASE1_HEAD_REVISION)
+    # M25 Phase 1 (docs/M24D_TECHNICAL_CONTRACT.md Section 23) adds one new
+    # table (accounting_entities; stores.accounting_entity_id is a column,
+    # not a table): 68 + 1 = 69.
+    assert _table_count(migrations_db) == 69
+    assert _current_revision(migrations_db) == M25_PHASE1_HEAD_REVISION
+
+    command.upgrade(cfg, M25_PHASE2_HEAD_REVISION)
+    # M25 Phase 2 (docs/M24D_TECHNICAL_CONTRACT.md Sections 3.1/5/11/23)
+    # adds one new table (inter_store_transfer_custody_acceptances;
+    # the damaged/declared-short quantity columns on
+    # inter_store_transfer_lines/inter_store_transfer_receipt_items are
+    # columns, not tables): 69 + 1 = 70.
+    assert _table_count(migrations_db) == 70
+    assert _current_revision(migrations_db) == M25_PHASE2_HEAD_REVISION
+
+    command.upgrade(cfg, M25_PHASE3_HEAD_REVISION)
+    # M25 Phase 3 (docs/M24D_TECHNICAL_CONTRACT.md Sections 3.1/12/16/17)
+    # adds one new table (receiving_discrepancies): 70 + 1 = 71. The
+    # second migration in this phase seeds one permission row -- data,
+    # not a table -- so the count is unchanged by it.
+    assert _table_count(migrations_db) == 71
+    assert _current_revision(migrations_db) == M25_PHASE3_HEAD_REVISION
+
+    command.upgrade(cfg, "head")
+    # M25 Phase 4 (docs/M24D_TECHNICAL_CONTRACT.md Sections 3.1/5/6.2/10/20)
+    # adds three new tables (approval_policy_rules, transfer_write_offs,
+    # write_off_approvals): 71 + 3 = 74. The new
+    # inter_store_transfer_lines.written_off_quantity column and the
+    # widened ck_journal_entries_source_type CHECK are not tables. The
+    # second migration in this phase seeds one role + three permission
+    # rows -- data, not tables -- so the count is unchanged by it.
+    assert _table_count(migrations_db) == 74
+    assert _current_revision(migrations_db) == M25_PHASE4_HEAD_REVISION
+
     command.downgrade(cfg, M0_REVISION)
     assert _table_count(migrations_db) == 8
 
     command.upgrade(cfg, "head")
-    assert _table_count(migrations_db) == 68
-    assert _current_revision(migrations_db) == M22_HEAD_REVISION
+    assert _table_count(migrations_db) == 74
+    assert _current_revision(migrations_db) == M25_PHASE4_HEAD_REVISION
 
 
 def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
@@ -191,15 +232,20 @@ def test_rbac_seed_data_present_after_upgrade(migrations_db: str) -> None:
             permission_count = conn.exec_driver_sql("SELECT count(*) FROM permissions").scalar_one()
     finally:
         engine.dispose()
-    assert role_count == 6
+    # M25 Phase 4 adds one new role (Regional Manager) on top of the
+    # prior 6 = 7.
+    assert role_count == 7
     # M14 adds one new permission (sales.return.approve) on top of M12's
     # 44 = 45. M15 adds three more (shift.manage, shift.read,
     # shift.override) = 48. The pre-M15 hardening migration adds no
     # permissions (a column only). M16 adds one more (ap.reverse) = 49,
     # then two more (store.settings.read, store.settings.write) = 51.
     # M20 adds three more (fiscal.read, fiscal.config.write,
-    # fiscal.retry) = 54.
-    assert permission_count == 54
+    # fiscal.retry) = 54. M25 Phase 3 adds one more
+    # (inventory.transfer.discrepancy.investigate) = 55. M25 Phase 4
+    # adds three more (inventory.transfer.writeoff.initiate/.approve/
+    # .reverse) = 58.
+    assert permission_count == 58
 
 
 def test_m4_downgrade_refuses_when_journal_entries_exist(migrations_db: str) -> None:
@@ -1013,6 +1059,923 @@ def test_m14_downgrade_refuses_when_approval_data_exists(migrations_db: str) -> 
         finally:
             engine.dispose()
         command.downgrade(cfg, "base")
+
+
+def test_m25_phase1_backfills_every_existing_store_onto_one_default_entity(
+    migrations_db: str,
+) -> None:
+    """docs/M24D_TECHNICAL_CONTRACT.md Section 23: a store created BEFORE
+    this migration runs must be backfilled onto exactly one, newly
+    seeded, default CORPORATE_DIVISION entity -- proven against a real
+    pre-existing store, not just a from-scratch database."""
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M22_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            store_id = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, created_at) "
+                "VALUES ('Pre-Phase1 Store', 'UTC', true, now()) RETURNING id"
+            ).scalar_one()
+    finally:
+        engine.dispose()
+
+    command.upgrade(cfg, M25_PHASE1_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.connect() as conn:
+            entity_count = conn.exec_driver_sql(
+                "SELECT COUNT(*) FROM accounting_entities"
+            ).scalar_one()
+            default_count = conn.exec_driver_sql(
+                "SELECT COUNT(*) FROM accounting_entities WHERE is_default = true"
+            ).scalar_one()
+            null_count = conn.exec_driver_sql(
+                "SELECT COUNT(*) FROM stores WHERE accounting_entity_id IS NULL"
+            ).scalar_one()
+            store_entity_id, default_entity_id = conn.exec_driver_sql(
+                "SELECT s.accounting_entity_id, e.id FROM stores s "
+                "JOIN accounting_entities e ON e.is_default = true "
+                "WHERE s.id = %s",
+                (store_id,),
+            ).one()
+    finally:
+        engine.dispose()
+
+    assert entity_count == 1
+    assert default_count == 1
+    assert null_count == 0
+    assert store_entity_id == default_entity_id
+
+    command.downgrade(cfg, "base")
+
+
+def test_m25_phase1_downgrade_refuses_when_a_second_entity_exists(migrations_db: str) -> None:
+    """Mirrors the M7/M8/M9/M10 downgrade-guard precedents in this same
+    file: this migration's own downgrade must fail LOUDLY, before any
+    destructive step, when data exists that it cannot represent -- here,
+    a second accounting_entities row (which could only have been created
+    by a later, not-yet-downgraded M25 phase)."""
+    from sqlalchemy.exc import DBAPIError, InternalError
+
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M25_PHASE1_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                "INSERT INTO accounting_entities (name, entity_type, is_default, created_at) "
+                "VALUES ('Guard Independent', 'INDEPENDENT', false, now())"
+            )
+    finally:
+        engine.dispose()
+
+    try:
+        with pytest.raises((DBAPIError, InternalError)):
+            command.downgrade(cfg, M22_HEAD_REVISION)
+
+        assert _current_revision(migrations_db) == M25_PHASE1_HEAD_REVISION
+        assert _table_count(migrations_db) == 69
+    finally:
+        engine = create_engine(migrations_db)
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "DELETE FROM accounting_entities WHERE name = 'Guard Independent'"
+                )
+        finally:
+            engine.dispose()
+        command.downgrade(cfg, "base")
+
+
+def test_m25_phase1_downgrade_refuses_when_a_store_was_reassigned(migrations_db: str) -> None:
+    """Same guard, the other triggering condition: a store reassigned
+    off the default entity onto a (necessarily later-phase-created)
+    second entity."""
+    from sqlalchemy.exc import DBAPIError, InternalError
+
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M25_PHASE1_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            other_entity_id = conn.exec_driver_sql(
+                "INSERT INTO accounting_entities (name, entity_type, is_default, created_at) "
+                "VALUES ('Guard Reassign Target', 'INDEPENDENT', false, now()) RETURNING id"
+            ).scalar_one()
+            store_id = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, accounting_entity_id, "
+                "created_at) VALUES ('Guard Reassigned Store', 'UTC', true, %s, now()) "
+                "RETURNING id",
+                (other_entity_id,),
+            ).scalar_one()
+    finally:
+        engine.dispose()
+
+    try:
+        with pytest.raises((DBAPIError, InternalError)):
+            command.downgrade(cfg, M22_HEAD_REVISION)
+
+        assert _current_revision(migrations_db) == M25_PHASE1_HEAD_REVISION
+        assert _table_count(migrations_db) == 69
+    finally:
+        engine = create_engine(migrations_db)
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql("DELETE FROM stores WHERE id = %s", (store_id,))
+                conn.exec_driver_sql(
+                    "DELETE FROM accounting_entities WHERE id = %s", (other_entity_id,)
+                )
+        finally:
+            engine.dispose()
+        command.downgrade(cfg, "base")
+
+
+def test_m25_phase1_upgrade_downgrade_reupgrade_preserves_populated_m22_business_data(
+    migrations_db: str,
+) -> None:
+    """A purely additive foundation migration must never touch existing
+    rows -- mirrors
+    test_m11_upgrade_downgrade_reupgrade_preserves_populated_m10_business_data's
+    own discipline, applied to this migration. Downgrading past this
+    migration is safe here ONLY because no second entity/reassignment
+    exists yet in this freshly-seeded scenario (see the two guard tests
+    above for the case where it is not safe)."""
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M22_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            store_id = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, created_at) "
+                "VALUES ('M25 Phase1 Migration Test Store', 'UTC', true, now()) RETURNING id"
+            ).scalar_one()
+        with engine.connect() as conn:
+            before = conn.exec_driver_sql(
+                "SELECT id, name, timezone FROM stores WHERE id = %s", (store_id,)
+            ).one()
+    finally:
+        engine.dispose()
+
+    command.upgrade(cfg, M25_PHASE1_HEAD_REVISION)
+    command.downgrade(cfg, M22_HEAD_REVISION)
+    command.upgrade(cfg, M25_PHASE1_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.connect() as conn:
+            after = conn.exec_driver_sql(
+                "SELECT id, name, timezone FROM stores WHERE id = %s", (store_id,)
+            ).one()
+    finally:
+        engine.dispose()
+
+    assert after == before
+    command.downgrade(cfg, "base")
+
+
+def test_m25_phase2_existing_receipt_items_backfill_to_zero_damaged_short(
+    migrations_db: str,
+) -> None:
+    """docs/M24D_TECHNICAL_CONTRACT.md Section 23: an existing (pre-Phase-2)
+    transfer line/receipt item must land on damaged=0/declared_short=0
+    after this migration -- proven against real pre-existing data, not
+    just a from-scratch database."""
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M25_PHASE1_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            store_a = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, accounting_entity_id, "
+                "created_at) VALUES ('P2 Store A', 'UTC', true, "
+                "(SELECT id FROM accounting_entities WHERE is_default = true), now()) "
+                "RETURNING id"
+            ).scalar_one()
+            store_b = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, accounting_entity_id, "
+                "created_at) VALUES ('P2 Store B', 'UTC', true, "
+                "(SELECT id FROM accounting_entities WHERE is_default = true), now()) "
+                "RETURNING id"
+            ).scalar_one()
+            category_id = conn.exec_driver_sql(
+                "INSERT INTO product_categories (name, is_active, created_at) "
+                "VALUES ('P2 Cat', true, now()) RETURNING id"
+            ).scalar_one()
+            product_a = conn.exec_driver_sql(
+                "INSERT INTO products (store_id, category_id, sku, name, unit_of_measure, "
+                "is_weighed, current_price, current_cost, current_qty_on_hand, "
+                "allow_negative_stock, is_active, created_at) VALUES "
+                f"({store_a}, {category_id}, 'SKU-P2', 'P2 Product', 'each', false, "
+                "9.99, 4.00, 10.000, false, true, now()) RETURNING id"
+            ).scalar_one()
+            product_b = conn.exec_driver_sql(
+                "INSERT INTO products (store_id, category_id, sku, name, unit_of_measure, "
+                "is_weighed, current_price, current_cost, current_qty_on_hand, "
+                "allow_negative_stock, is_active, created_at) VALUES "
+                f"({store_b}, {category_id}, 'SKU-P2', 'P2 Product B', 'each', false, "
+                "9.99, 0, 0, false, true, now()) RETURNING id"
+            ).scalar_one()
+            transfer_id = conn.exec_driver_sql(
+                "INSERT INTO inter_store_transfers (from_store_id, to_store_id, "
+                "transfer_number, status, requested_date, created_at) VALUES "
+                f"({store_a}, {store_b}, 'TR-P2-BACKFILL', 'SHIPPED', CURRENT_DATE, now()) "
+                "RETURNING id"
+            ).scalar_one()
+            line_id = conn.exec_driver_sql(
+                "INSERT INTO inter_store_transfer_lines (transfer_id, source_product_id, "
+                "destination_product_id, requested_quantity, shipped_quantity, "
+                "received_quantity, unit_cost_at_shipment) VALUES "
+                f"({transfer_id}, {product_a}, {product_b}, 10.000, 10.000, 10.000, 4.00) "
+                "RETURNING id"
+            ).scalar_one()
+            receipt_id = conn.exec_driver_sql(
+                "INSERT INTO inter_store_transfer_receipts (transfer_id, store_id, "
+                "client_transaction_id, received_date, created_at) VALUES "
+                f"({transfer_id}, {store_b}, 'rc-p2-backfill', CURRENT_DATE, now()) "
+                "RETURNING id"
+            ).scalar_one()
+            conn.exec_driver_sql(
+                "INSERT INTO inter_store_transfer_receipt_items "
+                "(inter_store_transfer_receipt_id, inter_store_transfer_line_id, "
+                "quantity_received) VALUES "
+                f"({receipt_id}, {line_id}, 10.000)"
+            )
+    finally:
+        engine.dispose()
+
+    command.upgrade(cfg, M25_PHASE2_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.connect() as conn:
+            line_damaged, line_short = conn.exec_driver_sql(
+                "SELECT damaged_quantity, declared_short_quantity "
+                f"FROM inter_store_transfer_lines WHERE id = {line_id}"
+            ).one()
+            item_damaged, item_short = conn.exec_driver_sql(
+                "SELECT quantity_damaged, quantity_declared_short "
+                f"FROM inter_store_transfer_receipt_items WHERE id = "
+                f"(SELECT id FROM inter_store_transfer_receipt_items "
+                f"WHERE inter_store_transfer_receipt_id = {receipt_id})"
+            ).one()
+    finally:
+        engine.dispose()
+
+    assert line_damaged == 0
+    assert line_short == 0
+    assert item_damaged == 0
+    assert item_short == 0
+
+    command.downgrade(cfg, "base")
+
+
+def test_m25_phase2_downgrade_refuses_when_damaged_or_short_data_exists(
+    migrations_db: str,
+) -> None:
+    """Mirrors the M7/M8/M9/M10/M25-Phase-1 downgrade-guard precedents:
+    this migration's downgrade must refuse, before any destructive step,
+    when a transfer line carries data (a nonzero damaged/declared-short
+    quantity) the pre-Phase-2 schema cannot represent."""
+    from sqlalchemy.exc import DBAPIError, InternalError
+
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M25_PHASE2_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            store_a = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, accounting_entity_id, "
+                "created_at) VALUES ('P2 Guard Store A', 'UTC', true, "
+                "(SELECT id FROM accounting_entities WHERE is_default = true), now()) "
+                "RETURNING id"
+            ).scalar_one()
+            store_b = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, accounting_entity_id, "
+                "created_at) VALUES ('P2 Guard Store B', 'UTC', true, "
+                "(SELECT id FROM accounting_entities WHERE is_default = true), now()) "
+                "RETURNING id"
+            ).scalar_one()
+            category_id = conn.exec_driver_sql(
+                "INSERT INTO product_categories (name, is_active, created_at) "
+                "VALUES ('P2 Guard Cat', true, now()) RETURNING id"
+            ).scalar_one()
+            product_a = conn.exec_driver_sql(
+                "INSERT INTO products (store_id, category_id, sku, name, unit_of_measure, "
+                "is_weighed, current_price, current_cost, current_qty_on_hand, "
+                "allow_negative_stock, is_active, created_at) VALUES "
+                f"({store_a}, {category_id}, 'SKU-P2-GUARD', 'P2 Guard Product', 'each', "
+                "false, 9.99, 4.00, 10.000, false, true, now()) RETURNING id"
+            ).scalar_one()
+            product_b = conn.exec_driver_sql(
+                "INSERT INTO products (store_id, category_id, sku, name, unit_of_measure, "
+                "is_weighed, current_price, current_cost, current_qty_on_hand, "
+                "allow_negative_stock, is_active, created_at) VALUES "
+                f"({store_b}, {category_id}, 'SKU-P2-GUARD', 'P2 Guard Product B', 'each', "
+                "false, 9.99, 0, 0, false, true, now()) RETURNING id"
+            ).scalar_one()
+            transfer_id = conn.exec_driver_sql(
+                "INSERT INTO inter_store_transfers (from_store_id, to_store_id, "
+                "transfer_number, status, requested_date, created_at) VALUES "
+                f"({store_a}, {store_b}, 'TR-P2-GUARD', 'SHIPPED', CURRENT_DATE, now()) "
+                "RETURNING id"
+            ).scalar_one()
+            conn.exec_driver_sql(
+                "INSERT INTO inter_store_transfer_lines (transfer_id, source_product_id, "
+                "destination_product_id, requested_quantity, shipped_quantity, "
+                "received_quantity, damaged_quantity, unit_cost_at_shipment) VALUES "
+                f"({transfer_id}, {product_a}, {product_b}, 10.000, 10.000, 8.000, 2.000, 4.00)"
+            )
+    finally:
+        engine.dispose()
+
+    try:
+        with pytest.raises((DBAPIError, InternalError)):
+            command.downgrade(cfg, M25_PHASE1_HEAD_REVISION)
+
+        assert _current_revision(migrations_db) == M25_PHASE2_HEAD_REVISION
+        assert _table_count(migrations_db) == 70
+    finally:
+        # Remove the blocking row first -- the guard would otherwise
+        # refuse this cleanup downgrade too, for the identical reason,
+        # and poison the shared migrations database for every later test.
+        engine = create_engine(migrations_db)
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "DELETE FROM inter_store_transfer_lines WHERE transfer_id = %s",
+                    (transfer_id,),
+                )
+                conn.exec_driver_sql(
+                    "DELETE FROM inter_store_transfers WHERE id = %s", (transfer_id,)
+                )
+                conn.exec_driver_sql(
+                    "DELETE FROM products WHERE id IN (%s, %s)", (product_a, product_b)
+                )
+                conn.exec_driver_sql("DELETE FROM product_categories WHERE id = %s", (category_id,))
+                conn.exec_driver_sql("DELETE FROM stores WHERE id IN (%s, %s)", (store_a, store_b))
+        finally:
+            engine.dispose()
+        command.downgrade(cfg, "base")
+
+
+def test_m25_phase2_downgrade_refuses_when_custody_acceptance_exists(
+    migrations_db: str,
+) -> None:
+    """Same guard, the other triggering condition: a custody-acceptance
+    row, which has no table at all in the pre-Phase-2 schema."""
+    from sqlalchemy.exc import DBAPIError, InternalError
+
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M25_PHASE2_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            store_a = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, accounting_entity_id, "
+                "created_at) VALUES ('P2 Custody Store A', 'UTC', true, "
+                "(SELECT id FROM accounting_entities WHERE is_default = true), now()) "
+                "RETURNING id"
+            ).scalar_one()
+            store_b = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, accounting_entity_id, "
+                "created_at) VALUES ('P2 Custody Store B', 'UTC', true, "
+                "(SELECT id FROM accounting_entities WHERE is_default = true), now()) "
+                "RETURNING id"
+            ).scalar_one()
+            transfer_id = conn.exec_driver_sql(
+                "INSERT INTO inter_store_transfers (from_store_id, to_store_id, "
+                "transfer_number, status, requested_date, created_at) VALUES "
+                f"({store_a}, {store_b}, 'TR-P2-CUSTODY', 'SHIPPED', CURRENT_DATE, now()) "
+                "RETURNING id"
+            ).scalar_one()
+            receipt_id = conn.exec_driver_sql(
+                "INSERT INTO inter_store_transfer_receipts (transfer_id, store_id, "
+                "client_transaction_id, received_date, created_at) VALUES "
+                f"({transfer_id}, {store_b}, 'rc-p2-custody', CURRENT_DATE, now()) "
+                "RETURNING id"
+            ).scalar_one()
+            conn.exec_driver_sql(
+                "INSERT INTO inter_store_transfer_custody_acceptances "
+                "(transfer_id, inter_store_transfer_receipt_id, store_id, accepted_at, "
+                "created_at) VALUES "
+                f"({transfer_id}, {receipt_id}, {store_b}, now(), now())"
+            )
+    finally:
+        engine.dispose()
+
+    try:
+        with pytest.raises((DBAPIError, InternalError)):
+            command.downgrade(cfg, M25_PHASE1_HEAD_REVISION)
+
+        assert _current_revision(migrations_db) == M25_PHASE2_HEAD_REVISION
+        assert _table_count(migrations_db) == 70
+    finally:
+        # Remove the blocking row first -- see the identical comment in
+        # test_m25_phase2_downgrade_refuses_when_damaged_or_short_data_exists.
+        engine = create_engine(migrations_db)
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "DELETE FROM inter_store_transfer_custody_acceptances "
+                    "WHERE transfer_id = %s",
+                    (transfer_id,),
+                )
+                conn.exec_driver_sql(
+                    "DELETE FROM inter_store_transfer_receipts WHERE id = %s", (receipt_id,)
+                )
+                conn.exec_driver_sql(
+                    "DELETE FROM inter_store_transfers WHERE id = %s", (transfer_id,)
+                )
+                conn.exec_driver_sql("DELETE FROM stores WHERE id IN (%s, %s)", (store_a, store_b))
+        finally:
+            engine.dispose()
+        command.downgrade(cfg, "base")
+
+
+def test_m25_phase2_upgrade_downgrade_reupgrade_preserves_populated_phase1_data(
+    migrations_db: str,
+) -> None:
+    """A purely additive extension must never touch existing rows --
+    mirrors the M25 Phase 1 equivalent test, applied to this migration."""
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M25_PHASE1_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            store_id = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, accounting_entity_id, "
+                "created_at) VALUES ('P2 Migration Test Store', 'UTC', true, "
+                "(SELECT id FROM accounting_entities WHERE is_default = true), now()) "
+                "RETURNING id"
+            ).scalar_one()
+        with engine.connect() as conn:
+            before = conn.exec_driver_sql(
+                "SELECT id, name, timezone FROM stores WHERE id = %s", (store_id,)
+            ).one()
+    finally:
+        engine.dispose()
+
+    command.upgrade(cfg, M25_PHASE2_HEAD_REVISION)
+    command.downgrade(cfg, M25_PHASE1_HEAD_REVISION)
+    command.upgrade(cfg, M25_PHASE2_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.connect() as conn:
+            after = conn.exec_driver_sql(
+                "SELECT id, name, timezone FROM stores WHERE id = %s", (store_id,)
+            ).one()
+    finally:
+        engine.dispose()
+
+    assert after == before
+    command.downgrade(cfg, "base")
+
+
+def test_m25_phase3_downgrade_refuses_when_discrepancy_rows_exist(
+    migrations_db: str,
+) -> None:
+    """Mirrors the M7/M8/M9/M10/M25-Phase-1/M25-Phase-2 downgrade-guard
+    precedents: this migration's downgrade must refuse, before any
+    destructive step, when a receiving_discrepancies row exists -- the
+    pre-Phase-3 schema has no table for it at all."""
+    from sqlalchemy.exc import DBAPIError, InternalError
+
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M25_PHASE3_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            store_id = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, accounting_entity_id, "
+                "created_at) VALUES ('P3 Guard Store', 'UTC', true, "
+                "(SELECT id FROM accounting_entities WHERE is_default = true), now()) "
+                "RETURNING id"
+            ).scalar_one()
+            category_id = conn.exec_driver_sql(
+                "INSERT INTO product_categories (name, is_active, created_at) "
+                "VALUES ('P3 Guard Cat', true, now()) RETURNING id"
+            ).scalar_one()
+            product_id = conn.exec_driver_sql(
+                "INSERT INTO products (store_id, category_id, sku, name, unit_of_measure, "
+                "is_weighed, current_price, current_cost, current_qty_on_hand, "
+                "allow_negative_stock, is_active, created_at) VALUES "
+                f"({store_id}, {category_id}, 'SKU-P3-GUARD', 'P3 Guard Product', 'each', "
+                "false, 9.99, 4.00, 0, false, true, now()) RETURNING id"
+            ).scalar_one()
+            discrepancy_id = conn.exec_driver_sql(
+                "INSERT INTO receiving_discrepancies (source_type, source_id, product_id, "
+                "store_id, discrepancy_type, quantity_short, quantity_damaged, unit_cost, "
+                "status, raised_at, created_at) VALUES "
+                f"('TRANSFER_RECEIPT', 1, {product_id}, {store_id}, 'SHORTAGE', 10, 0, 4.00, "
+                "'RECORDED', now(), now()) RETURNING id"
+            ).scalar_one()
+    finally:
+        engine.dispose()
+
+    try:
+        with pytest.raises((DBAPIError, InternalError)):
+            command.downgrade(cfg, M25_PHASE2_HEAD_REVISION)
+
+        assert _current_revision(migrations_db) == M25_PHASE3_HEAD_REVISION
+        assert _table_count(migrations_db) == 71
+    finally:
+        # Remove the blocking row first -- the guard would otherwise
+        # refuse this cleanup downgrade too, for the identical reason,
+        # and poison the shared migrations database for every later test.
+        engine = create_engine(migrations_db)
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "DELETE FROM receiving_discrepancies WHERE id = %s", (discrepancy_id,)
+                )
+                conn.exec_driver_sql("DELETE FROM products WHERE id = %s", (product_id,))
+                conn.exec_driver_sql("DELETE FROM product_categories WHERE id = %s", (category_id,))
+                conn.exec_driver_sql("DELETE FROM stores WHERE id = %s", (store_id,))
+        finally:
+            engine.dispose()
+        command.downgrade(cfg, "base")
+
+
+def test_m25_phase3_upgrade_downgrade_reupgrade_preserves_populated_phase2_data(
+    migrations_db: str,
+) -> None:
+    """A purely additive extension must never touch existing rows --
+    mirrors the M25 Phase 1/Phase 2 equivalent tests, applied to this
+    migration."""
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M25_PHASE2_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            store_id = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, accounting_entity_id, "
+                "created_at) VALUES ('P3 Migration Test Store', 'UTC', true, "
+                "(SELECT id FROM accounting_entities WHERE is_default = true), now()) "
+                "RETURNING id"
+            ).scalar_one()
+        with engine.connect() as conn:
+            before = conn.exec_driver_sql(
+                "SELECT id, name, timezone FROM stores WHERE id = %s", (store_id,)
+            ).one()
+    finally:
+        engine.dispose()
+
+    command.upgrade(cfg, M25_PHASE3_HEAD_REVISION)
+    command.downgrade(cfg, M25_PHASE2_HEAD_REVISION)
+    command.upgrade(cfg, M25_PHASE3_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.connect() as conn:
+            after = conn.exec_driver_sql(
+                "SELECT id, name, timezone FROM stores WHERE id = %s", (store_id,)
+            ).one()
+    finally:
+        engine.dispose()
+
+    assert after == before
+    command.downgrade(cfg, "base")
+
+
+def test_m25_phase3_permission_seeded_and_removed_on_downgrade(migrations_db: str) -> None:
+    """The dedicated permission-seed migration (d2b3c4e5f6a7) grants
+    inventory.transfer.discrepancy.investigate to Admin/Manager/
+    Inventory Clerk, and its downgrade removes both the permission row
+    and its role grants cleanly.
+
+    Note (discovered writing this test, not assumed): on a from-scratch
+    rebuild like this one, M2's own seed migration (e6180fca2ee0) already
+    seeds this permission and its role grants, because it reads
+    ALL_PERMISSIONS/ROLE_PERMISSIONS LIVE from app.modules.auth.permissions
+    at migration-run time, not a frozen historical snapshot -- so the
+    permission already exists and is already granted by the time
+    M25_PHASE3_SCHEMA_REVISION is reached, before d2b3c4e5f6a7 even runs.
+    This makes d2b3c4e5f6a7 (like every other dedicated permission-seed
+    migration in this chain -- 4a83c462dbff, 9c4c5a209aa9) a no-op upsert
+    on a fresh install; its real purpose is an already-deployed database
+    sitting at an OLDER revision, from before this permission existed in
+    the Python module at all. What's unconditionally true regardless of
+    that nuance -- and what this test actually proves -- is asserted
+    below: the permission is granted to exactly the right roles at HEAD,
+    and downgrading past d2b3c4e5f6a7 removes the permission (and its
+    grants) entirely, by code, however it got there."""
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M25_PHASE3_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.connect() as conn:
+            granted_roles = set(
+                conn.exec_driver_sql(
+                    "SELECT r.name FROM roles r "
+                    "JOIN role_permissions rp ON rp.role_id = r.id "
+                    "JOIN permissions p ON p.id = rp.permission_id "
+                    "WHERE p.code = 'inventory.transfer.discrepancy.investigate'"
+                )
+                .scalars()
+                .all()
+            )
+    finally:
+        engine.dispose()
+    assert granted_roles == {"Admin", "Manager", "Inventory Clerk"}
+
+    command.downgrade(cfg, M25_PHASE3_SCHEMA_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.connect() as conn:
+            exists_after = conn.exec_driver_sql(
+                "SELECT COUNT(*) FROM permissions WHERE code = "
+                "'inventory.transfer.discrepancy.investigate'"
+            ).scalar_one()
+    finally:
+        engine.dispose()
+    assert exists_after == 0
+
+    command.downgrade(cfg, "base")
+
+
+def test_m25_phase4_downgrade_refuses_when_write_off_rows_exist(migrations_db: str) -> None:
+    """Mirrors test_m25_phase3_downgrade_refuses_when_discrepancy_rows_exist:
+    a1b2c3d4e5f6's downgrade must refuse, before any destructive step,
+    when a transfer_write_offs row exists -- the pre-Phase-4 schema has
+    no table for it at all."""
+    from sqlalchemy.exc import DBAPIError, InternalError
+
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M25_PHASE4_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            store_id = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, accounting_entity_id, "
+                "created_at) VALUES ('P4 Guard Store', 'UTC', true, "
+                "(SELECT id FROM accounting_entities WHERE is_default = true), now()) "
+                "RETURNING id"
+            ).scalar_one()
+            other_store_id = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, accounting_entity_id, "
+                "created_at) VALUES ('P4 Guard Store 2', 'UTC', true, "
+                "(SELECT id FROM accounting_entities WHERE is_default = true), now()) "
+                "RETURNING id"
+            ).scalar_one()
+            category_id = conn.exec_driver_sql(
+                "INSERT INTO product_categories (name, is_active, created_at) "
+                "VALUES ('P4 Guard Cat', true, now()) RETURNING id"
+            ).scalar_one()
+            product_id = conn.exec_driver_sql(
+                "INSERT INTO products (store_id, category_id, sku, name, unit_of_measure, "
+                "is_weighed, current_price, current_cost, current_qty_on_hand, "
+                "allow_negative_stock, is_active, created_at) VALUES "
+                f"({store_id}, {category_id}, 'SKU-P4-GUARD', 'P4 Guard Product', 'each', "
+                "false, 9.99, 4.00, 0, false, true, now()) RETURNING id"
+            ).scalar_one()
+            user_id = conn.exec_driver_sql(
+                "INSERT INTO users (username, email, password_hash, full_name, is_active, "
+                "created_at) VALUES ('p4guard', 'p4guard@example.com', 'x', 'P4 Guard', "
+                "true, now()) RETURNING id"
+            ).scalar_one()
+            role_id = conn.exec_driver_sql("SELECT id FROM roles WHERE name = 'Admin'").scalar_one()
+            transfer_id = conn.exec_driver_sql(
+                "INSERT INTO inter_store_transfers (from_store_id, to_store_id, "
+                "transfer_number, status, requested_date, created_at) VALUES "
+                f"({store_id}, {other_store_id}, 'TR-P4-GUARD', 'SHIPPED', '2024-01-01', "
+                "now()) RETURNING id"
+            ).scalar_one()
+            line_id = conn.exec_driver_sql(
+                "INSERT INTO inter_store_transfer_lines (transfer_id, source_product_id, "
+                "destination_product_id, requested_quantity, shipped_quantity, "
+                "received_quantity, damaged_quantity, declared_short_quantity, "
+                "written_off_quantity, unit_cost_at_shipment, created_at) VALUES "
+                f"({transfer_id}, {product_id}, {product_id}, 10, 10, 0, 10, 0, 0, 4.00, "
+                "now()) RETURNING id"
+            ).scalar_one()
+            discrepancy_id = conn.exec_driver_sql(
+                "INSERT INTO receiving_discrepancies (source_type, source_id, transfer_id, "
+                "product_id, store_id, counterparty_store_id, discrepancy_type, "
+                "quantity_short, quantity_damaged, unit_cost, status, resolved_by, "
+                "resolved_at, resolution_type, resolution_notes, raised_at, created_at) "
+                f"VALUES ('TRANSFER_RECEIPT', 1, {transfer_id}, {product_id}, {other_store_id}, "
+                f"{store_id}, 'DAMAGE', 0, 10, 4.00, 'RESOLVED', {user_id}, now(), "
+                "'SOURCE_STORE_CAUSED', 'guard test', now(), now()) RETURNING id"
+            ).scalar_one()
+            write_off_id = conn.exec_driver_sql(
+                "INSERT INTO transfer_write_offs (transfer_id, transfer_line_id, "
+                "discrepancy_id, quantity, unit_cost, amount, store_id, reason, "
+                "initiated_by, initiated_at, required_role_id, status, "
+                "client_transaction_id, created_at) VALUES "
+                f"({transfer_id}, {line_id}, {discrepancy_id}, 10, 4.00, 40.00, {store_id}, "
+                f"'guard test', {user_id}, now(), {role_id}, 'PENDING_APPROVAL', "
+                "'ctxn-p4-guard', now()) RETURNING id"
+            ).scalar_one()
+    finally:
+        engine.dispose()
+
+    try:
+        with pytest.raises((DBAPIError, InternalError)):
+            command.downgrade(cfg, M25_PHASE3_HEAD_REVISION)
+
+        assert _current_revision(migrations_db) == M25_PHASE4_HEAD_REVISION
+        assert _table_count(migrations_db) == 74
+    finally:
+        engine = create_engine(migrations_db)
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "DELETE FROM transfer_write_offs WHERE id = %s", (write_off_id,)
+                )
+                conn.exec_driver_sql(
+                    "DELETE FROM receiving_discrepancies WHERE id = %s", (discrepancy_id,)
+                )
+                conn.exec_driver_sql(
+                    "DELETE FROM inter_store_transfer_lines WHERE id = %s", (line_id,)
+                )
+                conn.exec_driver_sql(
+                    "DELETE FROM inter_store_transfers WHERE id = %s", (transfer_id,)
+                )
+                conn.exec_driver_sql("DELETE FROM products WHERE id = %s", (product_id,))
+                conn.exec_driver_sql("DELETE FROM product_categories WHERE id = %s", (category_id,))
+                conn.exec_driver_sql("DELETE FROM users WHERE id = %s", (user_id,))
+                conn.exec_driver_sql(
+                    "DELETE FROM stores WHERE id IN (%s, %s)", (store_id, other_store_id)
+                )
+        finally:
+            engine.dispose()
+        command.downgrade(cfg, "base")
+
+
+def test_m25_phase4_upgrade_downgrade_reupgrade_preserves_populated_phase3_data(
+    migrations_db: str,
+) -> None:
+    """A purely additive extension must never touch existing rows --
+    mirrors the M25 Phase 1/Phase 2/Phase 3 equivalent tests, applied to
+    this migration."""
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M25_PHASE3_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.begin() as conn:
+            store_id = conn.exec_driver_sql(
+                "INSERT INTO stores (name, timezone, is_active, accounting_entity_id, "
+                "created_at) VALUES ('P4 Migration Test Store', 'UTC', true, "
+                "(SELECT id FROM accounting_entities WHERE is_default = true), now()) "
+                "RETURNING id"
+            ).scalar_one()
+        with engine.connect() as conn:
+            before = conn.exec_driver_sql(
+                "SELECT id, name, timezone FROM stores WHERE id = %s", (store_id,)
+            ).one()
+    finally:
+        engine.dispose()
+
+    command.upgrade(cfg, M25_PHASE4_HEAD_REVISION)
+    command.downgrade(cfg, M25_PHASE3_HEAD_REVISION)
+    command.upgrade(cfg, M25_PHASE4_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.connect() as conn:
+            after = conn.exec_driver_sql(
+                "SELECT id, name, timezone FROM stores WHERE id = %s", (store_id,)
+            ).one()
+    finally:
+        engine.dispose()
+
+    assert after == before
+    command.downgrade(cfg, "base")
+
+
+def test_m25_phase4_rbac_seeded_and_removed_on_downgrade(migrations_db: str) -> None:
+    """The dedicated RBAC-seed migration (b2c3d4e5f6a7) creates the
+    Regional Manager role and grants the three new write-off permissions
+    to exactly the right roles, and its downgrade removes the role,
+    permissions, and grants cleanly -- mirrors
+    test_m25_phase3_permission_seeded_and_removed_on_downgrade exactly
+    (including the same "M2's seed migration reads live Python data"
+    nuance noted there)."""
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M25_PHASE4_HEAD_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.connect() as conn:
+            assert (
+                conn.exec_driver_sql(
+                    "SELECT COUNT(*) FROM roles WHERE name = 'Regional Manager'"
+                ).scalar_one()
+                == 1
+            )
+            granted = {
+                code: set(
+                    conn.exec_driver_sql(
+                        "SELECT r.name FROM roles r "
+                        "JOIN role_permissions rp ON rp.role_id = r.id "
+                        "JOIN permissions p ON p.id = rp.permission_id "
+                        "WHERE p.code = %s",
+                        (code,),
+                    )
+                    .scalars()
+                    .all()
+                )
+                for code in (
+                    "inventory.transfer.writeoff.initiate",
+                    "inventory.transfer.writeoff.approve",
+                    "inventory.transfer.writeoff.reverse",
+                )
+            }
+    finally:
+        engine.dispose()
+    assert granted["inventory.transfer.writeoff.initiate"] == {"Admin", "Manager"}
+    assert granted["inventory.transfer.writeoff.approve"] == {
+        "Admin",
+        "Manager",
+        "Regional Manager",
+    }
+    assert granted["inventory.transfer.writeoff.reverse"] == {"Admin"}
+
+    command.downgrade(cfg, M25_PHASE4_SCHEMA_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.connect() as conn:
+            assert (
+                conn.exec_driver_sql(
+                    "SELECT COUNT(*) FROM roles WHERE name = 'Regional Manager'"
+                ).scalar_one()
+                == 0
+            )
+            assert (
+                conn.exec_driver_sql(
+                    "SELECT COUNT(*) FROM permissions WHERE code LIKE "
+                    "'inventory.transfer.writeoff.%%'"
+                ).scalar_one()
+                == 0
+            )
+    finally:
+        engine.dispose()
+
+    command.downgrade(cfg, "base")
+
+
+def test_m25_phase4_write_off_approvals_immutable_for_erp_app(migrations_db: str) -> None:
+    """write_off_approvals must have NO UPDATE/DELETE privilege for
+    erp_app at the Phase 4 schema revision -- proven against the real
+    privilege catalog, not just a code comment (mirrors
+    test_m12_alembic_version_privilege_revoked_on_upgrade_and_restored_on_downgrade's
+    own discipline, applied to this table). This is the DB-level backing
+    for "approval record/audit history must not be silently editable
+    through ordinary application permissions"."""
+    cfg = _alembic_config()
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, M25_PHASE4_SCHEMA_REVISION)
+
+    engine = create_engine(migrations_db)
+    try:
+        with engine.connect() as conn:
+            privileges = {
+                row[0]
+                for row in conn.exec_driver_sql(
+                    "SELECT privilege_type FROM information_schema.role_table_grants "
+                    "WHERE grantee = 'erp_app' AND table_name = 'write_off_approvals'"
+                ).all()
+            }
+    finally:
+        engine.dispose()
+    assert "UPDATE" not in privileges
+    assert "DELETE" not in privileges
+    assert "SELECT" in privileges
+    assert "INSERT" in privileges
+
+    command.downgrade(cfg, "base")
 
 
 def test_m12_alembic_version_privilege_revoked_on_upgrade_and_restored_on_downgrade(

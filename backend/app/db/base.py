@@ -11,6 +11,7 @@ from app.modules.accounting.models import (  # noqa: F401
     JournalEntry,
     JournalLine,
 )
+from app.modules.accounting_entities.models import AccountingEntity  # noqa: F401
 from app.modules.ap.models import (  # noqa: F401
     PurchaseInvoice,
     PurchaseInvoiceLine,
@@ -33,6 +34,7 @@ from app.modules.auth.models import (  # noqa: F401
     User,
     UserRole,
 )
+from app.modules.discrepancies.models import ReceivingDiscrepancy  # noqa: F401
 from app.modules.fiscal.models import FiscalConfig, FiscalSubmission  # noqa: F401
 from app.modules.hr.models import (  # noqa: F401
     AttendanceRecord,
@@ -84,4 +86,10 @@ from app.modules.transfers.models import (  # noqa: F401
     InterStoreTransferLine,
     InterStoreTransferReceipt,
     InterStoreTransferReceiptItem,
+    TransferCustodyAcceptance,
+)
+from app.modules.writeoffs.models import (  # noqa: F401
+    ApprovalPolicyRule,
+    TransferWriteOff,
+    WriteOffApproval,
 )

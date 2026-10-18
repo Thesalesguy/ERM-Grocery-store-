@@ -4,7 +4,7 @@ shipment, receipt, cancellation, and in-transit reconciliation."""
 from datetime import date, datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class TransferLineCreate(BaseModel):
@@ -34,6 +34,8 @@ class TransferLineRead(BaseModel):
     requested_quantity: Decimal
     shipped_quantity: Decimal
     received_quantity: Decimal
+    damaged_quantity: Decimal
+    declared_short_quantity: Decimal
     unit_cost_at_shipment: Decimal | None
 
 
@@ -70,8 +72,28 @@ class ShipTransferRequest(BaseModel):
 
 
 class ReceiveTransferLineInput(BaseModel):
+    """M25 Phase 2 (docs/M24D_TECHNICAL_CONTRACT.md Section 5): the actual
+    physical result for one line of one receiving event. `quantity_received`
+    means "good" (kept unrenamed for compatibility; the field has always
+    meant "the quantity made available at the destination"). Existing
+    callers that send only `quantity_received` are unaffected -- the two
+    new fields default to zero, reproducing today's exact behavior.
+    At least one of the three must be positive: an all-zero line is
+    rejected as malformed, never silently accepted."""
+
     transfer_line_id: int
-    quantity_received: Decimal = Field(gt=0)
+    quantity_received: Decimal = Field(ge=0)
+    quantity_damaged: Decimal = Field(ge=0, default=Decimal("0"))
+    quantity_declared_short: Decimal = Field(ge=0, default=Decimal("0"))
+
+    @model_validator(mode="after")
+    def _at_least_one_quantity_positive(self) -> "ReceiveTransferLineInput":
+        if self.quantity_received + self.quantity_damaged + self.quantity_declared_short <= 0:
+            raise ValueError(
+                "At least one of quantity_received, quantity_damaged, "
+                "quantity_declared_short must be positive"
+            )
+        return self
 
 
 class ReceiveTransferRequest(BaseModel):
@@ -87,6 +109,8 @@ class TransferReceiptItemRead(BaseModel):
     id: int
     inter_store_transfer_line_id: int
     quantity_received: Decimal
+    quantity_damaged: Decimal
+    quantity_declared_short: Decimal
 
 
 class TransferReceiptRead(BaseModel):
@@ -102,8 +126,25 @@ class TransferReceiptRead(BaseModel):
     created_at: datetime
 
 
+class TransferCustodyAcceptanceRead(BaseModel):
+    """M25 Phase 2 (docs/M24D_TECHNICAL_CONTRACT.md Section 11): an
+    internal ERP custody acknowledgment, not a legally compliant
+    electronic signature."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    transfer_id: int
+    inter_store_transfer_receipt_id: int
+    store_id: int
+    accepted_by: int | None
+    accepted_at: datetime
+    is_digital_acknowledgment: bool
+
+
 class TransferReceiptWithItemsRead(TransferReceiptRead):
     items: list[TransferReceiptItemRead]
+    custody_acceptance: TransferCustodyAcceptanceRead | None
 
 
 class TransferCancelRequest(BaseModel):

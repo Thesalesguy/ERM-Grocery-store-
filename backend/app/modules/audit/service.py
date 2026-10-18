@@ -25,6 +25,7 @@ from app.modules.accounting.models import AccountingPeriod, JournalEntry
 from app.modules.ap.models import PurchaseInvoice, SupplierCreditNote, SupplierPayment
 from app.modules.audit.models import AuditLog
 from app.modules.auth.models import Store, User
+from app.modules.discrepancies.models import ReceivingDiscrepancy
 from app.modules.hr.models import AttendanceRecord, EmploymentAssignment
 from app.modules.inventory.models import StockAdjustment, StockCount, StockCountLine
 from app.modules.payroll.models import PayrollPeriod
@@ -34,6 +35,7 @@ from app.modules.replenishment.models import ReplenishmentPlan
 from app.modules.sales.models import Sale, SaleReturn
 from app.modules.shifts.models import CashierShift
 from app.modules.transfers.models import InterStoreTransfer, InterStoreTransferReceipt
+from app.modules.writeoffs.models import TransferWriteOff
 
 
 def _json_safe(value: Any) -> Any:
@@ -116,6 +118,15 @@ _DIRECT_STORE_ENTITY_MODELS: dict[str, Any] = {
     # M22 (docs/M22_DISCOVERY.md Phase 2): AccountingPeriod has its own
     # store_id column directly, same shape as CashierShift above.
     "accounting_period": AccountingPeriod,
+    # M25 Phase 3 (docs/M24D_TECHNICAL_CONTRACT.md Section 12):
+    # ReceivingDiscrepancy.store_id is the destination store where the
+    # discrepancy was discovered -- same direct-model shape as
+    # CashierShift/AccountingPeriod above.
+    "receiving_discrepancy": ReceivingDiscrepancy,
+    # M25 Phase 4 (docs/M24D_TECHNICAL_CONTRACT.md Section 6.2):
+    # TransferWriteOff.store_id is the ATTRIBUTED (source) store -- same
+    # direct-model shape as ReceivingDiscrepancy above.
+    "transfer_write_off": TransferWriteOff,
 }
 
 # entity_type -> (model, column_a, column_b): matches if EITHER column
@@ -147,7 +158,23 @@ _JOIN_RESOLVED_ENTITY_TYPES = frozenset({"stock_count_line", "employee", "user",
 # entity_types with NO store dimension at all -- always excluded from a
 # store-scoped reader's results, regardless of filter.
 _NO_STORE_DIMENSION_ENTITY_TYPES = frozenset(
-    {"department", "position", "supplier", "supplier_product"}
+    {
+        "department",
+        "position",
+        "supplier",
+        "supplier_product",
+        # M25 Phase 4: a pragmatic simplification, not an oversight --
+        # WriteOffApproval has no store_id of its own (a decision may
+        # legitimately come from a different store than the write-off it
+        # decides, by design -- see app.modules.writeoffs.service's
+        # module docstring), and ApprovalPolicyRule is global admin
+        # configuration data, the same category "supplier" above already
+        # falls into. Extending the join-resolution machinery to reach
+        # through to TransferWriteOff.store_id for these two is possible
+        # but not done this phase; documented as a minor limitation.
+        "write_off_approval",
+        "approval_policy_rule",
+    }
 )
 
 _ALL_KNOWN_ENTITY_TYPES = (
